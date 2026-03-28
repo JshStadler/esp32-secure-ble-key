@@ -3,7 +3,7 @@
        width="48"
        align="left"
        style="margin-right: 12px;" />
-  BLE Car Key
+  BLE Car Key Solution
 </h1>
 
 A Bluetooth Low Energy (BLE) system that turns your phone into a car key. An ESP32 wired to your car remote's button acts as a bridge — your phone authenticates over BLE and triggers the remote, unlocking or locking the car.
