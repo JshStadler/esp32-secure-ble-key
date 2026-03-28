@@ -8,6 +8,14 @@
 
 A Bluetooth Low Energy (BLE) system that turns your phone into a car key. An ESP32 wired to your car remote's button acts as a bridge — your phone authenticates over BLE and triggers the remote, unlocking or locking the car.
 
+While designed for automotive use, the system can be adapted to any application requiring a secure BLE-triggered action, such as doors, gates, or other access control systems.  
+*(This is not for keyless ignition/starting.)*
+
+Designed for both convenience and security:
+- No need to carry physical keys for everyday access  
+- Lost keys alone cannot unlock the car without the additional authentication layer  
+- Access can be restored on a new device if your phone is lost, with proper authentication
+
 ## 🛠️ How It Works
 
 The ESP32 sits inside the car, powered from the 12V system via a buck converter. A GPIO pin is wired directly across the car remote's button — no MOSFET or relay needed since both share the same 3.3V supply. When you want to unlock the car, the Flutter app on your phone connects over BLE, completes an HMAC-SHA256 challenge-response handshake using a pre-shared key (PSK), and sends a command. The ESP32 verifies the HMAC and drives the GPIO to simulate a button press on the remote.
@@ -111,7 +119,7 @@ Service UUID: `a1b2c3d4-e5f6-7890-abcd-ef1234567890`
 
 - `0x01` — Authenticate only (no button press)
 - `0x02` — Authenticate and press remote button
-> **Note:** Additional commands will be needed for multi button remotes.
+> **Note:** Additional commands will be needed for multi button remotes or additional triggers.
 
 ## 🧰 Configuration
 
