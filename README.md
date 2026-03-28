@@ -1,3 +1,6 @@
+<img width="512" height="512" alt="app_icon" src="https://github.com/user-attachments/assets/df0752f4-f48e-4ef4-8ece-912d6552f2eb" />
+
+
 # BLE Car Key
 
 A Bluetooth Low Energy (BLE) system that turns your phone into a car key. An ESP32 wired to your car remote's button acts as a bridge — your phone authenticates over BLE and triggers the remote, unlocking or locking the car.
