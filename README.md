@@ -8,18 +8,18 @@
 
 A Bluetooth Low Energy (BLE) system that turns your phone into a car key. An ESP32 wired to your car remote's button acts as a bridge — your phone authenticates over BLE and triggers the remote, unlocking or locking the car.
 
-## How It Works
+## 🛠️ How It Works
 
 The ESP32 sits inside the car, powered from the 12V system via a buck converter. A GPIO pin is wired directly across the car remote's button — no MOSFET or relay needed since both share the same 3.3V supply. When you want to unlock the car, the Flutter app on your phone connects over BLE, completes an HMAC-SHA256 challenge-response handshake using a pre-shared key (PSK), and sends a command. The ESP32 verifies the HMAC and drives the GPIO to simulate a button press on the remote.
 
-## Project Structure
+## 🧱 Project Structure
 
 ```
 ESP32_Firmware/           ESP32 Arduino firmware (PlatformIO)
 Android_Flutter_Application/   Flutter mobile app (Android; iOS is untested)
 ```
 
-## Security
+## 🔒 Security
 
 Authentication uses HMAC-SHA256 with a challenge-response protocol:
 
@@ -32,14 +32,14 @@ Additional protections include biometric gating on the phone (fingerprint/face),
 
 > **Important:** The firmware ships with a placeholder PSK (`CHANGE_ME_before_flashing_32chars!`). You **must** change this before deploying. You can update the PSK over BLE from the app after initial setup.
 
-## Hardware
+## 🖥️ Hardware
 
 - **MCU:** ESP32-C3 or standard ESP32 (C3 variant is better for low power draw like in vehicle running off battery)
 - **Power:** Car 12V through a buck converter to 3.3V (powers both the ESP32 and the remote)
 - **Remote:** Car remote with a physical button — GPIO wired directly across the button
 - **No MOSFET needed** when the remote runs on the same 3.3V supply as the ESP32
 
-### Wiring Diagram (Single button remote)
+### 🔌 Wiring Diagram (Single button remote)
 
 ```
 Car 12V ──► Buck Converter ──► 3.3V ──┬──► ESP32 VIN
@@ -49,7 +49,7 @@ ESP32 GPIO 4 ──► Remote button (non-supply leg)
                   Remote button (other leg) ──► 3.3V or GND (depends on remote)
 ```
 
-### Button Polarity
+### 🔄 Button Polarity
 
 Use a multimeter to check which side of the remote's button connects to the supply rail:
 
@@ -62,9 +62,9 @@ Wire GPIO 4 to the **other leg** (the encoder input side).
 
 <img width="360" height="506" alt="image" src="https://github.com/user-attachments/assets/f285ad65-6825-4cf8-b721-fcc585502ffc" />
 
-## Getting Started
+## 🚀 Getting Started
 
-### ESP32 Firmware
+### 💻 ESP32 Firmware
 
 **Requirements:** [PlatformIO](https://platformio.org/) (CLI or VS Code extension)
 
@@ -80,7 +80,7 @@ Wire GPIO 4 to the **other leg** (the encoder input side).
    pio device monitor
    ```
 
-### Flutter App
+### 📱 Flutter App
 
 **Requirements:** [Flutter SDK](https://flutter.dev/docs/get-started/install) (3.0+)
 
@@ -96,7 +96,7 @@ Wire GPIO 4 to the **other leg** (the encoder input side).
 
 On first launch, set the PSK in the app's settings to match what you flashed onto the ESP32.
 
-## BLE Service Details
+## 📡 BLE Service Details
 
 | Characteristic | UUID (suffix) | Properties | Purpose |
 |---|---|---|---|
@@ -111,8 +111,9 @@ Service UUID: `a1b2c3d4-e5f6-7890-abcd-ef1234567890`
 
 - `0x01` — Authenticate only (no button press)
 - `0x02` — Authenticate and press remote button
+> **Note:** Additional commands will be needed for multi button remotes.
 
-## Configuration
+## 🧰 Configuration
 
 Key constants in `car_unlock_firmware.ino`:
 
@@ -130,6 +131,6 @@ Key constants in `car_unlock_firmware.ino`:
 | `UNAUTH_TIMEOUT_SEC` | `15` | Auto-disconnect for unauthenticated clients |
 | `AUTH_TIMEOUT_SEC` | `300` | Auto-disconnect for authenticated clients |
 
-## License
+## 📜 License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
