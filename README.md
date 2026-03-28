@@ -34,7 +34,7 @@ Additional protections include biometric gating on the phone (fingerprint/face),
 
 ## Hardware
 
-- **MCU:** ESP32-C3 SuperMini (or ESP32 WROOM)
+- **MCU:** ESP32-C3 or standard ESP32 (C3 variant is better for low power draw like in vehicle running off battery)
 - **Power:** Car 12V through a buck converter to 3.3V (powers both the ESP32 and the remote)
 - **Remote:** Car remote with a physical button — GPIO wired directly across the button
 - **No MOSFET needed** when the remote runs on the same 3.3V supply as the ESP32
