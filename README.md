@@ -7,7 +7,7 @@ A Bluetooth Low Energy (BLE) system that turns your phone into a car key. An ESP
 
 ## How It Works
 
-The ESP32 sits inside the car, powered from the 12V system via a buck converter, with its GPIO connected to the car remote's button through a MOSFET. When you want to unlock the car, the Flutter app on your phone connects over BLE, completes an HMAC-SHA256 challenge-response handshake using a pre-shared key (PSK), and sends a command. The ESP32 verifies the HMAC and pulses the MOSFET to press the remote button.
+The ESP32 sits inside the car, powered from the 12V system via a buck converter. A GPIO pin is wired directly across the car remote's button — no MOSFET needed since both share the same 3.3V supply. When you want to unlock the car, the Flutter app on your phone connects over BLE, completes an HMAC-SHA256 challenge-response handshake using a pre-shared key (PSK), and sends a command. The ESP32 verifies the HMAC and drives the GPIO to simulate a button press on the remote.
 
 ## Project Structure
 
@@ -31,21 +31,31 @@ Additional protections include biometric gating on the phone (fingerprint/face),
 
 ## Hardware
 
-- **MCU:** ESP32 (WROOM) or ESP32-C3
-- **MOSFET:** N-channel (e.g. 2N7002) — gate on GPIO 2, drain to remote button, source to GND
-- **Power:** Car 12V through a buck converter to 3.3V
-- **Remote:** Any car alarm remote with a physical button that can be wired to the MOSFET
+- **MCU:** ESP32-C3 SuperMini (or ESP32 WROOM)
+- **Power:** Car 12V through a buck converter to 3.3V (powers both the ESP32 and the remote)
+- **Remote:** Car remote with a physical button — GPIO wired directly across the button
+- **No MOSFET needed** when the remote runs on the same 3.3V supply as the ESP32
 
 ### Wiring Diagram
 
 ```
-Car 12V ──► Buck Converter ──► 3.3V ──► ESP32 VIN
+Car 12V ──► Buck Converter ──► 3.3V ──┬──► ESP32 VIN
+                                       └──► Remote (replaces batteries)
 
-ESP32 GPIO 2 ──► MOSFET Gate
-                  MOSFET Drain ──► Remote Button (one side)
-                  MOSFET Source ──► GND
-                  Remote Button (other side) ──► Remote VCC
+ESP32 GPIO 4 ──► Remote button (non-supply leg)
+                  Remote button (other leg) ──► 3.3V or GND (depends on remote)
 ```
+
+### Button Polarity
+
+Use a multimeter to check which side of the remote's button connects to the supply rail:
+
+- **One leg on 3.3V:** The button pulls the encoder input HIGH when pressed. Set `BUTTON_ACTIVE_HIGH true`.
+- **One leg on GND:** The button pulls the encoder input LOW when pressed. Set `BUTTON_ACTIVE_HIGH false`.
+
+Wire GPIO 4 to the **other leg** (the encoder input side).
+
+> **Note:** If your remote operates at a different voltage than 3.3V, you'll need a MOSFET (e.g. BS170) between the GPIO and the button, plus a separate regulator for the remote.
 
 ## Getting Started
 
@@ -55,7 +65,7 @@ ESP32 GPIO 2 ──► MOSFET Gate
 
 1. Open `ESP32_Firmware/` in PlatformIO
 2. Edit `src/car_unlock_firmware.ino` and change `DEFAULT_PSK` to your own secret (32+ characters recommended)
-3. Optionally adjust `RELAY_GPIO`, `BUTTON_PULSE_MS`, `BLE_DEVICE_NAME`, and other configuration constants at the top of the file
+3. Optionally adjust `BUTTON_GPIO`, `BUTTON_ACTIVE_HIGH`, `BUTTON_PULSE_MS`, `BLE_DEVICE_NAME`, and other configuration constants at the top of the file
 4. Build and flash:
    ```
    pio run -t upload
@@ -104,8 +114,11 @@ Key constants in `car_unlock_firmware.ino`:
 | Constant | Default | Description |
 |---|---|---|
 | `DEFAULT_PSK` | `CHANGE_ME_before_flashing_32chars!` | Pre-shared key (change before flashing) |
-| `RELAY_GPIO` | `2` | GPIO pin for MOSFET gate |
+| `BUTTON_GPIO` | `4` | GPIO pin wired to remote button |
+| `BUTTON_ACTIVE_HIGH` | `true` | `true` if button connects to VCC, `false` if to GND |
 | `BUTTON_PULSE_MS` | `300` | Button press duration in ms |
+| `DEBUG_LED_ENABLED` | defined | Comment out to disable debug LED |
+| `DEBUG_LED_GPIO` | `2` | GPIO for debug LED (active during button press) |
 | `BLE_DEVICE_NAME` | `BLE-Device` | BLE advertised name |
 | `MAX_CONNECTIONS` | `3` | Simultaneous BLE connections |
 | `BLE_TX_POWER` | `3` | TX power in dBm (-12 to 9) |

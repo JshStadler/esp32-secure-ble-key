@@ -1,20 +1,20 @@
 /*
  * BLE Car Unlock Bridge - ESP32 Firmware
- * 
+ *
  * Bridges a phone (via BLE) to a car alarm remote's button.
  * Authentication: HMAC-SHA256 challenge-response with PSK.
- * 
+ *
  * Hardware:
- *   - ESP32 (WROOM) or ESP32-C3
- *   - Car remote button wired via N-channel MOSFET (e.g. 2N7002) on RELAY_GPIO
- *   - Powered from car 12V via buck converter to 3.3V
- * 
+ *   - ESP32-C3 SuperMini (or ESP32 WROOM)
+ *   - GPIO wired to the non-supply leg of the remote's button
+ *   - Powered from car 12V via buck converter to 3.3V (also powers remote)
+ *
  * BLE GATT Service:
  *   - Challenge characteristic (read/notify): 16-byte random nonce
  *   - Command characteristic (write): 1-byte command type + 32-byte HMAC
  *   - Status characteristic (read/notify): reports result of last command
  *   - PSK Update characteristic (write): change PSK (requires current auth)
- * 
+ *
  * Requires: NimBLE-Arduino 2.x (h2zero/NimBLE-Arduino@^2.1.0)
  */
 
@@ -32,11 +32,22 @@
 // Default PSK - change this before flashing! 32+ chars recommended.
 #define DEFAULT_PSK "CHANGE_ME_before_flashing_32chars!"
 
-// GPIO pin connected to MOSFET gate (drives remote button)
-#define RELAY_GPIO 2
+// GPIO pin wired to the non-supply leg of the remote's button
+#define BUTTON_GPIO 4
+
+// Button trigger polarity:
+//   true  = button connects encoder input to VCC (active HIGH)
+//   false = button connects encoder input to GND (active LOW)
+// Check with a multimeter: if one switch leg is on 3.3V, set true.
+// If one switch leg is on GND, set false.
+#define BUTTON_ACTIVE_HIGH true
 
 // Button press pulse duration in milliseconds
 #define BUTTON_PULSE_MS 300
+
+// ---- DEBUG LED (comment out to disable) ----
+#define DEBUG_LED_ENABLED
+#define DEBUG_LED_GPIO 2
 
 // BLE advertising interval (in 0.625ms units)
 // Higher = less power, slower discovery. 1600 = 1000ms is a good balance.
@@ -189,9 +200,28 @@ bool verifyAuth(const uint8_t* payload, size_t len) {
 }
 
 void pressRemoteButton() {
-    digitalWrite(RELAY_GPIO, HIGH);
+    // Drive pin to simulate button press
+    pinMode(BUTTON_GPIO, OUTPUT);
+    digitalWrite(BUTTON_GPIO, BUTTON_ACTIVE_HIGH ? HIGH : LOW);
+
+#ifdef DEBUG_LED_ENABLED
+    digitalWrite(DEBUG_LED_GPIO, HIGH);
+#endif
+
     delay(BUTTON_PULSE_MS);
-    digitalWrite(RELAY_GPIO, LOW);
+
+    // Release: return to idle state
+    if (BUTTON_ACTIVE_HIGH) {
+        // Active-high: idle LOW, no interference with encoder pull-down
+        digitalWrite(BUTTON_GPIO, LOW);
+    } else {
+        // Active-low: go high-impedance so encoder pull-up holds line high
+        pinMode(BUTTON_GPIO, INPUT);
+    }
+
+#ifdef DEBUG_LED_ENABLED
+    digitalWrite(DEBUG_LED_GPIO, LOW);
+#endif
 }
 
 void setStatus(const char* msg) {
@@ -315,9 +345,20 @@ class PSKUpdateCallbacks : public NimBLECharacteristicCallbacks {
 void setup() {
     Serial.begin(115200);
 
-    // GPIO setup
-    pinMode(RELAY_GPIO, OUTPUT);
-    digitalWrite(RELAY_GPIO, LOW);
+    // Button GPIO: set to idle state so it doesn't trigger the remote
+    if (BUTTON_ACTIVE_HIGH) {
+        // Active-high: hold LOW at boot (encoder input stays low = not pressed)
+        pinMode(BUTTON_GPIO, OUTPUT);
+        digitalWrite(BUTTON_GPIO, LOW);
+    } else {
+        // Active-low: high-impedance at boot (encoder pull-up holds line high)
+        pinMode(BUTTON_GPIO, INPUT);
+    }
+
+#ifdef DEBUG_LED_ENABLED
+    pinMode(DEBUG_LED_GPIO, OUTPUT);
+    digitalWrite(DEBUG_LED_GPIO, LOW);
+#endif
 
     // Init client slots
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
