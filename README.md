@@ -10,7 +10,7 @@ A Bluetooth Low Energy (BLE) system that turns your phone into a car key. An ESP
 
 ## How It Works
 
-The ESP32 sits inside the car, powered from the 12V system via a buck converter. A GPIO pin is wired directly across the car remote's button — no MOSFET needed since both share the same 3.3V supply. When you want to unlock the car, the Flutter app on your phone connects over BLE, completes an HMAC-SHA256 challenge-response handshake using a pre-shared key (PSK), and sends a command. The ESP32 verifies the HMAC and drives the GPIO to simulate a button press on the remote.
+The ESP32 sits inside the car, powered from the 12V system via a buck converter. A GPIO pin is wired directly across the car remote's button — no MOSFET or relay needed since both share the same 3.3V supply. When you want to unlock the car, the Flutter app on your phone connects over BLE, completes an HMAC-SHA256 challenge-response handshake using a pre-shared key (PSK), and sends a command. The ESP32 verifies the HMAC and drives the GPIO to simulate a button press on the remote.
 
 ## Project Structure
 
