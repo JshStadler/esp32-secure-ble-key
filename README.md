@@ -39,7 +39,7 @@ Additional protections include biometric gating on the phone (fingerprint/face),
 - **Remote:** Car remote with a physical button — GPIO wired directly across the button
 - **No MOSFET needed** when the remote runs on the same 3.3V supply as the ESP32
 
-### Wiring Diagram
+### Wiring Diagram (Single button remote)
 
 ```
 Car 12V ──► Buck Converter ──► 3.3V ──┬──► ESP32 VIN
