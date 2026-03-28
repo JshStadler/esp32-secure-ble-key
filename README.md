@@ -16,7 +16,7 @@ The ESP32 sits inside the car, powered from the 12V system via a buck converter.
 
 ```
 ESP32_Firmware/           ESP32 Arduino firmware (PlatformIO)
-Android_Flutter_Application/   Flutter mobile app (Android/iOS)
+Android_Flutter_Application/   Flutter mobile app (Android; iOS is untested)
 ```
 
 ## Security
@@ -58,7 +58,9 @@ Use a multimeter to check which side of the remote's button connects to the supp
 
 Wire GPIO 4 to the **other leg** (the encoder input side).
 
-> **Note:** If your remote operates at a different voltage than 3.3V, you'll need a MOSFET (e.g. BS170) between the GPIO and the button, plus a separate regulator for the remote.
+> **Note:** If your remote operates at a different voltage than 3.3V, you'll need a relay or N-Channel MOSFET (e.g. BS170) between the GPIO and the button, plus a separate regulator for the remote.
+
+<img width="360" height="506" alt="image" src="https://github.com/user-attachments/assets/f285ad65-6825-4cf8-b721-fcc585502ffc" />
 
 ## Getting Started
 
