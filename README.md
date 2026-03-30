@@ -6,7 +6,7 @@
   BLE Car Key Solution
 </h1>
 
-A Bluetooth Low Energy (BLE) system that turns your phone into a car key. An ESP32 wired to your car remote's button acts as a bridge — your phone authenticates over BLE and triggers the remote, unlocking or locking the car.
+A Bluetooth Low Energy (BLE) system that turns your phone and/or Garmin watch into a car key. An ESP32 wired to your car remote's button acts as a bridge — your phone authenticates over BLE and triggers the remote, unlocking or locking the car.
 
 While designed for automotive use, the system can be adapted to any application requiring a secure BLE-triggered action, such as doors, gates, or other access control systems.  
 *(This is not for keyless ignition/starting.)*
@@ -14,7 +14,7 @@ While designed for automotive use, the system can be adapted to any application 
 Designed for both convenience and security:
 - No need to carry physical keys for everyday access  
 - Lost keys alone cannot unlock the car without the additional authentication layer  
-- Access can be restored on a new device if your phone is lost, with proper authentication
+- Access can be restored on a new device if your phone or watch is lost, with proper authentication
 
 ## 🛠️ How It Works
 
@@ -32,11 +32,11 @@ Android_Flutter_Application/   Flutter mobile app (Android; iOS is untested)
 Authentication uses HMAC-SHA256 with a challenge-response protocol:
 
 1. The ESP32 generates a random 16-byte nonce
-2. The phone reads the nonce and computes `HMAC-SHA256(nonce, PSK)`
-3. The phone sends the HMAC along with a command byte
+2. The phone/watch reads the nonce and computes `HMAC-SHA256(nonce, PSK)`
+3. The phone/watch sends the HMAC along with a command byte
 4. The ESP32 verifies using constant-time comparison, then rotates the nonce
 
-Additional protections include biometric gating on the phone (fingerprint/face), auto-disconnect timeouts (15s unauthenticated, 5min authenticated), and secure storage for the PSK on both the phone and ESP32.
+Additional protections include biometric gating on the phone (fingerprint/face), auto-disconnect timeouts (15s unauthenticated, 5min authenticated), and secure storage for the PSK on both the phone/watch and ESP32.
 
 > **Important:** The firmware ships with a placeholder PSK (`CHANGE_ME_before_flashing_32chars!`). You **must** change this before deploying. You can update the PSK over BLE from the app after initial setup.
 
