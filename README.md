@@ -89,7 +89,7 @@ Wire GPIO 4 to the **other leg** (the encoder input side).
    pio device monitor
    ```
 
-### 📱 Flutter App
+### 📱 Android App (Flutter)
 
 **Requirements:** [Flutter SDK](https://flutter.dev/docs/get-started/install) (3.0+)
 
@@ -107,6 +107,11 @@ On first launch, set the PSK in the app's settings to match what you flashed ont
 
 <img width="360" height="707" alt="image" src="https://github.com/user-attachments/assets/e33acc7a-7c9c-415d-9772-41116ede4fe0" /><img width="360" height="707" alt="image" src="https://github.com/user-attachments/assets/94fad788-adde-4d8a-987b-6423a58d1854" />
 
+### ⌚ Garmin Watch App
+
+<img width="360" height="539" alt="image" src="https://github.com/user-attachments/assets/28264123-9bf5-41ac-bad2-cb6732b7731b" />
+
+> **Note:** PSK needs to be set before compiling app.
 
 ## 📡 BLE Service Details
 
