@@ -1,0 +1,4 @@
+<properties>
+    <property id="psk" type="string">CHANGE_ME_before_flashing_32chars!</property>
+</properties>
+    

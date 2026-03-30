@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<iq:manifest xmlns:iq="http://www.garmin.com/xml/connectiq" version="5">
+    <iq:application id="a1b2c3d4-e5f6-7890-abcd-ef0000000001" type="watch-app" name="@Strings.AppName" entry="BleCarKeyApp" launcherIcon="@Drawables.LauncherIcon" minSdkVersion="5.2.0">
+        <iq:permissions>
+            <iq:uses-permission id="BluetoothLowEnergy"/>
+        </iq:permissions>
+        <iq:products>
+            <iq:product id="fr165"/>
+        </iq:products>
+        <iq:languages>
+            <iq:language>eng</iq:language>
+        </iq:languages>
+        <iq:barrels/>
+    </iq:application>
+</iq:manifest>

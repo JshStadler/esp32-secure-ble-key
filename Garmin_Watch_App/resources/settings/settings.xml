@@ -1,0 +1,7 @@
+<settings>
+    <setting propertyKey="@Properties.psk"
+             title="@Strings.PskLabel"
+             prompt="@Strings.PskPrompt">
+        <settingConfig type="alphaNumeric"/>
+    </setting>
+</settings>

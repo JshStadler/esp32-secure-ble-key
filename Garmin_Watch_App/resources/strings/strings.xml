@@ -1,0 +1,5 @@
+<strings>
+    <string id="AppName">BLE Car Key</string>
+    <string id="PskLabel">Pre-Shared Key (PSK)</string>
+    <string id="PskPrompt">Enter the PSK that matches your ESP32 firmware</string>
+</strings>
