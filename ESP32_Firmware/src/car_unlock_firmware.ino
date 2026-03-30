@@ -95,6 +95,8 @@
 #define COMMAND_CHAR_UUID   "a1b2c3d4-e5f6-7890-abcd-ef1234567892"
 #define STATUS_CHAR_UUID    "a1b2c3d4-e5f6-7890-abcd-ef1234567893"
 #define PSK_UPDATE_CHAR_UUID "a1b2c3d4-e5f6-7890-abcd-ef1234567894"
+#define COMMAND_PT1_CHAR_UUID "a1b2c3d4-e5f6-7890-abcd-ef1234567895"
+#define COMMAND_PT2_CHAR_UUID "a1b2c3d4-e5f6-7890-abcd-ef1234567896"
 
 // ============================================================
 // Globals
@@ -106,6 +108,8 @@ NimBLECharacteristic* challengeChar = nullptr;
 NimBLECharacteristic* commandChar = nullptr;
 NimBLECharacteristic* statusChar = nullptr;
 NimBLECharacteristic* pskUpdateChar = nullptr;
+NimBLECharacteristic* commandPt1Char = nullptr;
+NimBLECharacteristic* commandPt2Char = nullptr;
 
 uint8_t currentNonce[NONCE_LEN];
 char currentPSK[MAX_PSK_LEN + 1];
@@ -116,6 +120,15 @@ struct ClientState {
     unsigned long connectedAt;
 };
 ClientState clients[MAX_CONNECTIONS];
+
+// Buffer for split command
+struct SplitCommandState {
+    bool hasPart1;
+    uint8_t cmdType;
+    uint8_t hmacPart1[16];
+    unsigned long part1Time;
+};
+SplitCommandState splitCmd = {false, 0, {0}, 0};
 
 // ============================================================
 // Utility functions
@@ -338,6 +351,83 @@ class PSKUpdateCallbacks : public NimBLECharacteristicCallbacks {
     }
 };
 
+class CommandPt1Callbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override {
+        NimBLEAttValue val = pCharacteristic->getValue();
+        const uint8_t* data = val.data();
+        size_t len = val.length();
+
+        // Expect: 1 byte cmd + 16 bytes HMAC part 1 = 17 bytes
+        if (len != 17) {
+            setStatus("ERR:PT1_LEN");
+            return;
+        }
+
+        splitCmd.cmdType = data[0];
+        memcpy(splitCmd.hmacPart1, data + 1, 16);
+        splitCmd.hasPart1 = true;
+        splitCmd.part1Time = millis();
+    }
+};
+
+class CommandPt2Callbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override {
+        NimBLEAttValue val = pCharacteristic->getValue();
+        const uint8_t* data = val.data();
+        size_t len = val.length();
+
+        // Expect: 16 bytes HMAC part 2
+        if (len != 16) {
+            splitCmd.hasPart1 = false;
+            setStatus("ERR:PT2_LEN");
+            return;
+        }
+
+        if (!splitCmd.hasPart1) {
+            setStatus("ERR:NO_PT1");
+            return;
+        }
+
+        // Timeout: part 2 must arrive within 5 seconds of part 1
+        if (millis() - splitCmd.part1Time > 5000) {
+            splitCmd.hasPart1 = false;
+            setStatus("ERR:TIMEOUT");
+            return;
+        }
+
+        // Reassemble full HMAC
+        uint8_t fullHMAC[HMAC_LEN];
+        memcpy(fullHMAC, splitCmd.hmacPart1, 16);
+        memcpy(fullHMAC + 16, data, 16);
+        splitCmd.hasPart1 = false;
+
+        uint8_t cmdType = splitCmd.cmdType;
+
+        if (cmdType != CMD_AUTH_ONLY && cmdType != CMD_PRESS) {
+            setStatus("ERR:UNKNOWN_CMD");
+            return;
+        }
+
+        if (verifyAuth(fullHMAC, HMAC_LEN)) {
+            for (int i = 0; i < MAX_CONNECTIONS; i++) {
+                if (clients[i].inUse && !clients[i].authenticated) {
+                    clients[i].authenticated = true;
+                    break;
+                }
+            }
+
+            if (cmdType == CMD_PRESS) {
+                pressRemoteButton();
+                setStatus("OK:PRESSED");
+            } else {
+                setStatus("OK:AUTH");
+            }
+        } else {
+            setStatus("ERR:AUTH");
+        }
+    }
+};
+
 // ============================================================
 // Setup
 // ============================================================
@@ -375,6 +465,7 @@ void setup() {
 
     // Init BLE
     NimBLEDevice::init(BLE_DEVICE_NAME);
+    NimBLEDevice::setMTU(185);
     NimBLEDevice::setPower(BLE_TX_POWER);
 
     // Create server
@@ -397,6 +488,19 @@ void setup() {
         NIMBLE_PROPERTY::WRITE
     );
     commandChar->setCallbacks(new CommandCallbacks());
+
+    // Split command characteristics for low-MTU clients (e.g. Garmin watches)
+    commandPt1Char = pService->createCharacteristic(
+        COMMAND_PT1_CHAR_UUID,
+        NIMBLE_PROPERTY::WRITE
+    );
+    commandPt1Char->setCallbacks(new CommandPt1Callbacks());
+
+    commandPt2Char = pService->createCharacteristic(
+        COMMAND_PT2_CHAR_UUID,
+        NIMBLE_PROPERTY::WRITE
+    );
+    commandPt2Char->setCallbacks(new CommandPt2Callbacks());
 
     // Status characteristic (read + notify)
     statusChar = pService->createCharacteristic(
