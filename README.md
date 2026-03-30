@@ -25,6 +25,7 @@ The ESP32 sits inside the car, powered from the 12V system via a buck converter.
 ```
 ESP32_Firmware/           ESP32 Arduino firmware (PlatformIO)
 Android_Flutter_Application/   Flutter mobile app (Android; iOS is untested)
+Garmin_Watch_App/          Garmin Watch App (Connect IQ v3.0 or newer required)
 ```
 
 ## 🔒 Security
