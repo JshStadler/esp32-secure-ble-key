@@ -6,7 +6,7 @@
   BLE Car Key Solution
 </h1>
 
-A Bluetooth Low Energy (BLE) system that turns your phone and/or Garmin watch into a car key. An ESP32 wired to your car remote's button acts as a bridge — your phone authenticates over BLE and triggers the remote, unlocking or locking the car.
+A Bluetooth Low Energy (BLE) system that turns your phone and/or Garmin watch into a car key. An ESP32-C3 wired to your car remote's button acts as a bridge — your phone authenticates over BLE and triggers the remote, unlocking or locking the car.
 
 While designed for automotive use, the system can be adapted to any application requiring a secure BLE-triggered action, such as doors, gates, or other access control systems.  
 *(This is not for keyless ignition/starting.)*
@@ -18,12 +18,12 @@ Designed for both convenience and security:
 
 ## 🛠️ How It Works
 
-The ESP32 sits inside the car, powered from the 12V system via a buck converter. A GPIO pin is wired directly across the car remote's button — no MOSFET or relay needed since both share the same 3.3V supply. When you want to unlock the car, the Flutter app on your phone connects over BLE, completes an HMAC-SHA256 challenge-response handshake using a pre-shared key (PSK), and sends a command. The ESP32 verifies the HMAC and drives the GPIO to simulate a button press on the remote.
+The ESP32-C3 sits inside the car, powered from the 12V system via a buck converter. A GPIO pin is wired directly across the car remote's button — no MOSFET or relay needed since both share the same 3.3V supply. When you want to unlock the car, the Flutter app on your phone connects over BLE, completes an HMAC-SHA256 challenge-response handshake using a pre-shared key (PSK), and sends a command. The ESP32-C3 verifies the HMAC and drives the GPIO to simulate a button press on the remote.
 
 ## 🧱 Project Structure
 
 ```
-ESP32_Firmware/           ESP32 Arduino firmware (PlatformIO)
+ESP32_Firmware/           ESP32 Arduino firmware (PlatformIO) (Not maintained)
 ESP32-C3_Firmware/        ESP32-C3 Arduino firmware (PlatformIO)
 Android_Flutter_Application/   Flutter mobile app (Android; iOS is untested)
 Garmin_Watch_App/          Garmin Watch App (Connect IQ v3.0 or newer required)
@@ -44,7 +44,7 @@ Additional protections include biometric gating on the phone (fingerprint/face),
 
 ## 🖥️ Hardware
 
-- **MCU:** ESP32-C3 or standard ESP32 (C3 variant is better for low power draw like in vehicle running off battery)
+- **MCU:** ESP32-C3 or standard ESP32 (C3 variant is better for low power draw like in vehicle running off battery; Standard ESP32 firmware is not being maintained and contains some functional bugs, still useful for POC)
 - **Power:** Car 12V through a buck converter to 3.3V (powers both the ESP32 and the remote)
 - **Remote:** Car remote with a physical button — GPIO wired directly across the button
 - **No MOSFET needed** when the remote runs on the same 3.3V supply as the ESP32
@@ -74,11 +74,11 @@ Wire GPIO 4 to the **other leg** (the encoder input side).
 
 ## 🚀 Getting Started
 
-### 💻 ESP32 Firmware
+### 💻 ESP32-C3 Firmware
 
 **Requirements:** [PlatformIO](https://platformio.org/) (CLI or VS Code extension)
 
-1. Open `ESP32_Firmware/` in PlatformIO
+1. Open `ESP32-C3_Firmware/` or `ESP32_Firmware/` in PlatformIO
 2. Edit `src/car_unlock_firmware.ino` and change `DEFAULT_PSK` to your own secret (32+ characters recommended)
 3. Optionally adjust `BUTTON_GPIO`, `BUTTON_ACTIVE_HIGH`, `BUTTON_PULSE_MS`, `BLE_DEVICE_NAME`, and other configuration constants at the top of the file
 4. Build and flash:
@@ -104,7 +104,7 @@ Wire GPIO 4 to the **other leg** (the encoder input side).
    flutter run
    ```
 
-On first launch, set the PSK in the app's settings to match what you flashed onto the ESP32.
+On first launch, set the PSK in the app's settings to match what you flashed onto the ESP32-C3.
 
 <img width="360" height="707" alt="image" src="https://github.com/user-attachments/assets/e33acc7a-7c9c-415d-9772-41116ede4fe0" /><img width="360" height="707" alt="image" src="https://github.com/user-attachments/assets/94fad788-adde-4d8a-987b-6423a58d1854" />
 
