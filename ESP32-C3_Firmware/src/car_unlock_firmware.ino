@@ -41,6 +41,7 @@
 #include <esp_wifi.h>
 #include <esp_bt.h>
 #include <driver/gpio.h>
+#include <esp_task_wdt.h>
 
 // On ESP32-C3, USB-CDC console can be disabled to save power.
 // The ROM bootloader always re-enables USB for flashing, so this is safe.
@@ -107,7 +108,8 @@
 
 // Max simultaneous BLE connections
 // Note: each connection costs ~3-4KB RAM on C3 (single-core, 400KB total).
-// 3 connections is fine, but reduces free heap. Set to 1 if only phone is used.
+// 3 connections = phone + watch + spare. Ghost slot reaper in loop()
+// prevents orphaned slots from blocking new connections.
 #define MAX_CONNECTIONS 3
 
 // Auto-disconnect unauthenticated clients after this many seconds
@@ -137,6 +139,11 @@
 // delay() yields to the FreeRTOS idle task between ticks.
 // BLE callbacks fire instantly regardless of this value.
 #define LOOP_INTERVAL_MS 1000
+
+// Task watchdog timeout in seconds. Reboots if loop() doesn't complete
+// a full tick within this window. 10s is generous — longest blocking call
+// is pressRemoteButton() at 300ms.
+#define WDT_TIMEOUT_SEC 10
 
 // ============================================================
 // UUIDs
@@ -390,6 +397,16 @@ class ServerCallbacks : public NimBLEServerCallbacks {
             pServer->disconnect(connInfo.getConnHandle());
             return;
         }
+
+        // Tighten link supervision: 4s timeout (400 * 10ms).
+        // If the peer vanishes (phone walks away), NimBLE fires onDisconnect
+        // within ~4s instead of the default ~20s, reducing ghost slot windows.
+        // Args: connHandle, minInterval(1.25ms), maxInterval(1.25ms),
+        //       latency, supervisionTimeout(10ms)
+        pServer->updateConnParams(
+            connInfo.getConnHandle(), 24, 48, 0, 400
+        );
+
         generateNonce();
 
         // Continue advertising if we have capacity
@@ -399,18 +416,25 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     }
 
     void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
+        uint16_t handle = connInfo.getConnHandle();
+        Serial.printf("[BLE] Disconnect handle %d, reason 0x%02x\n", handle, reason);
+
         // Free the exact slot for this connection handle
-        int slot = findClientByHandle(connInfo.getConnHandle());
+        int slot = findClientByHandle(handle);
         if (slot >= 0) {
             clients[slot].inUse         = false;
             clients[slot].authenticated = false;
         }
 
         // Invalidate any pending split command from this connection
-        if (splitCmd.hasPart1 && splitCmd.connHandle == connInfo.getConnHandle()) {
+        if (splitCmd.hasPart1 && splitCmd.connHandle == handle) {
             splitCmd.hasPart1 = false;
         }
 
+        // Always restart advertising after a disconnect, even if we think
+        // we're below MAX_CONNECTIONS. Belt-and-suspenders: advertising
+        // may have been stopped and never restarted due to slot accounting
+        // bugs or NimBLE edge cases.
         NimBLEDevice::startAdvertising();
     }
 };
@@ -670,11 +694,20 @@ void setup() {
     pAdvertising->setMinInterval(ADV_INTERVAL_MIN);
     pAdvertising->setMaxInterval(ADV_INTERVAL_MAX);
     pAdvertising->enableScanResponse(true);
+
     pAdvertising->start();
 
     Serial.println("[BLE] Advertising started");
     Serial.printf("[BLE] TX power: %d dBm, Adv interval: %d ms\n",
                   BLE_TX_POWER, (ADV_INTERVAL_MAX * 625) / 1000);
+
+    // ---- Task watchdog: reboot on deadlock ----
+    // Arduino ESP32 core ships with TWDT already initialized on the idle task.
+    // Deinit first, then reinit with our timeout and panic-on-timeout enabled.
+    esp_task_wdt_deinit();
+    esp_task_wdt_init(WDT_TIMEOUT_SEC, true);  // timeout_sec, panic_on_timeout
+    esp_task_wdt_add(NULL);  // subscribe current (loop) task
+    Serial.println("[WDT] Task watchdog enabled");
 
     // ---- Power: disable USB console (do this last so boot logs are visible) ----
 #ifndef DEBUG_LED_ENABLED
@@ -693,7 +726,57 @@ void setup() {
 // ============================================================
 
 void loop() {
+    esp_task_wdt_reset();  // feed the watchdog
     unsigned long now = millis();
+
+    // ---- Ghost slot reaper ----
+    // If NimBLE reports fewer active connections than we have inUse slots,
+    // at least one slot is orphaned (onDisconnect never fired). Find and
+    // free slots whose connection handle is no longer valid in the stack.
+    uint16_t nimbleCount = pServer->getConnectedCount();
+    uint16_t slotCount = 0;
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (clients[i].inUse) slotCount++;
+    }
+
+    if (slotCount > nimbleCount) {
+        // Build a set of connection handles that NimBLE still considers valid.
+        // getPeerInfo(index) returns info for the Nth connected peer (0-based).
+        uint16_t validHandles[MAX_CONNECTIONS];
+        for (uint8_t p = 0; p < nimbleCount && p < MAX_CONNECTIONS; p++) {
+            NimBLEConnInfo info = pServer->getPeerInfo(p);
+            validHandles[p] = info.getConnHandle();
+        }
+
+        // Free any slot whose handle isn't in NimBLE's active list
+        for (int i = 0; i < MAX_CONNECTIONS; i++) {
+            if (!clients[i].inUse) continue;
+
+            bool found = false;
+            for (uint8_t p = 0; p < nimbleCount && p < MAX_CONNECTIONS; p++) {
+                if (validHandles[p] == clients[i].connHandle) {
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                Serial.printf("[BLE] Reaped ghost slot %d (handle %d)\n",
+                              i, clients[i].connHandle);
+                clients[i].inUse         = false;
+                clients[i].authenticated = false;
+
+                if (splitCmd.hasPart1 && splitCmd.connHandle == clients[i].connHandle) {
+                    splitCmd.hasPart1 = false;
+                }
+            }
+        }
+
+        // If we freed slots and aren't at capacity, re-enable advertising
+        if (pServer->getConnectedCount() < MAX_CONNECTIONS) {
+            NimBLEDevice::startAdvertising();
+        }
+    }
 
     // ---- Client timeout check ----
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
@@ -705,10 +788,20 @@ void loop() {
             : UNAUTH_TIMEOUT_SEC * 1000UL;
 
         if (elapsed > timeout) {
-            // Disconnect this specific client by its connection handle
-            pServer->disconnect(clients[i].connHandle);
+            Serial.printf("[BLE] Timeout slot %d (handle %d, auth=%d)\n",
+                          i, clients[i].connHandle, clients[i].authenticated);
+            // Force-free the slot BEFORE calling disconnect, so even if
+            // onDisconnect doesn't fire, the slot is available.
             clients[i].inUse = false;
             clients[i].authenticated = false;
+
+            // Invalidate any pending split command from this connection
+            if (splitCmd.hasPart1 && splitCmd.connHandle == clients[i].connHandle) {
+                splitCmd.hasPart1 = false;
+            }
+
+            // Ask NimBLE to tear down the link (best-effort for ghost peers)
+            pServer->disconnect(clients[i].connHandle);
         }
     }
 
