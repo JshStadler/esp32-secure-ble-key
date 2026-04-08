@@ -1,0 +1,101 @@
+# ============================================================
+# BLE Car Unlock Bridge - sdkconfig.defaults
+# ESP32-C3 power-optimised BLE peripheral
+# ============================================================
+
+# ---- Target ----
+CONFIG_IDF_TARGET="esp32c3"
+
+# ---- Power Management & Dynamic Frequency Scaling ----
+# Enable PM subsystem (required for DFS and auto light sleep)
+CONFIG_PM_ENABLE=y
+
+# DFS: CPU scales between max_freq and min_freq automatically.
+# Actual limits are set at runtime via esp_pm_configure().
+# max=80 MHz (PLL), min=10 MHz (XTAL/4 on C3, actual floor
+# depends on APB consumers — NimBLE needs >=10 MHz).
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_80=y
+
+# FreeRTOS tickless idle: allows the CPU to enter light sleep
+# when no tasks are ready to run (instead of busy-looping in
+# the idle task). This is what makes auto light sleep work.
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+
+# Tick rate: 1000 Hz gives 1ms resolution for vTaskDelay.
+# Tickless idle suppresses ticks during sleep, so high tick
+# rate doesn't cost power — it only improves timing precision.
+CONFIG_FREERTOS_HZ=1000
+
+# ---- Light Sleep / Power ----
+# Allow light sleep in the power management framework.
+# When all tasks are idle and no locks prevent it, the CPU
+# enters light sleep automatically. Wake sources: BLE
+# controller interrupts, timers, GPIO.
+CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP=y
+
+# Power down flash during light sleep (saves ~1mA).
+# Requires flash to support suspend/resume — most do.
+CONFIG_ESP_SLEEP_FLASH_LEAKAGE_WORKAROUND=y
+
+# ---- Wi-Fi: fully disabled ----
+# We don't use Wi-Fi at all. Disabling it at the config level
+# strips the Wi-Fi stack from the build entirely (~100KB flash,
+# ~40KB RAM saved vs disabling at runtime).
+CONFIG_ESP_WIFI_ENABLED=n
+
+# ---- Bluetooth / NimBLE ----
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+
+# Use NimBLE host (not Bluedroid)
+CONFIG_BT_CONTROLLER_ENABLED=y
+
+# Max connections: match firmware's MAX_CONNECTIONS=3
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
+
+# Reduce NimBLE log noise (0=DEBUG,1=INFO,2=WARNING,3=ERROR,4=CRITICAL)
+CONFIG_BT_NIMBLE_LOG_LEVEL=2
+
+# Enable BLE sleep: lets the controller sleep between
+# advertising/connection events. Works with PM auto light sleep.
+CONFIG_BT_NIMBLE_SLEEP_ENABLE=y
+
+# Disable unused NimBLE roles to save flash/RAM
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+
+# ---- NVS ----
+CONFIG_NVS_FLASH_ENABLED=y
+
+# ---- Logging ----
+# Default log level for production. Override per-tag at runtime
+# when DEBUG is defined in main.c.
+# 0=NONE, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, 5=VERBOSE
+CONFIG_LOG_DEFAULT_LEVEL=1
+CONFIG_LOG_MAXIMUM_LEVEL=4
+
+# ---- USB Console ----
+# Disable USB-CDC console in production to save power.
+# The ROM bootloader always re-enables USB for flashing.
+CONFIG_ESP_CONSOLE_NONE=y
+
+# ---- Partition table ----
+CONFIG_PARTITION_TABLE_SINGLE_APP=y
+
+# ---- Watchdog ----
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_INIT=n
+
+# ---- Optimisation ----
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# ---- Flash: 4MB on C3 SuperMini ----
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# ---- mbedTLS (for HMAC-SHA256) ----
+CONFIG_MBEDTLS_HARDWARE_SHA=y
+
+# Disable certificate bundle (not needed, avoids build error)
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
