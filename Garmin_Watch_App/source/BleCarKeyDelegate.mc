@@ -16,9 +16,15 @@ class BleCarKeyDelegate extends WatchUi.BehaviorDelegate {
         return true;
     }
 
-    // BACK button = exit app
+    // MENU button (long-press UP) = force unpair + reconnect fresh
+    function onMenu() {
+        _bleHandler.forceUnpair();
+        return true;
+    }
+
+    // BACK button = exit app (preserves pairing for fast reconnect)
     function onBack() {
-        _bleHandler.disconnect();
+        _bleHandler.cleanup();
         System.exit();
     }
 }

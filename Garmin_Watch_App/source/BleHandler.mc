@@ -4,6 +4,7 @@ using Toybox.System;
 using Toybox.Application;
 using Toybox.WatchUi;
 using Toybox.Lang;
+using Toybox.Timer;
 
 // UUIDs matching the ESP32 firmware
 class CarKeyProfile {
@@ -66,10 +67,14 @@ class BleHandler extends Ble.BleDelegate {
     var _pendingCommand = CarKeyProfile.CMD_PRESS;
     var _profileRegistered = false;
     var _pendingPart2 = null;
+    var _hasPendingUnlock = false;
+    var _timer = null;
+    var _shouldAutoReconnect = true;
 
     function initialize() {
         BleDelegate.initialize();
         Ble.setDelegate(self);
+        _timer = new Timer.Timer();
 
         // Register the BLE profile
         try {
@@ -111,17 +116,29 @@ class BleHandler extends Ble.BleDelegate {
     }
 
     function sendUnlock() {
+        // Debounce: ignore if a BLE operation is already in flight
+        if (_state == STATE_READING_CHALLENGE ||
+            _state == STATE_SENDING_COMMAND ||
+            _state == STATE_WAITING_STATUS) {
+            return;
+        }
+
+        _pendingCommand = CarKeyProfile.CMD_PRESS;
+
         if (_device == null || !_device.isConnected()) {
-            // Not connected, try scanning first
-            _pendingCommand = CarKeyProfile.CMD_PRESS;
+            // Not connected — scan and execute after connect
+            _hasPendingUnlock = true;
             startScan();
             return;
         }
-        _pendingCommand = CarKeyProfile.CMD_PRESS;
+
         readChallenge();
     }
 
     function disconnect() {
+        _shouldAutoReconnect = false;
+        _hasPendingUnlock = false;
+        _timer.stop();
         if (_device != null) {
             Ble.unpairDevice(_device);
             _device = null;
@@ -129,6 +146,36 @@ class BleHandler extends Ble.BleDelegate {
         _state = STATE_IDLE;
         _statusText = "Disconnected";
         WatchUi.requestUpdate();
+    }
+
+    // Force unpair: clears the GATT cache and reconnects from scratch.
+    // Use after firmware updates that change the GATT service table.
+    // Triggered by MENU button (long-press UP on FR165).
+    function forceUnpair() {
+        _timer.stop();
+        _hasPendingUnlock = false;
+        stopScan();
+        if (_device != null) {
+            Ble.unpairDevice(_device);
+            _device = null;
+        }
+        _state = STATE_IDLE;
+        _statusText = "Unpaired, scanning...";
+        WatchUi.requestUpdate();
+
+        // Immediately reconnect with fresh pairing
+        _shouldAutoReconnect = true;
+        startScan();
+    }
+
+    // Clean shutdown: stop scanning and timers but keep the device
+    // paired so the OS caches the GATT service table. Next app
+    // launch reconnects in ~1-2s instead of ~15s full discovery.
+    function cleanup() {
+        _shouldAutoReconnect = false;
+        _hasPendingUnlock = false;
+        _timer.stop();
+        stopScan();
     }
 
     function getStatusText() {
@@ -262,6 +309,22 @@ class BleHandler extends Ble.BleDelegate {
         }
     }
 
+    // Auto-reconnect after unexpected disconnect or scan timeout
+    function onReconnectTimer() as Void {
+        if (_shouldAutoReconnect && _state == STATE_IDLE) {
+            startScan();
+        }
+    }
+
+    // Status response timeout — release debounce so user can retry
+    function onStatusTimeout() as Void {
+        if (_state == STATE_WAITING_STATUS) {
+            _state = STATE_CONNECTED;
+            _statusText = "No response";
+            WatchUi.requestUpdate();
+        }
+    }
+
     // ============================================================
     // BleDelegate callbacks
     // ============================================================
@@ -277,11 +340,15 @@ class BleHandler extends Ble.BleDelegate {
 
     function onScanStateChanged(scanState, status) {
         if (scanState == Ble.SCAN_STATE_OFF && _state == STATE_SCANNING) {
-            // Scan was stopped externally
+            // Scan was stopped externally or timed out
             if (_device == null) {
                 _state = STATE_IDLE;
-                _statusText = "Not found";
+                _statusText = "Scanning...";
                 WatchUi.requestUpdate();
+                // Retry scan immediately
+                if (_shouldAutoReconnect) {
+                    _timer.start(method(:onReconnectTimer), 100, false);
+                }
             }
         }
     }
@@ -327,14 +394,22 @@ class BleHandler extends Ble.BleDelegate {
             _statusText = "Connected";
             WatchUi.requestUpdate();
 
-            // Enable notifications on status characteristic
+            // Enable notifications on status characteristic.
+            // If there's a pending unlock, it will execute from
+            // onDescriptorWrite once the CCCD write completes.
             enableStatusNotifications();
 
         } else {
             _device = null;
+            _pendingPart2 = null;
             _state = STATE_IDLE;
             _statusText = "Disconnected";
             WatchUi.requestUpdate();
+
+            // Auto-reconnect after 2 seconds
+            if (_shouldAutoReconnect) {
+                _timer.start(method(:onReconnectTimer), 2000, false);
+            }
         }
     }
 
@@ -384,6 +459,7 @@ class BleHandler extends Ble.BleDelegate {
             if (status == Ble.STATUS_SUCCESS) {
                 _state = STATE_WAITING_STATUS;
                 _statusText = "Sent, waiting...";
+                _timer.start(method(:onStatusTimeout), 2000, false);
             } else {
                 _statusText = "Write pt2 err: " + status;
                 _state = STATE_ERROR;
@@ -393,6 +469,7 @@ class BleHandler extends Ble.BleDelegate {
             if (status == Ble.STATUS_SUCCESS) {
                 _state = STATE_WAITING_STATUS;
                 _statusText = "Sent, waiting...";
+                _timer.start(method(:onStatusTimeout), 2000, false);
             } else {
                 _statusText = "Write error: " + status;
                 _state = STATE_ERROR;
@@ -403,8 +480,9 @@ class BleHandler extends Ble.BleDelegate {
 
     function onCharacteristicChanged(char, value) {
         if (char.getUuid().equals(CarKeyProfile.STATUS_CHAR_UUID)) {
+            _timer.stop(); // cancel status timeout
             // Parse status from ESP32
-            var statusStr = byteArrayToString(value as Lang.ByteArray); // Added cast for safety
+            var statusStr = byteArrayToString(value as Lang.ByteArray);
             if (statusStr.find("OK:PRESSED") != null) {
                 _statusText = "Button pressed";
                 _state = STATE_CONNECTED;
@@ -417,9 +495,18 @@ class BleHandler extends Ble.BleDelegate {
             } else if (statusStr.find("OK:AUTH") != null) {
                 _statusText = "Authenticated";
                 _state = STATE_CONNECTED;
+            } else if (statusStr.find("ERR:BUSY") != null) {
+                _statusText = "Busy, try again";
+                _state = STATE_CONNECTED; // recoverable, not an error state
+            } else if (statusStr.find("ERR:AUTH") != null) {
+                _statusText = "Auth failed";
+                _state = STATE_CONNECTED; // recoverable — user can retry
             } else if (statusStr.find("ERR") != null) {
                 _statusText = "Error: " + statusStr;
                 _state = STATE_ERROR;
+            } else if (statusStr.find("WARN") != null) {
+                _statusText = statusStr;
+                _state = STATE_CONNECTED;
             } else {
                 _statusText = statusStr;
             }
@@ -428,9 +515,14 @@ class BleHandler extends Ble.BleDelegate {
     }
 
     function onDescriptorWrite(desc, status) {
-        // CCCD write complete
+        // CCCD write complete — notifications are now active
         if (status == Ble.STATUS_SUCCESS) {
             System.println("Notifications enabled");
+            // If user pressed SELECT while disconnected, execute now
+            if (_hasPendingUnlock && _device != null && _device.isConnected()) {
+                _hasPendingUnlock = false;
+                readChallenge();
+            }
         }
     }
 

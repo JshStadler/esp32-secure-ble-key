@@ -17,7 +17,7 @@ class BleCarKeyApp extends Application.AppBase {
 
     function onStop(state) {
         if (_bleHandler != null) {
-            _bleHandler.disconnect();
+            _bleHandler.cleanup();
         }
     }
 
