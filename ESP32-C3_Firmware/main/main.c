@@ -124,9 +124,12 @@ static const char *TAG = "CAR_UNLOCK";
 /* BLE TX power in dBm. 3 dBm good for car cabin with external antenna. */
 #define BLE_TX_POWER 3
 
-/* BLE advertising interval (in 0.625ms units). 1600 = 1000ms. */
+/* BLE advertising interval (in 0.625ms units).
+ * 1600 = 1000ms, 3200 = 2000ms. Giving a range lets the
+ * controller jitter the interval for better coexistence
+ * and reduced peak current from synchronized wake-ups. */
 #define ADV_INTERVAL_MIN 1600
-#define ADV_INTERVAL_MAX 1600
+#define ADV_INTERVAL_MAX 3200
 
 /* Max simultaneous BLE connections */
 #define MAX_CONNECTIONS 3
@@ -137,6 +140,11 @@ static const char *TAG = "CAR_UNLOCK";
 
 /* Periodic restart interval (seconds). 3 hours = 10800s. */
 #define RESTART_INTERVAL_SEC 10800
+
+/* Hard restart: force restart after this many seconds regardless
+ * of connection state. Guards against slow memory leaks or NimBLE
+ * state drift. 24 hours = 86400s. */
+#define HARD_RESTART_SEC 86400
 
 /* ---- Crypto ---- */
 #define HMAC_LEN  32
@@ -149,11 +157,14 @@ static const char *TAG = "CAR_UNLOCK";
 /* Max PSK length */
 #define MAX_PSK_LEN 128
 
-/* Loop tick interval in ms */
-#define LOOP_INTERVAL_MS 1000
+/* Loop tick interval in ms. 10s is sufficient for timeout checks
+ * (15s minimum granularity) and ghost reaping, while letting the
+ * CPU stay in light sleep for longer stretches. */
+#define LOOP_INTERVAL_MS 10000
 
-/* Task watchdog timeout in seconds */
-#define WDT_TIMEOUT_SEC 10
+/* Task watchdog timeout in seconds. Must exceed LOOP_INTERVAL_MS
+ * to avoid false triggers during normal sleep. */
+#define WDT_TIMEOUT_SEC 30
 
 /* ---- Power Management ----
  * DFS frequency limits (MHz). CPU scales between these automatically.
@@ -226,7 +237,7 @@ typedef struct {
     uint16_t conn_handle;
     bool     in_use;
     bool     authenticated;
-    int64_t  connected_at;  /* microseconds from esp_timer_get_time() */
+    int64_t  connected_at;  /* milliseconds from now_ms() */
 } client_state_t;
 
 static client_state_t clients[MAX_CONNECTIONS];
@@ -237,13 +248,17 @@ typedef struct {
     uint8_t  cmd_type;
     uint8_t  hmac_part1[16];
     uint16_t conn_handle;
-    int64_t  part1_time;  /* microseconds */
+    int64_t  part1_time;  /* milliseconds from now_ms() */
 } split_cmd_state_t;
 
 static split_cmd_state_t split_cmd = {0};
 
 /* Track whether advertising is currently active */
 static bool adv_active = false;
+
+/* Non-blocking button press: one-shot timer releases the GPIO */
+static esp_timer_handle_t button_timer = NULL;
+static bool button_busy = false;
 
 /* ============================================================
  * Forward declarations
@@ -279,7 +294,21 @@ static void gpio_init_button(void) {
     gpio_config(&io_conf);
 }
 
-static void press_remote_button(void) {
+static void button_timer_callback(void *arg) {
+    /* Return to high-impedance idle (zero quiescent current) */
+    gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
+
+#ifdef DEBUG_LED_ENABLED
+    gpio_set_level(DEBUG_LED_GPIO, 0);
+#endif
+
+    button_busy = false;
+}
+
+static bool press_remote_button(void) {
+    if (button_busy) return false;  /* press already in progress */
+    button_busy = true;
+
     /* Drive to active state */
     gpio_set_direction(BUTTON_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_level(BUTTON_GPIO, BUTTON_ACTIVE_HIGH ? 1 : 0);
@@ -288,14 +317,16 @@ static void press_remote_button(void) {
     gpio_set_level(DEBUG_LED_GPIO, 1);
 #endif
 
-    vTaskDelay(pdMS_TO_TICKS(BUTTON_PULSE_MS));
-
-    /* Return to high-impedance idle (zero quiescent current) */
-    gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
-
-#ifdef DEBUG_LED_ENABLED
-    gpio_set_level(DEBUG_LED_GPIO, 0);
-#endif
+    /* Release after BUTTON_PULSE_MS via one-shot timer (non-blocking) */
+    esp_err_t err = esp_timer_start_once(button_timer, (uint64_t)BUTTON_PULSE_MS * 1000);
+    if (err != ESP_OK) {
+        /* Timer failed — release GPIO immediately to avoid stuck press */
+        gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
+        button_busy = false;
+        LOG_E(TAG, "Button timer start failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    return true;
 }
 
 #ifdef DEBUG_LED_ENABLED
@@ -338,7 +369,8 @@ static void load_psk(void) {
         size_t len = MAX_PSK_LEN;
         err = nvs_get_str(handle, "psk", current_psk, &len);
         nvs_close(handle);
-        if (err == ESP_OK && len > 0) {
+        /* len includes null terminator, so len > 1 means non-empty */
+        if (err == ESP_OK && len > 1) {
             LOG_I(TAG, "PSK loaded from NVS (%d chars)", (int)len);
             return;
         }
@@ -350,16 +382,28 @@ static void load_psk(void) {
     LOG_W(TAG, "Using default PSK");
 }
 
-static void save_psk(const char *new_psk) {
+static bool save_psk(const char *new_psk) {
     nvs_handle_t handle;
+    bool persisted = false;
     esp_err_t err = nvs_open("car_unlock", NVS_READWRITE, &handle);
     if (err == ESP_OK) {
-        nvs_set_str(handle, "psk", new_psk);
-        nvs_commit(handle);
+        err = nvs_set_str(handle, "psk", new_psk);
+        if (err == ESP_OK) {
+            err = nvs_commit(handle);
+            if (err == ESP_OK) {
+                persisted = true;
+            }
+        }
         nvs_close(handle);
     }
+    if (!persisted) {
+        LOG_E(TAG, "NVS PSK write failed: %s", esp_err_to_name(err));
+    }
+
+    /* Always update in-memory PSK so current session works */
     strncpy(current_psk, new_psk, MAX_PSK_LEN);
     current_psk[MAX_PSK_LEN] = '\0';
+    return persisted;
 }
 
 /* ============================================================
@@ -545,9 +589,7 @@ static int chr_access_command(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     uint8_t buf[33];
-    uint16_t copied = 0;
     os_mbuf_copydata(ctxt->om, 0, len, buf);
-    (void)copied;
 
     uint8_t cmd_type = buf[0];
     const uint8_t *hmac_payload = buf + 1;
@@ -561,8 +603,7 @@ static int chr_access_command(uint16_t conn_handle, uint16_t attr_handle,
     if (verify_auth(hmac_payload, hmac_len)) {
         mark_authenticated(conn_handle);
         if (cmd_type == CMD_PRESS) {
-            press_remote_button();
-            set_status("OK:PRESSED");
+            set_status(press_remote_button() ? "OK:PRESSED" : "ERR:BUSY");
         } else {
             set_status("OK:AUTH");
         }
@@ -647,8 +688,7 @@ static int chr_access_command_pt2(uint16_t conn_handle, uint16_t attr_handle,
     if (verify_auth(full_hmac, HMAC_LEN)) {
         mark_authenticated(conn_handle);
         if (cmd_type == CMD_PRESS) {
-            press_remote_button();
-            set_status("OK:PRESSED");
+            set_status(press_remote_button() ? "OK:PRESSED" : "ERR:BUSY");
         } else {
             set_status("OK:AUTH");
         }
@@ -666,7 +706,7 @@ static int chr_access_psk_update(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
-    if (len > HMAC_LEN + 1 + MAX_PSK_LEN || len < HMAC_LEN + 2) {
+    if (len > HMAC_LEN + 1 + MAX_PSK_LEN) {
         set_status("ERR:PSK_FORMAT");
         return 0;
     }
@@ -674,19 +714,15 @@ static int chr_access_psk_update(uint16_t conn_handle, uint16_t attr_handle,
     uint8_t buf[HMAC_LEN + 1 + MAX_PSK_LEN];
     os_mbuf_copydata(ctxt->om, 0, len, buf);
 
-    /* Find the 0x00 separator */
-    int sep_idx = -1;
-    for (size_t i = 0; i < len; i++) {
-        if (buf[i] == 0x00) {
-            sep_idx = i;
-            break;
-        }
-    }
-
-    if (sep_idx < 1 || sep_idx >= (int)len - 1) {
+    /* The separator must be at exactly position HMAC_LEN (byte 32).
+     * Bytes 0..31 are the HMAC (which can legitimately contain 0x00),
+     * byte 32 must be 0x00, and the rest is the new PSK. */
+    if (len < HMAC_LEN + 2 || buf[HMAC_LEN] != 0x00) {
         set_status("ERR:PSK_FORMAT");
         return 0;
     }
+
+    int sep_idx = HMAC_LEN;
 
     if (!verify_auth(buf, sep_idx)) {
         set_status("ERR:PSK_AUTH");
@@ -703,9 +739,9 @@ static int chr_access_psk_update(uint16_t conn_handle, uint16_t attr_handle,
     memcpy(new_psk, buf + sep_idx + 1, new_psk_len);
     new_psk[new_psk_len] = '\0';
 
-    save_psk(new_psk);
+    bool persisted = save_psk(new_psk);
     mark_authenticated(conn_handle);
-    set_status("OK:PSK_UPDATED");
+    set_status(persisted ? "OK:PSK_UPDATED" : "WARN:PSK_VOLATILE");
     return 0;
 }
 
@@ -726,10 +762,11 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
                 .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
             },
             {
-                /* Command: write (full 33-byte) */
+                /* Command: write (full 33-byte).
+                 * WRITE_NO_RSP lets clients choose lower-latency writes. */
                 .uuid       = &command_uuid.u,
                 .access_cb  = chr_access_command,
-                .flags      = BLE_GATT_CHR_F_WRITE,
+                .flags      = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
             },
             {
                 /* Status: read + notify */
@@ -748,13 +785,13 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
                 /* Command Part 1: write */
                 .uuid       = &command_pt1_uuid.u,
                 .access_cb  = chr_access_command_pt1,
-                .flags      = BLE_GATT_CHR_F_WRITE,
+                .flags      = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
             },
             {
                 /* Command Part 2: write */
                 .uuid       = &command_pt2_uuid.u,
                 .access_cb  = chr_access_command_pt2,
-                .flags      = BLE_GATT_CHR_F_WRITE,
+                .flags      = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
             },
             { 0 }, /* Terminator */
         },
@@ -1014,6 +1051,13 @@ static void main_loop_task(void *param) {
             esp_restart();
         }
 
+        /* ---- Hard restart (unconditional, guards against long-running drift) ---- */
+        if (now > (int64_t)HARD_RESTART_SEC * 1000) {
+            LOG_E(TAG, "Hard restart after %d hours", HARD_RESTART_SEC / 3600);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            esp_restart();
+        }
+
         vTaskDelay(pdMS_TO_TICKS(LOOP_INTERVAL_MS));
     }
 }
@@ -1027,6 +1071,13 @@ void app_main(void) {
 
     /* ---- GPIO init ---- */
     gpio_init_button();
+
+    /* ---- Button release timer (non-blocking pulse) ---- */
+    const esp_timer_create_args_t btn_timer_args = {
+        .callback = button_timer_callback,
+        .name     = "btn_release",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&btn_timer_args, &button_timer));
 
 #ifdef DEBUG_LED_ENABLED
     gpio_init_led();

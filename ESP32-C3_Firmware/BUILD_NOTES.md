@@ -102,3 +102,70 @@ pio run -e esp32c3 -t upload
 
 4. **LED pin parking**: Still parks GPIO 8 low in production, same as the
    Arduino version. Only runs when `DEBUG_LED_ENABLED` is not defined.
+
+## Changes from code review (ESP-IDF version)
+
+### Bug fixes
+
+1. **PSK update separator search**: The `0x00` separator scan previously
+   started at byte 0, which would match a zero byte inside the 32-byte
+   HMAC payload. Now validates that the separator is at exactly byte 32
+   (`buf[HMAC_LEN]`), since the layout is always `[HMAC(32)] [0x00] [newPSK]`.
+
+2. **Button press status on busy**: `press_remote_button()` now returns
+   `bool`. If a press is already in progress (timer hasn't fired yet),
+   callers set `ERR:BUSY` instead of falsely reporting `OK:PRESSED`.
+
+### Power & performance
+
+3. **Non-blocking button press**: The 300ms button pulse no longer blocks
+   the NimBLE host task with `vTaskDelay`. Instead, the GPIO is driven
+   immediately and a one-shot `esp_timer` releases it after
+   `BUTTON_PULSE_MS`. This keeps GATT callbacks responsive during a press.
+   If the timer fails to start, the GPIO is released immediately as a
+   safety fallback.
+
+4. **Advertising interval range**: Changed from fixed 1000ms
+   (`ADV_INTERVAL_MIN = ADV_INTERVAL_MAX = 1600`) to a 1000–2000ms range
+   (`MIN=1600, MAX=3200`). Lets the BLE controller jitter the interval
+   for better coexistence and reduced peak current from synchronized
+   wake-ups.
+
+5. **Main loop tick**: Increased from 1s to 10s (`LOOP_INTERVAL_MS=10000`).
+   The loop only checks timeouts (15s minimum granularity) and reaps ghost
+   slots, so 10s resolution is more than sufficient. Lets the CPU stay in
+   light sleep for longer stretches. WDT timeout increased from 10s to 30s
+   to match.
+
+### Reliability
+
+6. **Hard restart after 24 hours**: Added `HARD_RESTART_SEC=86400`.
+   If the soft restart (every 3 hours when idle) never fires because
+   there's always an active connection, the device now force-restarts
+   after 24 hours regardless. Guards against slow memory leaks or
+   NimBLE state drift.
+
+7. **NVS error handling on PSK save**: `save_psk()` now checks return
+   values from `nvs_open`, `nvs_set_str`, and `nvs_commit`. On failure,
+   the in-memory PSK is still updated (current session works), but the
+   status characteristic reports `WARN:PSK_VOLATILE` instead of
+   `OK:PSK_UPDATED` so the client knows the change won't survive a reboot.
+
+8. **Empty PSK detection in `load_psk`**: Fixed the length check from
+   `len > 0` to `len > 1`. `nvs_get_str` includes the null terminator
+   in the returned length, so `len == 1` means an empty string was stored.
+
+### BLE usability
+
+9. **Write-without-response on command characteristics**: Added
+   `BLE_GATT_CHR_F_WRITE_NO_RSP` to the command, command_pt1, and
+   command_pt2 characteristics. Clients can now choose write-without-response
+   for lower-latency round trips (useful for Garmin watch). Write-with-response
+   still works — the flag is additive.
+
+### New status strings
+
+| Status              | Meaning                                            |
+|---------------------|----------------------------------------------------|
+| `ERR:BUSY`          | Button press rejected — previous press still active |
+| `WARN:PSK_VOLATILE` | PSK updated in memory but NVS write failed          |
