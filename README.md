@@ -30,7 +30,7 @@ Android_Flutter_Application/     Flutter mobile app (Android; iOS untested)
 Garmin_Watch_App/                Garmin Connect IQ watch app
 ESP32-C3_Firmware/               ESP32-C3 ESP-IDF firmware (PlatformIO) — recommended
 ESP32_Arduino_Firmware/          ESP32 Arduino firmware (PlatformIO) — POC, not maintained
-ESP32-C3_Arduino_Firmware/       ESP32 Arduino firmware (PlatformIO) — POC, not maintained
+ESP32-C3_Arduino_Firmware/       ESP32-C3 Arduino firmware (PlatformIO) — POC, not maintained
 ```
 
 ## 🔒 Security
