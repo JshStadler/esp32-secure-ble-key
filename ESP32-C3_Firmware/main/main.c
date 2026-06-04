@@ -35,6 +35,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* FreeRTOS */
 #include "freertos/FreeRTOS.h"
@@ -52,8 +53,8 @@
 #include "nvs.h"
 #include "driver/gpio.h"
 
-/* mbedTLS for HMAC-SHA256 */
-#include "mbedtls/md.h"
+/* PSA Crypto for HMAC-SHA256 (ESP-IDF 6 / mbedTLS 4 public API) */
+#include "psa/crypto.h"
 
 /* BLE TX power control (NimBLE on C3) */
 #include "esp_bt.h"
@@ -433,20 +434,31 @@ static void configure_power_management(void) {
 
 static bool compute_hmac(const uint8_t *nonce, size_t nonce_len,
                          const char *key, uint8_t *out_hmac) {
-    mbedtls_md_context_t ctx;
-    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    const size_t key_len = strlen(key);
+    const psa_algorithm_t alg = PSA_ALG_HMAC(PSA_ALG_SHA_256);
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_id_t key_id = 0;
+    size_t hmac_len = 0;
 
-    mbedtls_md_init(&ctx);
-    if (mbedtls_md_setup(&ctx, info, 1) != 0)    goto fail;
-    if (mbedtls_md_hmac_starts(&ctx, (const uint8_t *)key, strlen(key)) != 0) goto fail;
-    if (mbedtls_md_hmac_update(&ctx, nonce, nonce_len) != 0)                  goto fail;
-    if (mbedtls_md_hmac_finish(&ctx, out_hmac) != 0)                          goto fail;
-    mbedtls_md_free(&ctx);
-    return true;
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_SIGN_MESSAGE);
+    psa_set_key_algorithm(&attributes, alg);
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_HMAC);
+    psa_set_key_bits(&attributes, key_len * 8);
+    psa_set_key_lifetime(&attributes, PSA_KEY_LIFETIME_VOLATILE);
 
-fail:
-    mbedtls_md_free(&ctx);
-    return false;
+    psa_status_t status = psa_import_key(&attributes,
+                                         (const uint8_t *)key, key_len,
+                                         &key_id);
+    if (status == PSA_SUCCESS) {
+        status = psa_mac_compute(key_id, alg,
+                                 nonce, nonce_len,
+                                 out_hmac, HMAC_LEN,
+                                 &hmac_len);
+        psa_destroy_key(key_id);
+    }
+    psa_reset_key_attributes(&attributes);
+
+    return status == PSA_SUCCESS && hmac_len == HMAC_LEN;
 }
 
 /* ============================================================
@@ -1120,6 +1132,13 @@ void app_main(void) {
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
         nvs_flash_init();
+    }
+
+    /* ---- Init PSA Crypto for HMAC ---- */
+    psa_status_t psa_status = psa_crypto_init();
+    if (psa_status != PSA_SUCCESS) {
+        LOG_E(TAG, "PSA crypto init failed: %d", (int)psa_status);
+        abort();
     }
 
     /* ---- Load PSK ---- */
