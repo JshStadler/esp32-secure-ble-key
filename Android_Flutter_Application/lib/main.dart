@@ -517,8 +517,8 @@ class _UnlockScreenState extends State<UnlockScreen> {
         });
       }
 
-      _subscribeToChallengeAndStatus();
-      Future.delayed(const Duration(milliseconds: 200), _sendAuthPing);
+      await _subscribeToChallengeAndStatus();
+      await _sendAuthPing();
     } catch (e) {
       debugPrint('Service discovery failed (attempt $attempt): $e');
       if (attempt < 2 && _device != null && mounted) {
@@ -573,9 +573,8 @@ class _UnlockScreenState extends State<UnlockScreen> {
     }
   }
 
-  void _subscribeToChallengeAndStatus() {
+  Future<void> _subscribeToChallengeAndStatus() async {
     _challengeSub?.cancel();
-    _challengeChar?.setNotifyValue(true);
     _challengeSub = _challengeChar?.onValueReceived.listen(
       (data) {
         _currentNonce = Uint8List.fromList(data);
@@ -584,9 +583,9 @@ class _UnlockScreenState extends State<UnlockScreen> {
         debugPrint('Challenge subscription error: $error');
       },
     );
+    await _challengeChar?.setNotifyValue(true);
 
     _statusSub?.cancel();
-    _statusChar?.setNotifyValue(true);
     _statusSub = _statusChar?.onValueReceived.listen(
       (data) {
         if (!mounted) return;
@@ -634,8 +633,9 @@ class _UnlockScreenState extends State<UnlockScreen> {
       },
       onError: (error) {},
     );
+    await _statusChar?.setNotifyValue(true);
 
-    _readChallenge();
+    await _readChallenge();
   }
 
   Uint8List _computeHMAC(Uint8List nonce, String key) {
@@ -653,9 +653,12 @@ class _UnlockScreenState extends State<UnlockScreen> {
   Future<void> _sendAuthPing() async {
     if (_device == null || _commandChar == null || _currentNonce == null) return;
     try {
-      final payload = _buildCommandPayload(cmdAuthOnly, _currentNonce!, _psk);
-      _currentNonce = null; // consumed by firmware — wait for fresh notification
+      final nonce = _currentNonce!;
+      final payload = _buildCommandPayload(cmdAuthOnly, nonce, _psk);
       await _commandChar!.write(payload, withoutResponse: false);
+      if (_currentNonce == nonce) {
+        _currentNonce = null; // consumed by firmware — wait for fresh read/notification
+      }
     } catch (e) {
       debugPrint('Auth ping failed: $e');
     }
@@ -682,9 +685,12 @@ class _UnlockScreenState extends State<UnlockScreen> {
           return;
         }
       }
-      final payload = _buildCommandPayload(cmdPress, _currentNonce!, _psk);
-      _currentNonce = null; // consumed by firmware — wait for fresh notification
+      final nonce = _currentNonce!;
+      final payload = _buildCommandPayload(cmdPress, nonce, _psk);
       await _commandChar!.write(payload, withoutResponse: false);
+      if (_currentNonce == nonce) {
+        _currentNonce = null; // consumed by firmware — wait for fresh read/notification
+      }
     } catch (e) {
       setState(() {
         _statusMessage = 'Send error';
@@ -871,8 +877,8 @@ class _UnlockScreenState extends State<UnlockScreen> {
                         }
                         return;
                       }
-                      final hmac = _computeHMAC(_currentNonce!, _psk);
-                      _currentNonce = null; // consumed by firmware
+                      final nonce = _currentNonce!;
+                      final hmac = _computeHMAC(nonce, _psk);
                       final separator = Uint8List.fromList([0x00]);
                       final newPskBytes = Uint8List.fromList(utf8.encode(newPsk));
                       final payload = Uint8List.fromList([
@@ -882,6 +888,9 @@ class _UnlockScreenState extends State<UnlockScreen> {
                       ]);
 
                       await _pskUpdateChar!.write(payload, withoutResponse: false);
+                      if (_currentNonce == nonce) {
+                        _currentNonce = null; // consumed by firmware
+                      }
                     } catch (e) {
                       if (context.mounted) {
                         ScaffoldMessenger.of(context).showSnackBar(

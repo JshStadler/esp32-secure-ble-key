@@ -223,7 +223,6 @@ static const ble_uuid128_t command_pt2_uuid =
  * Globals
  * ============================================================ */
 
-static uint8_t current_nonce[NONCE_LEN];
 static char    current_psk[MAX_PSK_LEN + 1];
 
 /* GATT attribute handles (populated by NimBLE after registration) */
@@ -237,6 +236,7 @@ typedef struct {
     uint16_t conn_handle;
     bool     in_use;
     bool     authenticated;
+    uint8_t  nonce[NONCE_LEN];
     int64_t  connected_at;  /* milliseconds from now_ms() */
 } client_state_t;
 
@@ -255,6 +255,7 @@ static split_cmd_state_t split_cmd = {0};
 
 /* Track whether advertising is currently active */
 static bool adv_active = false;
+static uint8_t adv_failure_count = 0;
 
 /* Non-blocking button press: one-shot timer releases the GPIO */
 static esp_timer_handle_t button_timer = NULL;
@@ -264,7 +265,7 @@ static bool button_busy = false;
  * Forward declarations
  * ============================================================ */
 static void start_advertising(void);
-static void generate_nonce(void);
+static void generate_nonce_for_slot(int slot, bool notify);
 static struct os_mbuf *om_from_buf(const void *buf, uint16_t len);
 static int  gap_event_handler(struct ble_gap_event *event, void *arg);
 
@@ -491,18 +492,18 @@ static void invalidate_split_cmd_for(uint16_t conn_handle) {
  * BLE: nonce & status helpers
  * ============================================================ */
 
-static void generate_nonce(void) {
-    esp_fill_random(current_nonce, NONCE_LEN);
+static void generate_nonce_for_slot(int slot, bool notify) {
+    if (slot < 0 || slot >= MAX_CONNECTIONS || !clients[slot].in_use) return;
 
-    /* Notify subscribed clients of new nonce */
+    esp_fill_random(clients[slot].nonce, NONCE_LEN);
+    if (!notify) return;
+
+    /* Notify only this connection so other clients keep their own challenge. */
     struct ble_gap_conn_desc desc;
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (!clients[i].in_use) continue;
-        if (ble_gap_conn_find(clients[i].conn_handle, &desc) == 0) {
-            ble_gatts_notify_custom(clients[i].conn_handle,
-                                    challenge_val_handle,
-                                    om_from_buf(current_nonce, NONCE_LEN));
-        }
+    if (ble_gap_conn_find(clients[slot].conn_handle, &desc) == 0) {
+        ble_gatts_notify_custom(clients[slot].conn_handle,
+                                challenge_val_handle,
+                                om_from_buf(clients[slot].nonce, NONCE_LEN));
     }
 }
 
@@ -532,12 +533,18 @@ static void set_status(const char *msg) {
  * Verify HMAC payload against current nonce and PSK.
  * Always rotates the nonce afterwards (even on failure) to prevent replay.
  */
-static bool verify_auth(const uint8_t *payload, size_t len) {
-    if (len != HMAC_LEN) return false;
+static bool verify_auth(uint16_t conn_handle, const uint8_t *payload, size_t len) {
+    int slot = find_client_by_handle(conn_handle);
+    if (slot < 0) return false;
+
+    if (len != HMAC_LEN) {
+        generate_nonce_for_slot(slot, true);
+        return false;
+    }
 
     uint8_t expected[HMAC_LEN];
-    if (!compute_hmac(current_nonce, NONCE_LEN, current_psk, expected)) {
-        generate_nonce();
+    if (!compute_hmac(clients[slot].nonce, NONCE_LEN, current_psk, expected)) {
+        generate_nonce_for_slot(slot, true);
         return false;
     }
 
@@ -547,7 +554,7 @@ static bool verify_auth(const uint8_t *payload, size_t len) {
         diff |= payload[i] ^ expected[i];
     }
 
-    generate_nonce();  /* rotate unconditionally */
+    generate_nonce_for_slot(slot, true);  /* rotate unconditionally */
     return (diff == 0);
 }
 
@@ -559,7 +566,10 @@ static bool verify_auth(const uint8_t *payload, size_t len) {
 static int chr_access_challenge(uint16_t conn_handle, uint16_t attr_handle,
                                 struct ble_gatt_access_ctxt *ctxt, void *arg) {
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-        int rc = os_mbuf_append(ctxt->om, current_nonce, NONCE_LEN);
+        int slot = find_client_by_handle(conn_handle);
+        if (slot < 0) return BLE_ATT_ERR_UNLIKELY;
+
+        int rc = os_mbuf_append(ctxt->om, clients[slot].nonce, NONCE_LEN);
         return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
     return BLE_ATT_ERR_UNLIKELY;
@@ -600,7 +610,7 @@ static int chr_access_command(uint16_t conn_handle, uint16_t attr_handle,
         return 0;
     }
 
-    if (verify_auth(hmac_payload, hmac_len)) {
+    if (verify_auth(conn_handle, hmac_payload, hmac_len)) {
         mark_authenticated(conn_handle);
         if (cmd_type == CMD_PRESS) {
             set_status(press_remote_button() ? "OK:PRESSED" : "ERR:BUSY");
@@ -685,7 +695,7 @@ static int chr_access_command_pt2(uint16_t conn_handle, uint16_t attr_handle,
         return 0;
     }
 
-    if (verify_auth(full_hmac, HMAC_LEN)) {
+    if (verify_auth(conn_handle, full_hmac, HMAC_LEN)) {
         mark_authenticated(conn_handle);
         if (cmd_type == CMD_PRESS) {
             set_status(press_remote_button() ? "OK:PRESSED" : "ERR:BUSY");
@@ -724,7 +734,7 @@ static int chr_access_psk_update(uint16_t conn_handle, uint16_t attr_handle,
 
     int sep_idx = HMAC_LEN;
 
-    if (!verify_auth(buf, sep_idx)) {
+    if (!verify_auth(conn_handle, buf, sep_idx)) {
         set_status("ERR:PSK_AUTH");
         return 0;
     }
@@ -822,6 +832,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
             clients[slot].authenticated = false;
             clients[slot].connected_at  = now_ms();
             clients[slot].conn_handle   = conn_handle;
+            generate_nonce_for_slot(slot, false);
             LOG_I(TAG, "Client connected, slot %d, handle %d", slot, conn_handle);
         } else {
             /* No free slots, disconnect immediately */
@@ -842,8 +853,6 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
             .max_ce_len          = 0,
         };
         ble_gap_update_params(conn_handle, &params);
-
-        generate_nonce();
 
         /* Continue advertising if we have capacity */
         if (count_active_slots() < MAX_CONNECTIONS) {
@@ -916,6 +925,10 @@ static void start_advertising(void) {
     int rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
         LOG_E(TAG, "adv_set_fields failed: %d", rc);
+        if (++adv_failure_count >= 3 && count_active_slots() == 0) {
+            LOG_E(TAG, "Advertising setup failed repeatedly while idle, restarting");
+            esp_restart();
+        }
         return;
     }
 
@@ -927,6 +940,10 @@ static void start_advertising(void) {
     rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
     if (rc != 0) {
         LOG_E(TAG, "adv_rsp_set_fields failed: %d", rc);
+        if (++adv_failure_count >= 3 && count_active_slots() == 0) {
+            LOG_E(TAG, "Advertising response setup failed repeatedly while idle, restarting");
+            esp_restart();
+        }
         return;
     }
 
@@ -940,11 +957,17 @@ static void start_advertising(void) {
                            &adv_params, gap_event_handler, NULL);
     if (rc == 0) {
         adv_active = true;
+        adv_failure_count = 0;
         LOG_I(TAG, "Advertising started");
     } else if (rc == BLE_HS_EALREADY) {
         adv_active = true;  /* already advertising */
+        adv_failure_count = 0;
     } else {
         LOG_E(TAG, "adv_start failed: %d", rc);
+        if (++adv_failure_count >= 3 && count_active_slots() == 0) {
+            LOG_E(TAG, "Advertising failed repeatedly while idle, restarting");
+            esp_restart();
+        }
     }
 }
 
@@ -973,6 +996,7 @@ static void ble_on_sync(void) {
 
 static void ble_on_reset(int reason) {
     LOG_E(TAG, "BLE host reset, reason=%d", reason);
+    esp_restart();
 }
 
 static void nimble_host_task(void *param) {
@@ -1100,9 +1124,6 @@ void app_main(void) {
 
     /* ---- Load PSK ---- */
     load_psk();
-
-    /* ---- Generate initial nonce ---- */
-    esp_fill_random(current_nonce, NONCE_LEN);
 
     /* ---- Init NimBLE ---- */
     ret = nimble_port_init();

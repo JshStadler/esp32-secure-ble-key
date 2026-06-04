@@ -69,12 +69,14 @@ class BleHandler extends Ble.BleDelegate {
     var _pendingPart2 = null;
     var _hasPendingUnlock = false;
     var _timer = null;
+    var _operationTimer = null;
     var _shouldAutoReconnect = true;
 
     function initialize() {
         BleDelegate.initialize();
         Ble.setDelegate(self);
         _timer = new Timer.Timer();
+        _operationTimer = new Timer.Timer();
 
         // Register the BLE profile
         try {
@@ -214,12 +216,14 @@ class BleHandler extends Ble.BleDelegate {
         _state = STATE_READING_CHALLENGE;
         _statusText = "Reading nonce...";
         WatchUi.requestUpdate();
+        startOperationTimeout();
 
         try {
             challengeChar.requestRead();
         } catch (e) {
             _statusText = "Read failed";
-            _state = STATE_ERROR;
+            _state = STATE_CONNECTED;
+            cancelOperationTimeout();
             System.println("Read error: " + e.getErrorMessage());
             WatchUi.requestUpdate();
         }
@@ -284,9 +288,10 @@ class BleHandler extends Ble.BleDelegate {
 
         try {
             pt1Char.requestWrite(part1, {:writeType => Ble.WRITE_TYPE_WITH_RESPONSE});
+            startOperationTimeout();
         } catch (e) {
             _statusText = "Write pt1: " + e.getErrorMessage();
-            _state = STATE_ERROR;
+            _state = STATE_CONNECTED;
             _pendingPart2 = null;
             WatchUi.requestUpdate();
         }
@@ -321,6 +326,28 @@ class BleHandler extends Ble.BleDelegate {
         if (_state == STATE_WAITING_STATUS) {
             _state = STATE_CONNECTED;
             _statusText = "No response";
+            WatchUi.requestUpdate();
+        }
+    }
+
+    function startOperationTimeout() as Void {
+        _operationTimer.stop();
+        _operationTimer.start(method(:onOperationTimeout), 5000, false);
+    }
+
+    function cancelOperationTimeout() as Void {
+        _operationTimer.stop();
+    }
+
+    function onOperationTimeout() as Void {
+        if (_state == STATE_READING_CHALLENGE || _state == STATE_SENDING_COMMAND) {
+            _pendingPart2 = null;
+            if (_device != null && _device.isConnected()) {
+                _state = STATE_CONNECTED;
+            } else {
+                _state = STATE_IDLE;
+            }
+            _statusText = "Operation timeout";
             WatchUi.requestUpdate();
         }
     }
@@ -402,6 +429,7 @@ class BleHandler extends Ble.BleDelegate {
         } else {
             _device = null;
             _pendingPart2 = null;
+            cancelOperationTimeout();
             _state = STATE_IDLE;
             _statusText = "Disconnected";
             WatchUi.requestUpdate();
@@ -415,14 +443,16 @@ class BleHandler extends Ble.BleDelegate {
 
     function onCharacteristicRead(char, status, value) {
         if (status != Ble.STATUS_SUCCESS) {
+            cancelOperationTimeout();
             _statusText = "Read error";
-            _state = STATE_ERROR;
+            _state = STATE_CONNECTED;
             WatchUi.requestUpdate();
             return;
         }
 
         if (char.getUuid().equals(CarKeyProfile.CHALLENGE_CHAR_UUID)) {
             // Got the nonce, now compute HMAC and send command
+            cancelOperationTimeout();
             sendCommand(value);
         }
     }
@@ -439,40 +469,44 @@ class BleHandler extends Ble.BleDelegate {
                     if (pt2Char != null) {
                         try {
                             pt2Char.requestWrite(_pendingPart2, {:writeType => Ble.WRITE_TYPE_WITH_RESPONSE});
-                            _pendingPart2 = null;
                             return;
                         } catch (e) {
                             _statusText = "Write pt2: " + e.getErrorMessage();
-                            _state = STATE_ERROR;
+                            _state = STATE_CONNECTED;
                         }
                     }
                 }
                 _pendingPart2 = null;
+                cancelOperationTimeout();
                 WatchUi.requestUpdate();
             } else if (status != Ble.STATUS_SUCCESS) {
                 _statusText = "Write pt1 err: " + status;
-                _state = STATE_ERROR;
+                _state = STATE_CONNECTED;
                 _pendingPart2 = null;
+                cancelOperationTimeout();
                 WatchUi.requestUpdate();
             }
         } else if (uuid.equals(CarKeyProfile.COMMAND_PT2_CHAR_UUID)) {
+            _pendingPart2 = null;
+            cancelOperationTimeout();
             if (status == Ble.STATUS_SUCCESS) {
                 _state = STATE_WAITING_STATUS;
                 _statusText = "Sent, waiting...";
                 _timer.start(method(:onStatusTimeout), 2000, false);
             } else {
                 _statusText = "Write pt2 err: " + status;
-                _state = STATE_ERROR;
+                _state = STATE_CONNECTED;
             }
             WatchUi.requestUpdate();
         } else if (uuid.equals(CarKeyProfile.COMMAND_CHAR_UUID)) {
+            cancelOperationTimeout();
             if (status == Ble.STATUS_SUCCESS) {
                 _state = STATE_WAITING_STATUS;
                 _statusText = "Sent, waiting...";
                 _timer.start(method(:onStatusTimeout), 2000, false);
             } else {
                 _statusText = "Write error: " + status;
-                _state = STATE_ERROR;
+                _state = STATE_CONNECTED;
             }
             WatchUi.requestUpdate();
         }
