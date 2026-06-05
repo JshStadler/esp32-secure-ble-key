@@ -662,6 +662,7 @@ static int chr_access_challenge(uint16_t conn_handle, uint16_t attr_handle,
         int slot = ensure_client_slot(conn_handle);
         if (slot < 0) return BLE_ATT_ERR_UNLIKELY;
 
+        LOG_I(TAG, "Challenge read handle=%d slot=%d", conn_handle, slot);
         int rc = os_mbuf_append(ctxt->om, clients[slot].nonce, NONCE_LEN);
         return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
@@ -672,6 +673,7 @@ static int chr_access_challenge(uint16_t conn_handle, uint16_t attr_handle,
 static int chr_access_status(uint16_t conn_handle, uint16_t attr_handle,
                              struct ble_gatt_access_ctxt *ctxt, void *arg) {
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        LOG_I(TAG, "Status read handle=%d status=%s", conn_handle, status_str);
         int rc = os_mbuf_append(ctxt->om, status_str, strlen(status_str));
         return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
@@ -686,7 +688,9 @@ static int chr_access_command(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+    LOG_I(TAG, "Command write handle=%d len=%d", conn_handle, len);
     if (len < 1 || len > 33) {
+        LOG_W(TAG, "Command write bad length handle=%d len=%d", conn_handle, len);
         set_status("ERR:EMPTY");
         return 0;
     }
@@ -697,8 +701,12 @@ static int chr_access_command(uint16_t conn_handle, uint16_t attr_handle,
     uint8_t cmd_type = buf[0];
     const uint8_t *hmac_payload = buf + 1;
     size_t hmac_len = len - 1;
+    LOG_I(TAG, "Command write parsed handle=%d cmd=0x%02x hmac_len=%d",
+          conn_handle, cmd_type, (int)hmac_len);
 
     if (cmd_type != CMD_AUTH_ONLY && cmd_type != CMD_PRESS) {
+        LOG_W(TAG, "Command write unknown cmd handle=%d cmd=0x%02x",
+              conn_handle, cmd_type);
         set_status("ERR:UNKNOWN_CMD");
         return 0;
     }
@@ -725,7 +733,9 @@ static int chr_access_command_pt1(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+    LOG_I(TAG, "Command pt1 write handle=%d len=%d", conn_handle, len);
     if (len != 17) {
+        LOG_W(TAG, "Command pt1 bad length handle=%d len=%d", conn_handle, len);
         set_status("ERR:PT1_LEN");
         return 0;
     }
@@ -738,6 +748,7 @@ static int chr_access_command_pt1(uint16_t conn_handle, uint16_t attr_handle,
     split_cmd.has_part1   = true;
     split_cmd.conn_handle = conn_handle;
     split_cmd.part1_time  = now_ms();
+    LOG_I(TAG, "Command pt1 stored handle=%d cmd=0x%02x", conn_handle, split_cmd.cmd_type);
 
     return 0;
 }
@@ -750,19 +761,25 @@ static int chr_access_command_pt2(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+    LOG_I(TAG, "Command pt2 write handle=%d len=%d has_part1=%d part1_handle=%d",
+          conn_handle, len, split_cmd.has_part1 ? 1 : 0, split_cmd.conn_handle);
     if (len != 16) {
         split_cmd.has_part1 = false;
+        LOG_W(TAG, "Command pt2 bad length handle=%d len=%d", conn_handle, len);
         set_status("ERR:PT2_LEN");
         return 0;
     }
 
     if (!split_cmd.has_part1) {
+        LOG_W(TAG, "Command pt2 missing pt1 handle=%d", conn_handle);
         set_status("ERR:NO_PT1");
         return 0;
     }
 
     if (split_cmd.conn_handle != conn_handle) {
         split_cmd.has_part1 = false;
+        LOG_W(TAG, "Command pt2 conn mismatch handle=%d part1_handle=%d",
+              conn_handle, split_cmd.conn_handle);
         set_status("ERR:CONN_MISMATCH");
         return 0;
     }
@@ -770,6 +787,8 @@ static int chr_access_command_pt2(uint16_t conn_handle, uint16_t attr_handle,
     /* Timeout: part 2 must arrive within 5 seconds of part 1 */
     if (now_ms() - split_cmd.part1_time > 5000) {
         split_cmd.has_part1 = false;
+        LOG_W(TAG, "Command pt2 timeout handle=%d elapsed_ms=%lld",
+              conn_handle, (long long)(now_ms() - split_cmd.part1_time));
         set_status("ERR:TIMEOUT");
         return 0;
     }
@@ -783,8 +802,11 @@ static int chr_access_command_pt2(uint16_t conn_handle, uint16_t attr_handle,
     memcpy(full_hmac + 16, buf, 16);
     uint8_t cmd_type = split_cmd.cmd_type;
     split_cmd.has_part1 = false;
+    LOG_I(TAG, "Command split parsed handle=%d cmd=0x%02x", conn_handle, cmd_type);
 
     if (cmd_type != CMD_AUTH_ONLY && cmd_type != CMD_PRESS) {
+        LOG_W(TAG, "Command split unknown cmd handle=%d cmd=0x%02x",
+              conn_handle, cmd_type);
         set_status("ERR:UNKNOWN_CMD");
         return 0;
     }
