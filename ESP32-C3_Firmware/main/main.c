@@ -143,6 +143,14 @@ static const char *TAG = "CAR_UNLOCK";
 #define UNAUTH_TIMEOUT_SEC 120
 #define AUTH_TIMEOUT_SEC   300
 
+/* BLE connection parameters.
+ * Units: interval = 1.25ms, supervision timeout = 10ms.
+ * Keep the link responsive, but avoid the brittle 4s timeout used before. */
+#define CONN_INTERVAL_MIN 36    /* 45ms */
+#define CONN_INTERVAL_MAX 72    /* 90ms */
+#define CONN_LATENCY      4     /* may skip up to 4 idle connection events */
+#define CONN_SUP_TIMEOUT  1000  /* 10s */
+
 /* Periodic restart interval (seconds). 3 hours = 10800s. */
 #define RESTART_INTERVAL_SEC 10800
 
@@ -889,14 +897,14 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
             return 0;
         }
 
-        /* Tighten link supervision: 4s timeout.
+        /* Balanced link parameters for phone + watch coexistence.
          * Params: min_itvl, max_itvl (1.25ms units), latency,
          *         supervision_timeout (10ms units) */
         struct ble_gap_upd_params params = {
-            .itvl_min            = 24,   /* 30ms */
-            .itvl_max            = 48,   /* 60ms */
-            .latency             = 0,
-            .supervision_timeout = 400,  /* 4s */
+            .itvl_min            = CONN_INTERVAL_MIN,
+            .itvl_max            = CONN_INTERVAL_MAX,
+            .latency             = CONN_LATENCY,
+            .supervision_timeout = CONN_SUP_TIMEOUT,
             .min_ce_len          = 0,
             .max_ce_len          = 0,
         };
