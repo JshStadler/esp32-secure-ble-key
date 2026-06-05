@@ -56,9 +56,13 @@ CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
 # Reduce NimBLE log noise (0=DEBUG,1=INFO,2=WARNING,3=ERROR,4=CRITICAL)
 CONFIG_BT_NIMBLE_LOG_LEVEL=2
 
-# Enable BLE sleep: lets the controller sleep between
-# advertising/connection events. Works with PM auto light sleep.
+# Enable BLE controller modem sleep: lets the controller sleep between
+# advertising/connection events. This is the effective ESP32-C3 switch
+# for allowing BLE to cooperate with PM auto light sleep.
 CONFIG_BT_NIMBLE_SLEEP_ENABLE=y
+CONFIG_BT_CTRL_MODEM_SLEEP=y
+CONFIG_BT_CTRL_MODEM_SLEEP_MODE_1=y
+CONFIG_BT_CTRL_LPCLK_SEL_MAIN_XTAL=y
 
 # Disable unused NimBLE roles to save flash/RAM
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
