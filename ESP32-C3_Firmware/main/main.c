@@ -125,18 +125,22 @@ static const char *TAG = "CAR_UNLOCK";
 /* BLE TX power in dBm. 3 dBm good for car cabin with external antenna. */
 #define BLE_TX_POWER 3
 
-/* BLE advertising interval (in 0.625ms units).
- * 1600 = 1000ms, 3200 = 2000ms. Giving a range lets the
- * controller jitter the interval for better coexistence
- * and reduced peak current from synchronized wake-ups. */
-#define ADV_INTERVAL_MIN 1600
-#define ADV_INTERVAL_MAX 3200
+/* BLE advertising intervals (in 0.625ms units).
+ * Fast mode improves Garmin discovery after boot/disconnect/activity.
+ * Slow mode preserves the previous low-power idle behavior. */
+#define ADV_FAST_INTERVAL_MIN 160   /* 100ms */
+#define ADV_FAST_INTERVAL_MAX 320   /* 200ms */
+#define ADV_SLOW_INTERVAL_MIN 1600  /* 1000ms */
+#define ADV_SLOW_INTERVAL_MAX 3200  /* 2000ms */
+
+/* Keep fast advertising active briefly after events where a reconnect is likely. */
+#define FAST_ADV_WINDOW_SEC 60
 
 /* Max simultaneous BLE connections */
 #define MAX_CONNECTIONS 3
 
 /* Auto-disconnect timeouts (seconds) */
-#define UNAUTH_TIMEOUT_SEC 15
+#define UNAUTH_TIMEOUT_SEC 120
 #define AUTH_TIMEOUT_SEC   300
 
 /* Periodic restart interval (seconds). 3 hours = 10800s. */
@@ -257,6 +261,9 @@ static split_cmd_state_t split_cmd = {0};
 /* Track whether advertising is currently active */
 static bool adv_active = false;
 static uint8_t adv_failure_count = 0;
+static bool adv_using_fast_interval = false;
+static int64_t fast_adv_until_ms = 0;
+static bool task_wdt_enabled = false;
 
 /* Non-blocking button press: one-shot timer releases the GPIO */
 static esp_timer_handle_t button_timer = NULL;
@@ -266,7 +273,9 @@ static bool button_busy = false;
  * Forward declarations
  * ============================================================ */
 static void start_advertising(void);
+static void mark_ble_activity(void);
 static void generate_nonce_for_slot(int slot, bool notify);
+static int  ensure_client_slot(uint16_t conn_handle);
 static struct os_mbuf *om_from_buf(const void *buf, uint16_t len);
 static int  gap_event_handler(struct ble_gap_event *event, void *arg);
 
@@ -479,6 +488,26 @@ static int find_client_by_handle(uint16_t conn_handle) {
     return -1;
 }
 
+static int ensure_client_slot(uint16_t conn_handle) {
+    int slot = find_client_by_handle(conn_handle);
+    if (slot >= 0) return slot;
+
+    struct ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(conn_handle, &desc) != 0) return -1;
+
+    slot = find_client_slot();
+    if (slot < 0) return -1;
+
+    clients[slot].in_use        = true;
+    clients[slot].authenticated = false;
+    clients[slot].connected_at  = now_ms();
+    clients[slot].conn_handle   = conn_handle;
+    generate_nonce_for_slot(slot, false);
+    mark_ble_activity();
+    LOG_W(TAG, "Repaired missing client slot %d for handle %d", slot, conn_handle);
+    return slot;
+}
+
 static void mark_authenticated(uint16_t conn_handle) {
     int slot = find_client_by_handle(conn_handle);
     if (slot >= 0) {
@@ -541,12 +570,16 @@ static void set_status(const char *msg) {
     }
 }
 
+static void mark_ble_activity(void) {
+    fast_adv_until_ms = now_ms() + ((int64_t)FAST_ADV_WINDOW_SEC * 1000);
+}
+
 /**
  * Verify HMAC payload against current nonce and PSK.
  * Always rotates the nonce afterwards (even on failure) to prevent replay.
  */
 static bool verify_auth(uint16_t conn_handle, const uint8_t *payload, size_t len) {
-    int slot = find_client_by_handle(conn_handle);
+    int slot = ensure_client_slot(conn_handle);
     if (slot < 0) return false;
 
     if (len != HMAC_LEN) {
@@ -578,7 +611,7 @@ static bool verify_auth(uint16_t conn_handle, const uint8_t *payload, size_t len
 static int chr_access_challenge(uint16_t conn_handle, uint16_t attr_handle,
                                 struct ble_gatt_access_ctxt *ctxt, void *arg) {
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-        int slot = find_client_by_handle(conn_handle);
+        int slot = ensure_client_slot(conn_handle);
         if (slot < 0) return BLE_ATT_ERR_UNLIKELY;
 
         int rc = os_mbuf_append(ctxt->om, clients[slot].nonce, NONCE_LEN);
@@ -623,6 +656,7 @@ static int chr_access_command(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     if (verify_auth(conn_handle, hmac_payload, hmac_len)) {
+        mark_ble_activity();
         mark_authenticated(conn_handle);
         if (cmd_type == CMD_PRESS) {
             set_status(press_remote_button() ? "OK:PRESSED" : "ERR:BUSY");
@@ -708,6 +742,7 @@ static int chr_access_command_pt2(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     if (verify_auth(conn_handle, full_hmac, HMAC_LEN)) {
+        mark_ble_activity();
         mark_authenticated(conn_handle);
         if (cmd_type == CMD_PRESS) {
             set_status(press_remote_button() ? "OK:PRESSED" : "ERR:BUSY");
@@ -845,6 +880,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
             clients[slot].connected_at  = now_ms();
             clients[slot].conn_handle   = conn_handle;
             generate_nonce_for_slot(slot, false);
+            mark_ble_activity();
             LOG_I(TAG, "Client connected, slot %d, handle %d", slot, conn_handle);
         } else {
             /* No free slots, disconnect immediately */
@@ -888,7 +924,8 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
 
         invalidate_split_cmd_for(conn_handle);
 
-        /* Always restart advertising after disconnect */
+        /* Use fast advertising after disconnect because reconnects are likely. */
+        mark_ble_activity();
         start_advertising();
         break;
     }
@@ -927,6 +964,18 @@ static void start_advertising(void) {
     struct ble_gap_adv_params adv_params = {0};
     struct ble_hs_adv_fields fields = {0};
     struct ble_hs_adv_fields rsp_fields = {0};
+    bool use_fast_adv = now_ms() < fast_adv_until_ms;
+
+    if (adv_active) {
+        if (adv_using_fast_interval == use_fast_adv) {
+            return;
+        }
+        int stop_rc = ble_gap_adv_stop();
+        if (stop_rc != 0 && stop_rc != BLE_HS_EALREADY) {
+            LOG_W(TAG, "adv_stop for interval switch failed: %d", stop_rc);
+        }
+        adv_active = false;
+    }
 
     /* Advertising data: flags + service UUID */
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
@@ -962,15 +1011,17 @@ static void start_advertising(void) {
     /* Advertising parameters */
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;  /* undirected connectable */
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;  /* general discoverable */
-    adv_params.itvl_min  = ADV_INTERVAL_MIN;
-    adv_params.itvl_max  = ADV_INTERVAL_MAX;
+    adv_params.itvl_min  = use_fast_adv ? ADV_FAST_INTERVAL_MIN : ADV_SLOW_INTERVAL_MIN;
+    adv_params.itvl_max  = use_fast_adv ? ADV_FAST_INTERVAL_MAX : ADV_SLOW_INTERVAL_MAX;
 
     rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
                            &adv_params, gap_event_handler, NULL);
     if (rc == 0) {
         adv_active = true;
+        adv_using_fast_interval = use_fast_adv;
         adv_failure_count = 0;
-        LOG_I(TAG, "Advertising started");
+        LOG_I(TAG, "Advertising started (%s interval)",
+              use_fast_adv ? "fast" : "slow");
     } else if (rc == BLE_HS_EALREADY) {
         adv_active = true;  /* already advertising */
         adv_failure_count = 0;
@@ -1001,9 +1052,9 @@ static void ble_on_sync(void) {
     /* Set TX power */
     esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P3);
 
+    mark_ble_activity();
     start_advertising();
-    LOG_I(TAG, "BLE synced, advertising started (TX %d dBm, interval %d ms)",
-          BLE_TX_POWER, (ADV_INTERVAL_MAX * 625) / 1000);
+    LOG_I(TAG, "BLE synced, advertising started (TX %d dBm)", BLE_TX_POWER);
 }
 
 static void ble_on_reset(int reason) {
@@ -1023,11 +1074,22 @@ static void nimble_host_task(void *param) {
 
 static void main_loop_task(void *param) {
     /* Subscribe this task to the task watchdog */
-    esp_task_wdt_add(NULL);
-    LOG_I(TAG, "Main loop started, WDT subscribed");
+    bool subscribed_to_wdt = false;
+    if (task_wdt_enabled) {
+        esp_err_t wdt_ret = esp_task_wdt_add(NULL);
+        if (wdt_ret == ESP_OK) {
+            subscribed_to_wdt = true;
+            LOG_I(TAG, "Main loop started, WDT subscribed");
+        } else {
+            LOG_E(TAG, "Failed to subscribe main loop to TWDT: %s",
+                  esp_err_to_name(wdt_ret));
+        }
+    }
 
     while (1) {
-        esp_task_wdt_reset();
+        if (subscribed_to_wdt) {
+            esp_task_wdt_reset();
+        }
         int64_t now = now_ms();
 
         /* ---- Ghost slot reaper ----
@@ -1053,6 +1115,11 @@ static void main_loop_task(void *param) {
 
         /* If we freed slots and aren't at capacity, re-enable advertising */
         if (nimble_count < MAX_CONNECTIONS && !adv_active) {
+            start_advertising();
+        }
+
+        /* Drop back to low-power advertising after the fast reconnect window. */
+        if (adv_active && adv_using_fast_interval && now >= fast_adv_until_ms) {
             start_advertising();
         }
 
@@ -1171,8 +1238,17 @@ void app_main(void) {
         .idle_core_mask = 0,       /* don't watch idle task */
         .trigger_panic = true,
     };
-    esp_task_wdt_reconfigure(&wdt_config);
-    LOG_I(TAG, "Task watchdog configured (%ds)", WDT_TIMEOUT_SEC);
+    ret = esp_task_wdt_init(&wdt_config);
+    if (ret == ESP_ERR_INVALID_STATE) {
+        ret = esp_task_wdt_reconfigure(&wdt_config);
+    }
+    if (ret == ESP_OK) {
+        task_wdt_enabled = true;
+        LOG_I(TAG, "Task watchdog configured (%ds)", WDT_TIMEOUT_SEC);
+    } else {
+        task_wdt_enabled = false;
+        LOG_E(TAG, "Task watchdog setup failed: %s", esp_err_to_name(ret));
+    }
 
     /* ---- Start NimBLE host task ---- */
     nimble_port_freertos_init(nimble_host_task);
