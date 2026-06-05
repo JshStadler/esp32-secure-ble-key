@@ -275,6 +275,7 @@ static bool button_busy = false;
  * Forward declarations
  * ============================================================ */
 static void start_advertising(void);
+static void force_restart_advertising(void);
 static void mark_ble_activity(void);
 static int  count_active_slots(void);
 static void log_client_state(const char *reason);
@@ -1012,7 +1013,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
 
         /* Use fast advertising after disconnect because reconnects are likely. */
         mark_ble_activity();
-        start_advertising();
+        force_restart_advertising();
         log_client_state("disconnect");
         break;
     }
@@ -1124,6 +1125,16 @@ static void start_advertising(void) {
             esp_restart();
         }
     }
+}
+
+static void force_restart_advertising(void) {
+    int stop_rc = ble_gap_adv_stop();
+    if (stop_rc != 0 && stop_rc != BLE_HS_EALREADY) {
+        LOG_W(TAG, "forced adv_stop failed: %d", stop_rc);
+    }
+
+    adv_active = false;
+    start_advertising();
 }
 
 /* ============================================================
