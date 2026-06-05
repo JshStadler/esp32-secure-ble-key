@@ -87,8 +87,10 @@ static const char *TAG = "CAR_UNLOCK";
 #define LOG_W(tag, fmt, ...) ESP_LOGW(tag, fmt, ##__VA_ARGS__)
 #define LOG_E(tag, fmt, ...) ESP_LOGE(tag, fmt, ##__VA_ARGS__)
 #else
-#define LOG_I(tag, fmt, ...) do {} while(0)
-#define LOG_W(tag, fmt, ...) do {} while(0)
+/* Keep firmware diagnostics visible while BLE reliability is being tuned.
+ * ESP_LOG levels are still tag-controlled at runtime. */
+#define LOG_I(tag, fmt, ...) ESP_LOGI(tag, fmt, ##__VA_ARGS__)
+#define LOG_W(tag, fmt, ...) ESP_LOGW(tag, fmt, ##__VA_ARGS__)
 #define LOG_E(tag, fmt, ...) ESP_LOGE(tag, fmt, ##__VA_ARGS__)
 #endif
 
@@ -274,6 +276,7 @@ static bool button_busy = false;
  * ============================================================ */
 static void start_advertising(void);
 static void mark_ble_activity(void);
+static void log_client_state(const char *reason);
 static void generate_nonce_for_slot(int slot, bool notify);
 static int  ensure_client_slot(uint16_t conn_handle);
 static struct os_mbuf *om_from_buf(const void *buf, uint16_t len);
@@ -523,6 +526,27 @@ static int count_active_slots(void) {
     return count;
 }
 
+static void log_client_state(const char *reason) {
+    char slots[96];
+    int used = snprintf(slots, sizeof(slots), "slots=");
+    for (int i = 0; i < MAX_CONNECTIONS && used > 0 && used < (int)sizeof(slots); i++) {
+        used += snprintf(slots + used, sizeof(slots) - used,
+                         "%s%d:%s/h%d/auth%d",
+                         i == 0 ? "" : ",",
+                         i,
+                         clients[i].in_use ? "used" : "free",
+                         clients[i].conn_handle,
+                         clients[i].authenticated ? 1 : 0);
+    }
+    LOG_I(TAG, "%s: active=%d adv=%d fast=%d split=%d %s",
+          reason,
+          count_active_slots(),
+          adv_active ? 1 : 0,
+          adv_using_fast_interval ? 1 : 0,
+          split_cmd.has_part1 ? 1 : 0,
+          slots);
+}
+
 static void invalidate_split_cmd_for(uint16_t conn_handle) {
     if (split_cmd.has_part1 && split_cmd.conn_handle == conn_handle) {
         split_cmd.has_part1 = false;
@@ -542,9 +566,13 @@ static void generate_nonce_for_slot(int slot, bool notify) {
     /* Notify only this connection so other clients keep their own challenge. */
     struct ble_gap_conn_desc desc;
     if (ble_gap_conn_find(clients[slot].conn_handle, &desc) == 0) {
-        ble_gatts_notify_custom(clients[slot].conn_handle,
-                                challenge_val_handle,
-                                om_from_buf(clients[slot].nonce, NONCE_LEN));
+        int rc = ble_gatts_notify_custom(clients[slot].conn_handle,
+                                         challenge_val_handle,
+                                         om_from_buf(clients[slot].nonce, NONCE_LEN));
+        if (rc != 0) {
+            LOG_W(TAG, "Challenge notify failed handle=%d rc=%d",
+                  clients[slot].conn_handle, rc);
+        }
     }
 }
 
@@ -563,9 +591,13 @@ static void set_status(const char *msg) {
         if (!clients[i].in_use) continue;
         struct ble_gap_conn_desc desc;
         if (ble_gap_conn_find(clients[i].conn_handle, &desc) == 0) {
-            ble_gatts_notify_custom(clients[i].conn_handle,
-                                    status_val_handle,
-                                    om_from_buf(status_str, strlen(status_str)));
+            int rc = ble_gatts_notify_custom(clients[i].conn_handle,
+                                             status_val_handle,
+                                             om_from_buf(status_str, strlen(status_str)));
+            if (rc != 0) {
+                LOG_W(TAG, "Status notify failed handle=%d rc=%d msg=%s",
+                      clients[i].conn_handle, rc, status_str);
+            }
         }
     }
 }
@@ -580,15 +612,22 @@ static void mark_ble_activity(void) {
  */
 static bool verify_auth(uint16_t conn_handle, const uint8_t *payload, size_t len) {
     int slot = ensure_client_slot(conn_handle);
-    if (slot < 0) return false;
+    if (slot < 0) {
+        LOG_W(TAG, "Auth failed: no client slot handle=%d", conn_handle);
+        return false;
+    }
 
     if (len != HMAC_LEN) {
+        LOG_W(TAG, "Auth failed: bad HMAC len handle=%d len=%d",
+              conn_handle, (int)len);
         generate_nonce_for_slot(slot, true);
         return false;
     }
 
     uint8_t expected[HMAC_LEN];
     if (!compute_hmac(clients[slot].nonce, NONCE_LEN, current_psk, expected)) {
+        LOG_E(TAG, "Auth failed: HMAC compute error handle=%d slot=%d",
+              conn_handle, slot);
         generate_nonce_for_slot(slot, true);
         return false;
     }
@@ -600,7 +639,9 @@ static bool verify_auth(uint16_t conn_handle, const uint8_t *payload, size_t len
     }
 
     generate_nonce_for_slot(slot, true);  /* rotate unconditionally */
-    return (diff == 0);
+    bool ok = (diff == 0);
+    LOG_I(TAG, "Auth %s handle=%d slot=%d", ok ? "OK" : "FAIL", conn_handle, slot);
+    return ok;
 }
 
 /* ============================================================
@@ -882,9 +923,11 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
             generate_nonce_for_slot(slot, false);
             mark_ble_activity();
             LOG_I(TAG, "Client connected, slot %d, handle %d", slot, conn_handle);
+            log_client_state("connect");
         } else {
             /* No free slots, disconnect immediately */
             LOG_W(TAG, "No free slots, disconnecting handle %d", conn_handle);
+            log_client_state("connect-no-slot");
             ble_gap_terminate(conn_handle, BLE_ERR_CONN_LIMIT);
             return 0;
         }
@@ -907,6 +950,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
             start_advertising();
         } else {
             adv_active = false;
+            log_client_state("advertising-stopped-at-capacity");
         }
         break;
     }
@@ -927,6 +971,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
         /* Use fast advertising after disconnect because reconnects are likely. */
         mark_ble_activity();
         start_advertising();
+        log_client_state("disconnect");
         break;
     }
 
@@ -937,6 +982,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
         if (count_active_slots() < MAX_CONNECTIONS) {
             start_advertising();
         }
+        log_client_state("adv-complete");
         break;
 
     case BLE_GAP_EVENT_MTU:
@@ -1022,11 +1068,14 @@ static void start_advertising(void) {
         adv_failure_count = 0;
         LOG_I(TAG, "Advertising started (%s interval)",
               use_fast_adv ? "fast" : "slow");
+        log_client_state("adv-start");
     } else if (rc == BLE_HS_EALREADY) {
         adv_active = true;  /* already advertising */
         adv_failure_count = 0;
+        log_client_state("adv-already");
     } else {
         LOG_E(TAG, "adv_start failed: %d", rc);
+        log_client_state("adv-start-failed");
         if (++adv_failure_count >= 3 && count_active_slots() == 0) {
             LOG_E(TAG, "Advertising failed repeatedly while idle, restarting");
             esp_restart();
@@ -1108,6 +1157,7 @@ static void main_loop_task(void *param) {
                 invalidate_split_cmd_for(clients[i].conn_handle);
                 clients[i].in_use = false;
                 clients[i].authenticated = false;
+                log_client_state("ghost-reaped");
             } else {
                 nimble_count++;
             }
@@ -1141,6 +1191,7 @@ static void main_loop_task(void *param) {
                 clients[i].in_use = false;
                 clients[i].authenticated = false;
                 invalidate_split_cmd_for(handle);
+                log_client_state("client-timeout");
 
                 /* Ask NimBLE to tear down the link */
                 ble_gap_terminate(handle, BLE_ERR_CONN_TERM_LOCAL);
@@ -1170,6 +1221,7 @@ static void main_loop_task(void *param) {
  * ============================================================ */
 
 void app_main(void) {
+    esp_log_level_set(TAG, ESP_LOG_INFO);
     LOG_I(TAG, "ESP32-C3 BLE Car Unlock starting...");
 
     /* ---- GPIO init ---- */
