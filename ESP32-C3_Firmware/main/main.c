@@ -276,6 +276,7 @@ static bool button_busy = false;
  * ============================================================ */
 static void start_advertising(void);
 static void mark_ble_activity(void);
+static int  count_active_slots(void);
 static void log_client_state(const char *reason);
 static void generate_nonce_for_slot(int slot, bool notify);
 static int  ensure_client_slot(uint16_t conn_handle);
@@ -508,6 +509,12 @@ static int ensure_client_slot(uint16_t conn_handle) {
     generate_nonce_for_slot(slot, false);
     mark_ble_activity();
     LOG_W(TAG, "Repaired missing client slot %d for handle %d", slot, conn_handle);
+    log_client_state("slot-repaired");
+
+    if (count_active_slots() < MAX_CONNECTIONS) {
+        start_advertising();
+    }
+
     return slot;
 }
 
@@ -908,8 +915,12 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
         uint16_t conn_handle = event->connect.conn_handle;
 
         if (event->connect.status != 0) {
-            /* Connection failed, restart advertising */
+            /* Connection failed. The controller may already have stopped
+             * advertising, so force our cached state back to inactive before
+             * restarting. */
             LOG_W(TAG, "Connect failed, status=%d", event->connect.status);
+            adv_active = false;
+            log_client_state("connect-failed");
             start_advertising();
             return 0;
         }
@@ -993,6 +1004,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
     case BLE_GAP_EVENT_SUBSCRIBE:
         LOG_I(TAG, "Subscribe: conn_handle=%d, attr_handle=%d",
               event->subscribe.conn_handle, event->subscribe.attr_handle);
+        ensure_client_slot(event->subscribe.conn_handle);
         break;
 
     default:
