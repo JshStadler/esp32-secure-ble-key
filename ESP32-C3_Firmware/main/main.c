@@ -925,6 +925,11 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
             return 0;
         }
 
+        /* A successful connection consumes the advertising procedure on many
+         * controllers. Treat advertising as stopped so we really restart it
+         * below when more connection slots are available. */
+        adv_active = false;
+
         int slot = find_client_slot();
         if (slot >= 0) {
             clients[slot].in_use        = true;
@@ -970,6 +975,11 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
         uint16_t conn_handle = event->disconnect.conn.conn_handle;
         LOG_I(TAG, "Disconnect handle %d, reason 0x%02x",
               conn_handle, event->disconnect.reason);
+
+        /* Do not trust cached advertising state across disconnect. If the
+         * controller stopped advertising, an early return here creates the
+         * reconnect delay seen in logs until the next interval switch. */
+        adv_active = false;
 
         int slot = find_client_by_handle(conn_handle);
         if (slot >= 0) {
