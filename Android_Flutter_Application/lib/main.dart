@@ -191,6 +191,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
 
   // Cached device MAC
   String? _cachedMac;
+  bool _allowCachedDirectConnect = true;
 
   // Auto-reconnect
   bool _shouldAutoConnect = true;
@@ -319,10 +320,10 @@ class _UnlockScreenState extends State<UnlockScreen> {
 
   bool _deviceReady = false;
 
-  /// Start connection in parallel:
+  /// Start connection:
   /// - Always start scanning
-  /// - If cached MAC exists, also try direct connect simultaneously
-  /// - Whichever succeeds first calls _setupDevice, the other is ignored
+  /// - On app launch only, also try the cached MAC direct route
+  /// - Later reconnects use scan only to avoid stale Android BLE connects
   void _startConnection() {
     if (_connectionState != BleConnectionState.disconnected) return;
     if (!_bluetoothOn) {
@@ -342,8 +343,11 @@ class _UnlockScreenState extends State<UnlockScreen> {
     // Always start scanning
     _startScan();
 
-    // If cached MAC exists, try direct connect in parallel
-    if (_cachedMac != null) {
+    // If cached MAC exists, try direct connect in parallel only once per app
+    // session. Reconnects are scan-only because repeated cached direct connects
+    // can leave stale Android-side attempts racing the real connection.
+    if (_cachedMac != null && _allowCachedDirectConnect) {
+      _allowCachedDirectConnect = false;
       _tryDirectConnect(_cachedMac!);
     }
   }
