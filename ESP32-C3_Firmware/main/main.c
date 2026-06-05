@@ -673,7 +673,6 @@ static int chr_access_challenge(uint16_t conn_handle, uint16_t attr_handle,
 static int chr_access_status(uint16_t conn_handle, uint16_t attr_handle,
                              struct ble_gatt_access_ctxt *ctxt, void *arg) {
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-        LOG_I(TAG, "Status read handle=%d status=%s", conn_handle, status_str);
         int rc = os_mbuf_append(ctxt->om, status_str, strlen(status_str));
         return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
