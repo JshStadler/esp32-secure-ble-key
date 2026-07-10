@@ -253,6 +253,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
     _btStateSub?.cancel();
     _resultClearTimer?.cancel();
     _reconnectTimer?.cancel();
+    _device?.disconnect();
     super.dispose();
   }
 

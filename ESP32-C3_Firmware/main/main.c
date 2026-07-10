@@ -143,8 +143,8 @@ static const char *TAG = "CAR_UNLOCK";
 #define MAX_CONNECTIONS 3
 
 /* Auto-disconnect timeouts (seconds) */
-#define UNAUTH_TIMEOUT_SEC 120
-#define AUTH_TIMEOUT_SEC   300
+#define UNAUTH_TIMEOUT_SEC 20
+#define AUTH_TIMEOUT_SEC   1800
 
 /* Periodic restart interval (seconds). 3 hours = 10800s. */
 #define RESTART_INTERVAL_SEC 10800
