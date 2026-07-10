@@ -29,7 +29,7 @@
  *   - Status characteristic (read/notify): result of last command
  *   - PSK Update characteristic (write): change PSK (requires auth)
  *
- * Build: ESP-IDF 5.1.x via PlatformIO (espressif32@6.13.0)
+ * Build: ESP-IDF 6.0.1 via PlatformIO (espressif32@7.0.1)
  * Board: ESP32-C3-DevKitM-1
  */
 

@@ -6,15 +6,17 @@
 
 | Metric             | Arduino framework       | ESP-IDF                          |
 |--------------------|-------------------------|----------------------------------|
-| Idle draw (no BLE) | ~15-20 mA               | ~2-5 mA (auto light sleep + DFS) |
+| Idle draw (no BLE) | ~15-20 mA               | Measure on installed hardware    |
 | CPU idle freq      | 80 MHz (fixed)          | 10 MHz (DFS auto-scales)         |
 | CPU active freq    | 80 MHz (fixed)          | 80 MHz (DFS auto-scales)         |
-| Sleep mode         | None (busy idle loop)   | Auto light sleep (tickless idle) |
+| Sleep mode         | None (busy idle loop)   | Tickless idle + DFS configured   |
 | Wi-Fi stack        | Disabled at runtime     | Excluded at build time           |
-| BLE modem sleep    | Yes (NimBLE flag)       | Yes + cooperates with PM sleep   |
+| BLE modem sleep    | Yes (NimBLE flag)       | Disabled for link reliability    |
 
-The key unlock: `CONFIG_PM_ENABLE` + `CONFIG_FREERTOS_USE_TICKLESS_IDLE` are only
-available in ESP-IDF because Arduino's FreeRTOS libs are precompiled without them.
+`CONFIG_PM_ENABLE` + `CONFIG_FREERTOS_USE_TICKLESS_IDLE` allow DFS and tickless
+idle. BLE modem sleep is intentionally disabled in the current production
+configuration because it caused unreliable phone/watch behavior. Consequently,
+the old 2-5 mA estimate must not be treated as a current measured result.
 
 ### API mapping
 
@@ -40,7 +42,8 @@ available in ESP-IDF because Arduino's FreeRTOS libs are precompiled without the
   (`gatt_svcs[]`) with access callbacks. NimBLE registers everything at init.
 
 - **Notifications**: `ble_gatts_notify_custom()` replaces `characteristic->notify()`.
-  We iterate active client slots and notify each subscribed connection.
+  Command results are sent only to the initiating connection so a phone and
+  watch cannot consume each other's response.
 
 - **GAP events**: A single `gap_event_handler()` replaces the `ServerCallbacks`
   class. Handles connect, disconnect, advertising complete, MTU, and subscribe.
@@ -58,6 +61,11 @@ pio run -e esp32c3 -t upload
 pio device monitor
 ```
 
+The tested toolchain is pinned to PlatformIO Espressif32 `7.0.1`, which supplies
+ESP-IDF `6.0.1`. PlatformIO rejects ESP-IDF project paths containing spaces.
+Build from a path without spaces or temporarily map the repository to a drive
+letter before running these commands.
+
 ## Debug builds
 
 To enable serial logging during development:
@@ -67,7 +75,7 @@ To enable serial logging during development:
 3. In `sdkconfig.defaults`, change:
    - `CONFIG_ESP_CONSOLE_NONE=y` → `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`
    - `CONFIG_LOG_DEFAULT_LEVEL=1` → `CONFIG_LOG_DEFAULT_LEVEL=3`
-4. **Delete `sdkconfig`** so it regenerates from defaults: `rm sdkconfig`
+4. **Delete `sdkconfig.esp32c3`** so it regenerates from defaults.
 5. Rebuild: `pio run -e esp32c3`
 
 ## NVS compatibility
@@ -96,9 +104,9 @@ pio run -e esp32c3 -t upload
 2. **MTU**: Set via `ble_att_set_preferred_mtu(185)` in the sync callback,
    matching the Arduino version's `NimBLEDevice::setMTU(185)`.
 
-3. **Watchdog**: IDF 5.1 uses `esp_task_wdt_reconfigure()` instead of the
-   older `esp_task_wdt_init()`. The main loop task subscribes itself with
-   `esp_task_wdt_add(NULL)`.
+3. **Watchdog**: ESP-IDF 6.0.1 may already have the watchdog initialized, so the
+   firmware initializes or reconfigures it as needed. The main loop task
+   subscribes itself with `esp_task_wdt_add(NULL)`.
 
 4. **LED pin parking**: Still parks GPIO 8 low in production, same as the
    Arduino version. Only runs when `DEBUG_LED_ENABLED` is not defined.
@@ -125,11 +133,10 @@ pio run -e esp32c3 -t upload
    If the timer fails to start, the GPIO is released immediately as a
    safety fallback.
 
-4. **Advertising interval range**: Changed from fixed 1000ms
-   (`ADV_INTERVAL_MIN = ADV_INTERVAL_MAX = 1600`) to a 1000–2000ms range
-   (`MIN=1600, MAX=3200`). Lets the BLE controller jitter the interval
-   for better coexistence and reduced peak current from synchronized
-   wake-ups.
+4. **Adaptive advertising intervals**: Reconnect activity uses 50–100 ms
+   advertising for 60 seconds. Normal idle advertising uses 200–400 ms. This
+   keeps short Garmin scan windows responsive while avoiding continuous fast
+   advertising.
 
 5. **Main loop tick**: Increased from 1s to 10s (`LOOP_INTERVAL_MS=10000`).
    The loop only checks timeouts (15s minimum granularity) and reaps ghost

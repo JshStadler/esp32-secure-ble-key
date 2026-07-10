@@ -173,6 +173,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
   StreamSubscription? _btStateSub;
   Timer? _reconnectTimer;
   Completer<bool>? _authCompleter;
+  int _connectionGeneration = 0;
   Uint8List? _currentNonce;
   bool _isProcessing = false;
   bool _bluetoothOn = true;
@@ -248,6 +249,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
 
   @override
   void dispose() {
+    _connectionGeneration++;
     _scanSub?.cancel();
     _connectionSub?.cancel();
     _statusSub?.cancel();
@@ -483,6 +485,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
 
   /// Set up a connected device: listen for disconnects, cache MAC, discover services
   void _setupDevice(BluetoothDevice device) {
+    final generation = ++_connectionGeneration;
     _device = device;
     setState(() {
       _connectionState = BleConnectionState.connecting;
@@ -496,6 +499,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
     _connectionSub = device.connectionState.listen(
       (state) {
         if (state == BluetoothConnectionState.disconnected) {
+          if (_device != device || generation != _connectionGeneration) return;
           final reason = device.disconnectReason;
           debugPrint(
             'BLE disconnected: code=${reason?.code} '
@@ -509,10 +513,11 @@ class _UnlockScreenState extends State<UnlockScreen> {
       },
     );
 
-    _discoverAndSubscribe();
+    _discoverAndSubscribe(device, generation);
   }
 
   void _resetConnectionState() {
+    _connectionGeneration++;
     if (_authCompleter != null && !_authCompleter!.isCompleted) {
       _authCompleter!.complete(false);
     }
@@ -520,6 +525,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
     _statusSub?.cancel();
     _challengeSub?.cancel();
     _deviceReady = false;
+    _device = null;
     if (!mounted) return;
     setState(() {
       _connectionState = BleConnectionState.disconnected;
@@ -545,11 +551,16 @@ class _UnlockScreenState extends State<UnlockScreen> {
     });
   }
 
-  Future<void> _discoverAndSubscribe({int attempt = 1}) async {
-    if (_device == null) return;
+  Future<void> _discoverAndSubscribe(
+    BluetoothDevice device,
+    int generation, {
+    int attempt = 1,
+  }) async {
+    if (_device != device || generation != _connectionGeneration) return;
 
     try {
-      final services = await _device!.discoverServices();
+      final services = await device.discoverServices();
+      if (_device != device || generation != _connectionGeneration) return;
 
       for (final svc in services) {
         if (svc.uuid == serviceUuid) {
@@ -569,39 +580,57 @@ class _UnlockScreenState extends State<UnlockScreen> {
       }
 
       await _subscribeToChallengeAndStatus();
-      if (!mounted || _device == null) return;
+      if (!mounted ||
+          _device != device ||
+          generation != _connectionGeneration) {
+        return;
+      }
       setState(() {
         _statusMessage = 'Authenticating...';
       });
       if (!await _authenticateLink()) {
         throw StateError('BLE authentication did not complete');
       }
-      if (!mounted || _device == null) return;
+      if (!mounted ||
+          _device != device ||
+          generation != _connectionGeneration) {
+        return;
+      }
       setState(() {
         _connectionState = BleConnectionState.connected;
         _statusMessage = 'Connected';
       });
     } catch (e) {
       debugPrint('Service discovery failed (attempt $attempt): $e');
-      if (attempt < 2 && _device != null && mounted) {
+      if (attempt < 2 &&
+          _device == device &&
+          generation == _connectionGeneration &&
+          device.isConnected &&
+          mounted) {
         setState(() {
           _statusMessage = 'Retrying discovery...';
         });
-        return _discoverAndSubscribe(attempt: attempt + 1);
+        return _discoverAndSubscribe(
+          device,
+          generation,
+          attempt: attempt + 1,
+        );
       }
+      if (_device != device || generation != _connectionGeneration) return;
       if (mounted) {
         setState(() {
           _statusMessage = 'Discovery failed';
         });
       }
-      final failedDevice = _device;
-      await failedDevice?.disconnect();
+      await device.disconnect();
+      if (_device != device || generation != _connectionGeneration) return;
       _resetConnectionState();
       _scheduleReconnect();
     }
   }
 
   void _disconnect() {
+    _connectionGeneration++;
     _shouldAutoConnect = false;
     _reconnectTimer?.cancel();
     _connectionSub?.cancel();

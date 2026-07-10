@@ -456,7 +456,8 @@ class BleHandler extends Ble.BleDelegate {
             while (device != null) {
                 if (device instanceof Ble.Device) {
                     var pairedDevice = device as Ble.Device;
-                    if (pairedDevice.isConnected()) {
+                    if (pairedDevice.isConnected() &&
+                        pairedDevice.getService(CarKeyProfile.SERVICE_UUID) != null) {
                         System.println("Reusing connected paired device");
                         onConnectedStateChanged(pairedDevice, Ble.CONNECTION_STATE_CONNECTED);
                         return true;
