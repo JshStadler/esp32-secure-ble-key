@@ -129,11 +129,12 @@ static const char *TAG = "CAR_UNLOCK";
 
 /* BLE advertising intervals (in 0.625ms units).
  * Fast mode improves Garmin discovery after boot/disconnect/activity.
- * Slow mode preserves the previous low-power idle behavior. */
-#define ADV_FAST_INTERVAL_MIN 160   /* 100ms */
-#define ADV_FAST_INTERVAL_MAX 320   /* 200ms */
-#define ADV_SLOW_INTERVAL_MIN 1600  /* 1000ms */
-#define ADV_SLOW_INTERVAL_MAX 3200  /* 2000ms */
+ * Idle mode stays responsive enough for short Garmin scan windows while
+ * remaining substantially less active than the reconnect burst. */
+#define ADV_FAST_INTERVAL_MIN 80    /* 50ms */
+#define ADV_FAST_INTERVAL_MAX 160   /* 100ms */
+#define ADV_SLOW_INTERVAL_MIN 320   /* 200ms */
+#define ADV_SLOW_INTERVAL_MAX 640   /* 400ms */
 
 /* Keep fast advertising active briefly after events where a reconnect is likely. */
 #define FAST_ADV_WINDOW_SEC 60
@@ -244,7 +245,7 @@ typedef struct {
     bool     in_use;
     bool     authenticated;
     uint8_t  nonce[NONCE_LEN];
-    int64_t  connected_at;  /* milliseconds from now_ms() */
+    int64_t  last_activity_at;  /* milliseconds from now_ms() */
 } client_state_t;
 
 static client_state_t clients[MAX_CONNECTIONS];
@@ -258,7 +259,7 @@ typedef struct {
     int64_t  part1_time;  /* milliseconds from now_ms() */
 } split_cmd_state_t;
 
-static split_cmd_state_t split_cmd = {0};
+static split_cmd_state_t split_cmds[MAX_CONNECTIONS];
 
 /* Track whether advertising is currently active */
 static bool adv_active = false;
@@ -505,7 +506,7 @@ static int ensure_client_slot(uint16_t conn_handle) {
 
     clients[slot].in_use        = true;
     clients[slot].authenticated = false;
-    clients[slot].connected_at  = now_ms();
+    clients[slot].last_activity_at = now_ms();
     clients[slot].conn_handle   = conn_handle;
     generate_nonce_for_slot(slot, false);
     mark_ble_activity();
@@ -523,6 +524,7 @@ static void mark_authenticated(uint16_t conn_handle) {
     int slot = find_client_by_handle(conn_handle);
     if (slot >= 0) {
         clients[slot].authenticated = true;
+        clients[slot].last_activity_at = now_ms();
     }
 }
 
@@ -551,13 +553,17 @@ static void log_client_state(const char *reason) {
           count_active_slots(),
           adv_active ? 1 : 0,
           adv_using_fast_interval ? 1 : 0,
-          split_cmd.has_part1 ? 1 : 0,
+          (split_cmds[0].has_part1 || split_cmds[1].has_part1 ||
+           split_cmds[2].has_part1) ? 1 : 0,
           slots);
 }
 
 static void invalidate_split_cmd_for(uint16_t conn_handle) {
-    if (split_cmd.has_part1 && split_cmd.conn_handle == conn_handle) {
-        split_cmd.has_part1 = false;
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        if (split_cmds[i].has_part1 &&
+            split_cmds[i].conn_handle == conn_handle) {
+            split_cmds[i].has_part1 = false;
+        }
     }
 }
 
@@ -590,22 +596,19 @@ static struct os_mbuf *om_from_buf(const void *buf, uint16_t len) {
     return om;
 }
 
-static void set_status(const char *msg) {
+static void set_status(uint16_t conn_handle, const char *msg) {
     strncpy(status_str, msg, sizeof(status_str) - 1);
     status_str[sizeof(status_str) - 1] = '\0';
 
-    /* Notify subscribed clients */
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-        if (!clients[i].in_use) continue;
-        struct ble_gap_conn_desc desc;
-        if (ble_gap_conn_find(clients[i].conn_handle, &desc) == 0) {
-            int rc = ble_gatts_notify_custom(clients[i].conn_handle,
-                                             status_val_handle,
-                                             om_from_buf(status_str, strlen(status_str)));
-            if (rc != 0) {
-                LOG_W(TAG, "Status notify failed handle=%d rc=%d msg=%s",
-                      clients[i].conn_handle, rc, status_str);
-            }
+    /* A command result belongs only to its initiating client. Broadcasting it
+     * makes another connected phone/watch report a command it did not send. */
+    struct ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(conn_handle, &desc) == 0) {
+        int rc = ble_gatts_notify_custom(conn_handle, status_val_handle,
+                                         om_from_buf(status_str, strlen(status_str)));
+        if (rc != 0) {
+            LOG_W(TAG, "Status notify failed handle=%d rc=%d msg=%s",
+                  conn_handle, rc, status_str);
         }
     }
 }
@@ -664,6 +667,7 @@ static int chr_access_challenge(uint16_t conn_handle, uint16_t attr_handle,
         if (slot < 0) return BLE_ATT_ERR_UNLIKELY;
 
         LOG_I(TAG, "Challenge read handle=%d slot=%d", conn_handle, slot);
+        clients[slot].last_activity_at = now_ms();
         int rc = os_mbuf_append(ctxt->om, clients[slot].nonce, NONCE_LEN);
         return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
@@ -691,7 +695,7 @@ static int chr_access_command(uint16_t conn_handle, uint16_t attr_handle,
     LOG_I(TAG, "Command write handle=%d len=%d", conn_handle, len);
     if (len < 1 || len > 33) {
         LOG_W(TAG, "Command write bad length handle=%d len=%d", conn_handle, len);
-        set_status("ERR:EMPTY");
+        set_status(conn_handle, "ERR:EMPTY");
         return 0;
     }
 
@@ -707,7 +711,7 @@ static int chr_access_command(uint16_t conn_handle, uint16_t attr_handle,
     if (cmd_type != CMD_AUTH_ONLY && cmd_type != CMD_PRESS) {
         LOG_W(TAG, "Command write unknown cmd handle=%d cmd=0x%02x",
               conn_handle, cmd_type);
-        set_status("ERR:UNKNOWN_CMD");
+        set_status(conn_handle, "ERR:UNKNOWN_CMD");
         return 0;
     }
 
@@ -715,12 +719,12 @@ static int chr_access_command(uint16_t conn_handle, uint16_t attr_handle,
         mark_ble_activity();
         mark_authenticated(conn_handle);
         if (cmd_type == CMD_PRESS) {
-            set_status(press_remote_button() ? "OK:PRESSED" : "ERR:BUSY");
+            set_status(conn_handle, press_remote_button() ? "OK:PRESSED" : "ERR:BUSY");
         } else {
-            set_status("OK:AUTH");
+            set_status(conn_handle, "OK:AUTH");
         }
     } else {
-        set_status("ERR:AUTH");
+        set_status(conn_handle, "ERR:AUTH");
     }
     return 0;
 }
@@ -736,19 +740,26 @@ static int chr_access_command_pt1(uint16_t conn_handle, uint16_t attr_handle,
     LOG_I(TAG, "Command pt1 write handle=%d len=%d", conn_handle, len);
     if (len != 17) {
         LOG_W(TAG, "Command pt1 bad length handle=%d len=%d", conn_handle, len);
-        set_status("ERR:PT1_LEN");
+        set_status(conn_handle, "ERR:PT1_LEN");
         return 0;
     }
+
+    int slot = ensure_client_slot(conn_handle);
+    if (slot < 0) {
+        set_status(conn_handle, "ERR:NO_SLOT");
+        return 0;
+    }
+    split_cmd_state_t *split_cmd = &split_cmds[slot];
 
     uint8_t buf[17];
     os_mbuf_copydata(ctxt->om, 0, len, buf);
 
-    split_cmd.cmd_type    = buf[0];
-    memcpy(split_cmd.hmac_part1, buf + 1, 16);
-    split_cmd.has_part1   = true;
-    split_cmd.conn_handle = conn_handle;
-    split_cmd.part1_time  = now_ms();
-    LOG_I(TAG, "Command pt1 stored handle=%d cmd=0x%02x", conn_handle, split_cmd.cmd_type);
+    split_cmd->cmd_type    = buf[0];
+    memcpy(split_cmd->hmac_part1, buf + 1, 16);
+    split_cmd->has_part1   = true;
+    split_cmd->conn_handle = conn_handle;
+    split_cmd->part1_time  = now_ms();
+    LOG_I(TAG, "Command pt1 stored handle=%d cmd=0x%02x", conn_handle, split_cmd->cmd_type);
 
     return 0;
 }
@@ -761,35 +772,41 @@ static int chr_access_command_pt2(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+    int slot = find_client_by_handle(conn_handle);
+    if (slot < 0) {
+        set_status(conn_handle, "ERR:NO_SLOT");
+        return 0;
+    }
+    split_cmd_state_t *split_cmd = &split_cmds[slot];
     LOG_I(TAG, "Command pt2 write handle=%d len=%d has_part1=%d part1_handle=%d",
-          conn_handle, len, split_cmd.has_part1 ? 1 : 0, split_cmd.conn_handle);
+          conn_handle, len, split_cmd->has_part1 ? 1 : 0, split_cmd->conn_handle);
     if (len != 16) {
-        split_cmd.has_part1 = false;
+        split_cmd->has_part1 = false;
         LOG_W(TAG, "Command pt2 bad length handle=%d len=%d", conn_handle, len);
-        set_status("ERR:PT2_LEN");
+        set_status(conn_handle, "ERR:PT2_LEN");
         return 0;
     }
 
-    if (!split_cmd.has_part1) {
+    if (!split_cmd->has_part1) {
         LOG_W(TAG, "Command pt2 missing pt1 handle=%d", conn_handle);
-        set_status("ERR:NO_PT1");
+        set_status(conn_handle, "ERR:NO_PT1");
         return 0;
     }
 
-    if (split_cmd.conn_handle != conn_handle) {
-        split_cmd.has_part1 = false;
+    if (split_cmd->conn_handle != conn_handle) {
+        split_cmd->has_part1 = false;
         LOG_W(TAG, "Command pt2 conn mismatch handle=%d part1_handle=%d",
-              conn_handle, split_cmd.conn_handle);
-        set_status("ERR:CONN_MISMATCH");
+              conn_handle, split_cmd->conn_handle);
+        set_status(conn_handle, "ERR:CONN_MISMATCH");
         return 0;
     }
 
     /* Timeout: part 2 must arrive within 5 seconds of part 1 */
-    if (now_ms() - split_cmd.part1_time > 5000) {
-        split_cmd.has_part1 = false;
+    if (now_ms() - split_cmd->part1_time > 5000) {
+        split_cmd->has_part1 = false;
         LOG_W(TAG, "Command pt2 timeout handle=%d elapsed_ms=%lld",
-              conn_handle, (long long)(now_ms() - split_cmd.part1_time));
-        set_status("ERR:TIMEOUT");
+              conn_handle, (long long)(now_ms() - split_cmd->part1_time));
+        set_status(conn_handle, "ERR:TIMEOUT");
         return 0;
     }
 
@@ -798,16 +815,16 @@ static int chr_access_command_pt2(uint16_t conn_handle, uint16_t attr_handle,
 
     /* Reassemble full HMAC */
     uint8_t full_hmac[HMAC_LEN];
-    memcpy(full_hmac, split_cmd.hmac_part1, 16);
+    memcpy(full_hmac, split_cmd->hmac_part1, 16);
     memcpy(full_hmac + 16, buf, 16);
-    uint8_t cmd_type = split_cmd.cmd_type;
-    split_cmd.has_part1 = false;
+    uint8_t cmd_type = split_cmd->cmd_type;
+    split_cmd->has_part1 = false;
     LOG_I(TAG, "Command split parsed handle=%d cmd=0x%02x", conn_handle, cmd_type);
 
     if (cmd_type != CMD_AUTH_ONLY && cmd_type != CMD_PRESS) {
         LOG_W(TAG, "Command split unknown cmd handle=%d cmd=0x%02x",
               conn_handle, cmd_type);
-        set_status("ERR:UNKNOWN_CMD");
+        set_status(conn_handle, "ERR:UNKNOWN_CMD");
         return 0;
     }
 
@@ -815,12 +832,12 @@ static int chr_access_command_pt2(uint16_t conn_handle, uint16_t attr_handle,
         mark_ble_activity();
         mark_authenticated(conn_handle);
         if (cmd_type == CMD_PRESS) {
-            set_status(press_remote_button() ? "OK:PRESSED" : "ERR:BUSY");
+            set_status(conn_handle, press_remote_button() ? "OK:PRESSED" : "ERR:BUSY");
         } else {
-            set_status("OK:AUTH");
+            set_status(conn_handle, "OK:AUTH");
         }
     } else {
-        set_status("ERR:AUTH");
+        set_status(conn_handle, "ERR:AUTH");
     }
     return 0;
 }
@@ -834,7 +851,7 @@ static int chr_access_psk_update(uint16_t conn_handle, uint16_t attr_handle,
 
     uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
     if (len > HMAC_LEN + 1 + MAX_PSK_LEN) {
-        set_status("ERR:PSK_FORMAT");
+        set_status(conn_handle, "ERR:PSK_FORMAT");
         return 0;
     }
 
@@ -845,20 +862,20 @@ static int chr_access_psk_update(uint16_t conn_handle, uint16_t attr_handle,
      * Bytes 0..31 are the HMAC (which can legitimately contain 0x00),
      * byte 32 must be 0x00, and the rest is the new PSK. */
     if (len < HMAC_LEN + 2 || buf[HMAC_LEN] != 0x00) {
-        set_status("ERR:PSK_FORMAT");
+        set_status(conn_handle, "ERR:PSK_FORMAT");
         return 0;
     }
 
     int sep_idx = HMAC_LEN;
 
     if (!verify_auth(conn_handle, buf, sep_idx)) {
-        set_status("ERR:PSK_AUTH");
+        set_status(conn_handle, "ERR:PSK_AUTH");
         return 0;
     }
 
     size_t new_psk_len = len - sep_idx - 1;
     if (new_psk_len == 0 || new_psk_len > MAX_PSK_LEN) {
-        set_status("ERR:PSK_LENGTH");
+        set_status(conn_handle, "ERR:PSK_LENGTH");
         return 0;
     }
 
@@ -868,7 +885,7 @@ static int chr_access_psk_update(uint16_t conn_handle, uint16_t attr_handle,
 
     bool persisted = save_psk(new_psk);
     mark_authenticated(conn_handle);
-    set_status(persisted ? "OK:PSK_UPDATED" : "WARN:PSK_VOLATILE");
+    set_status(conn_handle, persisted ? "OK:PSK_UPDATED" : "WARN:PSK_VOLATILE");
     return 0;
 }
 
@@ -956,7 +973,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
         if (slot >= 0) {
             clients[slot].in_use        = true;
             clients[slot].authenticated = false;
-            clients[slot].connected_at  = now_ms();
+            clients[slot].last_activity_at = now_ms();
             clients[slot].conn_handle   = conn_handle;
             generate_nonce_for_slot(slot, false);
             mark_ble_activity();
@@ -1231,7 +1248,7 @@ static void main_loop_task(void *param) {
         for (int i = 0; i < MAX_CONNECTIONS; i++) {
             if (!clients[i].in_use) continue;
 
-            int64_t elapsed = now - clients[i].connected_at;
+            int64_t elapsed = now - clients[i].last_activity_at;
             int64_t timeout = clients[i].authenticated
                 ? (int64_t)AUTH_TIMEOUT_SEC * 1000
                 : (int64_t)UNAUTH_TIMEOUT_SEC * 1000;

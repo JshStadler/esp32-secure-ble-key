@@ -10,3 +10,9 @@ Desktop.ini
 *.swp
 *.swo
 *~
+
+# Build outputs
+**/build/
+**/.pio/
+Garmin_Watch_App/bin/
+ESP32-C3_Firmware/sdkconfig.*

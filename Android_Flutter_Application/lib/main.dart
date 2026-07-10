@@ -171,6 +171,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
   StreamSubscription? _statusSub;
   StreamSubscription? _challengeSub;
   StreamSubscription? _btStateSub;
+  Timer? _reconnectTimer;
   Uint8List? _currentNonce;
   bool _isProcessing = false;
   bool _bluetoothOn = true;
@@ -220,7 +221,9 @@ class _UnlockScreenState extends State<UnlockScreen> {
         // Bluetooth just turned on — give the stack a moment to initialize
         if (wasOff && _pskConfigured && _shouldAutoConnect) {
           Future.delayed(const Duration(seconds: 1), () {
-            if (mounted && _bluetoothOn && _connectionState == BleConnectionState.disconnected) {
+            if (mounted &&
+                _bluetoothOn &&
+                _connectionState == BleConnectionState.disconnected) {
               _startConnection();
             }
           });
@@ -234,7 +237,8 @@ class _UnlockScreenState extends State<UnlockScreen> {
         if (_pskConfigured) {
           _startConnection();
         } else {
-          Future.delayed(const Duration(milliseconds: 300), _showInitialPSKDialog);
+          Future.delayed(
+              const Duration(milliseconds: 300), _showInitialPSKDialog);
         }
       });
     });
@@ -248,6 +252,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
     _challengeSub?.cancel();
     _btStateSub?.cancel();
     _resultClearTimer?.cancel();
+    _reconnectTimer?.cancel();
     super.dispose();
   }
 
@@ -321,9 +326,9 @@ class _UnlockScreenState extends State<UnlockScreen> {
   bool _deviceReady = false;
 
   /// Start connection:
-  /// - Always start scanning
-  /// - On app launch only, also try the cached MAC direct route
-  /// - Later reconnects use scan only to avoid stale Android BLE connects
+  /// - On app launch, try the cached device directly first
+  /// - Fall back to scanning if that single direct attempt fails
+  /// - Later reconnects use scan only to avoid stale Android GATT attempts
   void _startConnection() {
     if (_connectionState != BleConnectionState.disconnected) return;
     if (!_bluetoothOn) {
@@ -340,15 +345,14 @@ class _UnlockScreenState extends State<UnlockScreen> {
       _statusMessage = _cachedMac != null ? 'Connecting...' : 'Scanning...';
     });
 
-    // Always start scanning
-    _startScan();
-
-    // If cached MAC exists, try direct connect in parallel only once per app
-    // session. Reconnects are scan-only because repeated cached direct connects
-    // can leave stale Android-side attempts racing the real connection.
+    // Never race scan-connect and direct-connect requests. Android serializes
+    // or batches GATT requests depending on OS version, and competing attempts
+    // can leave a stale connection behind after one path succeeds.
     if (_cachedMac != null && _allowCachedDirectConnect) {
       _allowCachedDirectConnect = false;
       _tryDirectConnect(_cachedMac!);
+    } else {
+      _startScan();
     }
   }
 
@@ -390,7 +394,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
           _statusMessage = 'Device not found';
         });
         if (_shouldAutoConnect && _pskConfigured) {
-          Future.delayed(const Duration(seconds: 3), _startConnection);
+          _scheduleReconnect(delay: const Duration(seconds: 2));
         }
       }
     });
@@ -398,10 +402,12 @@ class _UnlockScreenState extends State<UnlockScreen> {
 
   void _tryDirectConnect(String mac) {
     final device = BluetoothDevice.fromId(mac);
-    device.connect(
+    device
+        .connect(
       timeout: const Duration(seconds: 3),
       autoConnect: false,
-    ).then((_) {
+    )
+        .then((_) {
       if (!mounted) return;
       if (!_deviceReady) {
         _deviceReady = true;
@@ -413,7 +419,12 @@ class _UnlockScreenState extends State<UnlockScreen> {
         device.disconnect();
       }
     }).catchError((e) {
-      debugPrint('Direct connect failed, scan continues');
+      debugPrint('Direct connect failed, falling back to scan: $e');
+      if (mounted &&
+          !_deviceReady &&
+          _connectionState == BleConnectionState.scanning) {
+        _startScan();
+      }
     });
   }
 
@@ -439,7 +450,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
       if (!_deviceReady) {
         _resetConnectionState();
         if (_shouldAutoConnect && _pskConfigured) {
-          Future.delayed(const Duration(seconds: 2), _startConnection);
+          _scheduleReconnect();
         }
       }
     });
@@ -449,7 +460,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
   void _setupDevice(BluetoothDevice device) {
     _device = device;
     setState(() {
-      _connectionState = BleConnectionState.connected;
+      _connectionState = BleConnectionState.connecting;
       _statusMessage = 'Discovering services...';
     });
 
@@ -462,7 +473,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
         if (state == BluetoothConnectionState.disconnected) {
           _resetConnectionState();
           if (mounted && _shouldAutoConnect && _pskConfigured) {
-            Future.delayed(const Duration(seconds: 2), _startConnection);
+            _scheduleReconnect();
           }
         }
       },
@@ -488,6 +499,18 @@ class _UnlockScreenState extends State<UnlockScreen> {
     });
   }
 
+  void _scheduleReconnect({Duration delay = const Duration(seconds: 1)}) {
+    _reconnectTimer?.cancel();
+    if (!_shouldAutoConnect || !_pskConfigured) return;
+    _reconnectTimer = Timer(delay, () {
+      if (mounted &&
+          _bluetoothOn &&
+          _connectionState == BleConnectionState.disconnected) {
+        _startConnection();
+      }
+    });
+  }
+
   Future<void> _discoverAndSubscribe({int attempt = 1}) async {
     if (_device == null) return;
 
@@ -505,7 +528,9 @@ class _UnlockScreenState extends State<UnlockScreen> {
         }
       }
 
-      if (_challengeChar == null || _commandChar == null || _statusChar == null) {
+      if (_challengeChar == null ||
+          _commandChar == null ||
+          _statusChar == null) {
         debugPrint('Missing required characteristics');
         if (mounted) {
           setState(() {
@@ -515,13 +540,12 @@ class _UnlockScreenState extends State<UnlockScreen> {
         return;
       }
 
-      if (mounted) {
-        setState(() {
-          _statusMessage = 'Connected';
-        });
-      }
-
       await _subscribeToChallengeAndStatus();
+      if (!mounted || _device == null) return;
+      setState(() {
+        _connectionState = BleConnectionState.connected;
+        _statusMessage = 'Connected';
+      });
       await _sendAuthPing();
     } catch (e) {
       debugPrint('Service discovery failed (attempt $attempt): $e');
@@ -541,6 +565,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
 
   void _disconnect() {
     _shouldAutoConnect = false;
+    _reconnectTimer?.cancel();
     _connectionSub?.cancel();
     _statusSub?.cancel();
     _challengeSub?.cancel();
@@ -655,13 +680,16 @@ class _UnlockScreenState extends State<UnlockScreen> {
   }
 
   Future<void> _sendAuthPing() async {
-    if (_device == null || _commandChar == null || _currentNonce == null) return;
+    if (_device == null || _commandChar == null || _currentNonce == null) {
+      return;
+    }
     try {
       final nonce = _currentNonce!;
       final payload = _buildCommandPayload(cmdAuthOnly, nonce, _psk);
       await _commandChar!.write(payload, withoutResponse: false);
       if (_currentNonce == nonce) {
-        _currentNonce = null; // consumed by firmware — wait for fresh read/notification
+        _currentNonce =
+            null; // consumed by firmware — wait for fresh read/notification
       }
     } catch (e) {
       debugPrint('Auth ping failed: $e');
@@ -693,7 +721,8 @@ class _UnlockScreenState extends State<UnlockScreen> {
       final payload = _buildCommandPayload(cmdPress, nonce, _psk);
       await _commandChar!.write(payload, withoutResponse: false);
       if (_currentNonce == nonce) {
-        _currentNonce = null; // consumed by firmware — wait for fresh read/notification
+        _currentNonce =
+            null; // consumed by firmware — wait for fresh read/notification
       }
     } catch (e) {
       setState(() {
@@ -876,7 +905,8 @@ class _UnlockScreenState extends State<UnlockScreen> {
                       if (_currentNonce == null) {
                         if (context.mounted) {
                           ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('Failed to read challenge')),
+                            const SnackBar(
+                                content: Text('Failed to read challenge')),
                           );
                         }
                         return;
@@ -884,21 +914,24 @@ class _UnlockScreenState extends State<UnlockScreen> {
                       final nonce = _currentNonce!;
                       final hmac = _computeHMAC(nonce, _psk);
                       final separator = Uint8List.fromList([0x00]);
-                      final newPskBytes = Uint8List.fromList(utf8.encode(newPsk));
+                      final newPskBytes =
+                          Uint8List.fromList(utf8.encode(newPsk));
                       final payload = Uint8List.fromList([
                         ...hmac,
                         ...separator,
                         ...newPskBytes,
                       ]);
 
-                      await _pskUpdateChar!.write(payload, withoutResponse: false);
+                      await _pskUpdateChar!
+                          .write(payload, withoutResponse: false);
                       if (_currentNonce == nonce) {
                         _currentNonce = null; // consumed by firmware
                       }
                     } catch (e) {
                       if (context.mounted) {
                         ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('Failed to update PSK on device')),
+                          const SnackBar(
+                              content: Text('Failed to update PSK on device')),
                         );
                       }
                       return;
@@ -1056,14 +1089,17 @@ class _UnlockScreenState extends State<UnlockScreen> {
                 height: 200,
                 child: ElevatedButton(
                   onPressed:
-                      (_connectionState == BleConnectionState.connected && !_isProcessing)
+                      (_connectionState == BleConnectionState.connected &&
+                              _commandChar != null &&
+                              _currentNonce != null &&
+                              !_isProcessing)
                           ? _sendCommand
                           : null,
                   style: ElevatedButton.styleFrom(
                     shape: const CircleBorder(),
                     padding: const EdgeInsets.all(32),
-                    backgroundColor:
-                        _buttonColor ?? Theme.of(context).colorScheme.primaryContainer,
+                    backgroundColor: _buttonColor ??
+                        Theme.of(context).colorScheme.primaryContainer,
                     foregroundColor: _buttonColor != null
                         ? Colors.white
                         : Theme.of(context).colorScheme.onPrimaryContainer,

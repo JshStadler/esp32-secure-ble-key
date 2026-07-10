@@ -68,6 +68,9 @@ class BleHandler extends Ble.BleDelegate {
     var _profileRegistered = false;
     var _pendingPart2 = null;
     var _hasPendingUnlock = false;
+    var _scanRequested = false;
+    var _notificationsReady = false;
+    var _notificationSetupStarted = false;
     var _timer = null;
     var _operationTimer = null;
     var _shouldAutoReconnect = true;
@@ -91,7 +94,13 @@ class BleHandler extends Ble.BleDelegate {
     // ============================================================
 
     function startScan() {
-        if (_state == STATE_SCANNING) {
+        _scanRequested = true;
+        if (!_profileRegistered) {
+            _statusText = "Preparing Bluetooth...";
+            WatchUi.requestUpdate();
+            return;
+        }
+        if (_state == STATE_SCANNING || _state == STATE_CONNECTING) {
             return;
         }
 
@@ -110,6 +119,7 @@ class BleHandler extends Ble.BleDelegate {
     }
 
     function stopScan() {
+        _scanRequested = false;
         try {
             Ble.setScanState(Ble.SCAN_STATE_OFF);
         } catch (e) {
@@ -130,7 +140,19 @@ class BleHandler extends Ble.BleDelegate {
         if (_device == null || !_device.isConnected()) {
             // Not connected — scan and execute after connect
             _hasPendingUnlock = true;
+            _statusText = "Unlock queued";
+            WatchUi.requestUpdate();
             startScan();
+            return;
+        }
+
+        if (!_notificationsReady) {
+            _hasPendingUnlock = true;
+            _statusText = "Unlock queued";
+            WatchUi.requestUpdate();
+            if (!_notificationSetupStarted) {
+                enableStatusNotifications();
+            }
             return;
         }
 
@@ -140,6 +162,8 @@ class BleHandler extends Ble.BleDelegate {
     function disconnect() {
         _shouldAutoReconnect = false;
         _hasPendingUnlock = false;
+        _notificationsReady = false;
+        _notificationSetupStarted = false;
         _timer.stop();
         if (_device != null) {
             Ble.unpairDevice(_device);
@@ -176,6 +200,8 @@ class BleHandler extends Ble.BleDelegate {
     function cleanup() {
         _shouldAutoReconnect = false;
         _hasPendingUnlock = false;
+        _notificationsReady = false;
+        _notificationSetupStarted = false;
         _timer.stop();
         stopScan();
     }
@@ -190,6 +216,10 @@ class BleHandler extends Ble.BleDelegate {
 
     function isConnected() {
         return _device != null && _device.isConnected();
+    }
+
+    function hasPendingUnlock() {
+        return _hasPendingUnlock;
     }
 
     // ============================================================
@@ -298,11 +328,18 @@ class BleHandler extends Ble.BleDelegate {
     }
     
     private function enableStatusNotifications() {
+        _notificationSetupStarted = true;
         var service = _device.getService(CarKeyProfile.SERVICE_UUID);
-        if (service == null) { return; }
+        if (service == null) {
+            finishNotificationSetup(false);
+            return;
+        }
 
         var statusChar = service.getCharacteristic(CarKeyProfile.STATUS_CHAR_UUID);
-        if (statusChar == null) { return; }
+        if (statusChar == null) {
+            finishNotificationSetup(false);
+            return;
+        }
 
         var cccd = statusChar.getDescriptor(CarKeyProfile.CCCD_UUID);
         if (cccd != null) {
@@ -310,7 +347,25 @@ class BleHandler extends Ble.BleDelegate {
                 cccd.requestWrite([0x01, 0x00]b);
             } catch (e) {
                 System.println("CCCD write error: " + e.getErrorMessage());
+                finishNotificationSetup(false);
             }
+        } else {
+            finishNotificationSetup(false);
+        }
+    }
+
+    private function finishNotificationSetup(success) {
+        _notificationsReady = success;
+        _notificationSetupStarted = false;
+        if (_hasPendingUnlock && _device != null && _device.isConnected()) {
+            _hasPendingUnlock = false;
+            if (!success) {
+                _statusText = "Sending without feedback";
+            }
+            readChallenge();
+        } else if (!success) {
+            _statusText = "Connected (no feedback)";
+            WatchUi.requestUpdate();
         }
     }
 
@@ -360,8 +415,14 @@ class BleHandler extends Ble.BleDelegate {
         if (status == Ble.STATUS_SUCCESS) {
             _profileRegistered = true;
             System.println("Profile registered");
+            if (_scanRequested) {
+                startScan();
+            }
         } else {
+            _state = STATE_ERROR;
+            _statusText = "BLE profile failed";
             System.println("Profile registration failed: " + status);
+            WatchUi.requestUpdate();
         }
     }
 
@@ -374,6 +435,7 @@ class BleHandler extends Ble.BleDelegate {
                 WatchUi.requestUpdate();
                 // Retry scan immediately
                 if (_shouldAutoReconnect) {
+                    _timer.stop();
                     _timer.start(method(:onReconnectTimer), 100, false);
                 }
             }
@@ -416,9 +478,12 @@ class BleHandler extends Ble.BleDelegate {
 
     function onConnectedStateChanged(device, state) {
         if (state == Ble.CONNECTION_STATE_CONNECTED) {
+            _timer.stop();
             _device = device;
+            _notificationsReady = false;
+            _notificationSetupStarted = false;
             _state = STATE_CONNECTED;
-            _statusText = "Connected";
+            _statusText = _hasPendingUnlock ? "Unlock queued" : "Connected";
             WatchUi.requestUpdate();
 
             // Enable notifications on status characteristic.
@@ -429,6 +494,8 @@ class BleHandler extends Ble.BleDelegate {
         } else {
             _device = null;
             _pendingPart2 = null;
+            _notificationsReady = false;
+            _notificationSetupStarted = false;
             cancelOperationTimeout();
             _state = STATE_IDLE;
             _statusText = "Disconnected";
@@ -436,6 +503,7 @@ class BleHandler extends Ble.BleDelegate {
 
             // Auto-reconnect after 2 seconds
             if (_shouldAutoReconnect) {
+                _timer.stop();
                 _timer.start(method(:onReconnectTimer), 2000, false);
             }
         }
@@ -492,6 +560,7 @@ class BleHandler extends Ble.BleDelegate {
             if (status == Ble.STATUS_SUCCESS) {
                 _state = STATE_WAITING_STATUS;
                 _statusText = "Sent, waiting...";
+                _timer.stop();
                 _timer.start(method(:onStatusTimeout), 2000, false);
             } else {
                 _statusText = "Write pt2 err: " + status;
@@ -503,6 +572,7 @@ class BleHandler extends Ble.BleDelegate {
             if (status == Ble.STATUS_SUCCESS) {
                 _state = STATE_WAITING_STATUS;
                 _statusText = "Sent, waiting...";
+                _timer.stop();
                 _timer.start(method(:onStatusTimeout), 2000, false);
             } else {
                 _statusText = "Write error: " + status;
@@ -552,11 +622,10 @@ class BleHandler extends Ble.BleDelegate {
         // CCCD write complete — notifications are now active
         if (status == Ble.STATUS_SUCCESS) {
             System.println("Notifications enabled");
-            // If user pressed SELECT while disconnected, execute now
-            if (_hasPendingUnlock && _device != null && _device.isConnected()) {
-                _hasPendingUnlock = false;
-                readChallenge();
-            }
+            finishNotificationSetup(true);
+        } else {
+            System.println("Notifications failed: " + status);
+            finishNotificationSetup(false);
         }
     }
 

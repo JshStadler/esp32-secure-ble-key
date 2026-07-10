@@ -30,9 +30,12 @@ class BleCarKeyView extends WatchUi.View {
 
         // 2. Connection status indicator (The Dot)
         var connected = _bleHandler.isConnected();
+        var queued = _bleHandler.hasPendingUnlock();
         var state = _bleHandler.getState();
 
-        if (connected) {
+        if (queued) {
+            dc.setColor(Graphics.COLOR_YELLOW, Graphics.COLOR_TRANSPARENT);
+        } else if (connected) {
             dc.setColor(Graphics.COLOR_GREEN, Graphics.COLOR_TRANSPARENT);
         } else if (state == 1 /* STATE_SCANNING */ || state == 2 /* STATE_CONNECTING */) {
             dc.setColor(Graphics.COLOR_YELLOW, Graphics.COLOR_TRANSPARENT);
@@ -45,12 +48,22 @@ class BleCarKeyView extends WatchUi.View {
         var btnY = h * 0.52; 
         var btnRadius = h * 0.18; // Slightly bigger for easier tapping
 
-        dc.setColor(connected ? Graphics.COLOR_GREEN : Graphics.COLOR_DK_GRAY, Graphics.COLOR_TRANSPARENT);
+        if (queued) {
+            dc.setColor(Graphics.COLOR_YELLOW, Graphics.COLOR_TRANSPARENT);
+        } else {
+            dc.setColor(connected ? Graphics.COLOR_GREEN : Graphics.COLOR_DK_GRAY, Graphics.COLOR_TRANSPARENT);
+        }
         dc.fillCircle(centerX, btnY, btnRadius);
+
+        if (queued) {
+            dc.setColor(Graphics.COLOR_WHITE, Graphics.COLOR_TRANSPARENT);
+            dc.setPenWidth(3);
+            dc.drawCircle(centerX, btnY, btnRadius + 7);
+        }
 
         // Button label
         dc.setColor(Graphics.COLOR_BLACK, Graphics.COLOR_TRANSPARENT);
-        dc.drawText(centerX, btnY, Graphics.FONT_SMALL, "Press",
+        dc.drawText(centerX, btnY, Graphics.FONT_SMALL, queued ? "Queued" : "Press",
                     Graphics.TEXT_JUSTIFY_CENTER | Graphics.TEXT_JUSTIFY_VCENTER);
 
         // 4. Status text (MOVED TO BOTTOM)
