@@ -73,13 +73,17 @@ class BleHandler extends Ble.BleDelegate {
     var _notificationSetupStarted = false;
     var _timer = null;
     var _operationTimer = null;
+    var _connectionTimer = null;
     var _shouldAutoReconnect = true;
+    var _connectionTimeoutStage = 0;
+    var _rapidRetryCount = 0;
 
     function initialize() {
         BleDelegate.initialize();
         Ble.setDelegate(self);
         _timer = new Timer.Timer();
         _operationTimer = new Timer.Timer();
+        _connectionTimer = new Timer.Timer();
 
         // Register the BLE profile
         try {
@@ -165,6 +169,7 @@ class BleHandler extends Ble.BleDelegate {
         _notificationsReady = false;
         _notificationSetupStarted = false;
         _timer.stop();
+        _connectionTimer.stop();
         if (_device != null) {
             Ble.unpairDevice(_device);
             _device = null;
@@ -179,6 +184,7 @@ class BleHandler extends Ble.BleDelegate {
     // Triggered by MENU button (long-press UP on FR165).
     function forceUnpair() {
         _timer.stop();
+        _connectionTimer.stop();
         _hasPendingUnlock = false;
         stopScan();
         if (_device != null) {
@@ -203,6 +209,7 @@ class BleHandler extends Ble.BleDelegate {
         _notificationsReady = false;
         _notificationSetupStarted = false;
         _timer.stop();
+        _connectionTimer.stop();
         stopScan();
     }
 
@@ -394,6 +401,75 @@ class BleHandler extends Ble.BleDelegate {
         _operationTimer.stop();
     }
 
+    private function startConnectionTimeout() as Void {
+        _connectionTimeoutStage = 0;
+        _connectionTimer.stop();
+        _connectionTimer.start(method(:onConnectionTimeout), 8000, false);
+    }
+
+    function onConnectionTimeout() as Void {
+        if (_state != STATE_CONNECTING) {
+            return;
+        }
+
+        if (_connectionTimeoutStage == 0) {
+            // Give Garmin's BLE subsystem one extra window before discarding
+            // the useful paired/GATT cache.
+            _connectionTimeoutStage = 1;
+            _statusText = "Connection slow...";
+            WatchUi.requestUpdate();
+            _connectionTimer.start(method(:onConnectionTimeout), 8000, false);
+            return;
+        }
+
+        System.println("Connection timed out; clearing stale pairing");
+        if (_device != null) {
+            try {
+                Ble.unpairDevice(_device);
+            } catch (e) {
+                System.println("Timeout unpair error: " + e.getErrorMessage());
+            }
+        }
+        _device = null;
+        _state = STATE_IDLE;
+        _statusText = "Retrying connection...";
+        WatchUi.requestUpdate();
+        scheduleReconnect(250);
+    }
+
+    private function scheduleReconnect(baseDelay) as Void {
+        var delay = baseDelay;
+        if (_rapidRetryCount == 1 && delay < 1000) {
+            delay = 1000;
+        } else if (_rapidRetryCount >= 2 && delay < 3000) {
+            delay = 3000;
+        }
+        _rapidRetryCount++;
+        _timer.stop();
+        _timer.start(method(:onReconnectTimer), delay, false);
+    }
+
+    private function useConnectedPairedDevice() {
+        try {
+            var devices = Ble.getPairedDevices();
+            var device = devices.next();
+            while (device != null) {
+                if (device instanceof Ble.Device) {
+                    var pairedDevice = device as Ble.Device;
+                    if (pairedDevice.isConnected()) {
+                        System.println("Reusing connected paired device");
+                        onConnectedStateChanged(pairedDevice, Ble.CONNECTION_STATE_CONNECTED);
+                        return true;
+                    }
+                }
+                device = devices.next();
+            }
+        } catch (e) {
+            System.println("Paired device lookup error: " + e.getErrorMessage());
+        }
+        return false;
+    }
+
     function onOperationTimeout() as Void {
         if (_state == STATE_READING_CHALLENGE || _state == STATE_SENDING_COMMAND) {
             _pendingPart2 = null;
@@ -415,7 +491,7 @@ class BleHandler extends Ble.BleDelegate {
         if (status == Ble.STATUS_SUCCESS) {
             _profileRegistered = true;
             System.println("Profile registered");
-            if (_scanRequested) {
+            if (_scanRequested && !useConnectedPairedDevice()) {
                 startScan();
             }
         } else {
@@ -435,8 +511,7 @@ class BleHandler extends Ble.BleDelegate {
                 WatchUi.requestUpdate();
                 // Retry scan immediately
                 if (_shouldAutoReconnect) {
-                    _timer.stop();
-                    _timer.start(method(:onReconnectTimer), 100, false);
+                    scheduleReconnect(100);
                 }
             }
         }
@@ -461,11 +536,20 @@ class BleHandler extends Ble.BleDelegate {
 
                             try {
                                 _device = Ble.pairDevice(sr);
+                                if (_device == null) {
+                                    _state = STATE_IDLE;
+                                    _statusText = "Pairing did not start";
+                                    WatchUi.requestUpdate();
+                                    scheduleReconnect(250);
+                                    return;
+                                }
+                                startConnectionTimeout();
                             } catch (e) {
                                 _statusText = "Pair failed";
-                                _state = STATE_ERROR;
+                                _state = STATE_IDLE;
                                 System.println("Pair error: " + e.getErrorMessage());
                                 WatchUi.requestUpdate();
+                                scheduleReconnect(1000);
                             }
                             return;
                         }
@@ -479,6 +563,8 @@ class BleHandler extends Ble.BleDelegate {
     function onConnectedStateChanged(device, state) {
         if (state == Ble.CONNECTION_STATE_CONNECTED) {
             _timer.stop();
+            _connectionTimer.stop();
+            _rapidRetryCount = 0;
             _device = device;
             _notificationsReady = false;
             _notificationSetupStarted = false;
@@ -494,6 +580,7 @@ class BleHandler extends Ble.BleDelegate {
         } else {
             _device = null;
             _pendingPart2 = null;
+            _connectionTimer.stop();
             _notificationsReady = false;
             _notificationSetupStarted = false;
             cancelOperationTimeout();
@@ -503,8 +590,7 @@ class BleHandler extends Ble.BleDelegate {
 
             // Auto-reconnect after 2 seconds
             if (_shouldAutoReconnect) {
-                _timer.stop();
-                _timer.start(method(:onReconnectTimer), 2000, false);
+                scheduleReconnect(2000);
             }
         }
     }

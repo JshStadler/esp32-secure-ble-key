@@ -993,12 +993,16 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
         struct ble_gap_upd_params params = {
             .itvl_min            = 24,   /* 30ms */
             .itvl_max            = 48,   /* 60ms */
-            .latency             = 0,
-            .supervision_timeout = 400,  /* 4s */
+            .latency             = 4,    /* skip up to 4 idle events */
+            .supervision_timeout = 800,  /* 8s tolerates noisy multi-client links */
             .min_ce_len          = 0,
             .max_ce_len          = 0,
         };
-        ble_gap_update_params(conn_handle, &params);
+        int update_rc = ble_gap_update_params(conn_handle, &params);
+        if (update_rc != 0) {
+            LOG_W(TAG, "Connection parameter request failed handle=%d rc=%d",
+                  conn_handle, update_rc);
+        }
 
         /* Continue advertising if we have capacity */
         if (count_active_slots() < MAX_CONNECTIONS) {
@@ -1048,6 +1052,11 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
     case BLE_GAP_EVENT_MTU:
         LOG_I(TAG, "MTU update: conn_handle=%d, mtu=%d",
               event->mtu.conn_handle, event->mtu.value);
+        break;
+
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        LOG_I(TAG, "Connection update: conn_handle=%d status=%d",
+              event->conn_update.conn_handle, event->conn_update.status);
         break;
 
     case BLE_GAP_EVENT_SUBSCRIBE:

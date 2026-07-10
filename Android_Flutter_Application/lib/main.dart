@@ -172,6 +172,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
   StreamSubscription? _challengeSub;
   StreamSubscription? _btStateSub;
   Timer? _reconnectTimer;
+  Completer<bool>? _authCompleter;
   Uint8List? _currentNonce;
   bool _isProcessing = false;
   bool _bluetoothOn = true;
@@ -193,6 +194,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
   // Cached device MAC
   String? _cachedMac;
   bool _allowCachedDirectConnect = true;
+  bool _checkedSystemDevices = false;
 
   // Auto-reconnect
   bool _shouldAutoConnect = true;
@@ -330,7 +332,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
   /// - On app launch, try the cached device directly first
   /// - Fall back to scanning if that single direct attempt fails
   /// - Later reconnects use scan only to avoid stale Android GATT attempts
-  void _startConnection() {
+  Future<void> _startConnection() async {
     if (_connectionState != BleConnectionState.disconnected) return;
     if (!_bluetoothOn) {
       setState(() {
@@ -345,6 +347,28 @@ class _UnlockScreenState extends State<UnlockScreen> {
       _connectionState = BleConnectionState.scanning;
       _statusMessage = _cachedMac != null ? 'Connecting...' : 'Scanning...';
     });
+
+    // Reuse a link already held by the operating system before starting a new
+    // GATT request. This is especially useful after a short app restart.
+    if (!_checkedSystemDevices) {
+      _checkedSystemDevices = true;
+      try {
+        final systemDevices =
+            await FlutterBluePlus.systemDevices([serviceUuid]);
+        if (!mounted || _connectionState != BleConnectionState.scanning) {
+          return;
+        }
+        if (systemDevices.isNotEmpty) {
+          _deviceReady = true;
+          _setupDevice(systemDevices.first);
+          return;
+        }
+      } catch (e) {
+        debugPrint('System device lookup failed: $e');
+      }
+    }
+
+    if (!mounted || _connectionState != BleConnectionState.scanning) return;
 
     // Never race scan-connect and direct-connect requests. Android serializes
     // or batches GATT requests depending on OS version, and competing attempts
@@ -472,6 +496,11 @@ class _UnlockScreenState extends State<UnlockScreen> {
     _connectionSub = device.connectionState.listen(
       (state) {
         if (state == BluetoothConnectionState.disconnected) {
+          final reason = device.disconnectReason;
+          debugPrint(
+            'BLE disconnected: code=${reason?.code} '
+            'description=${reason?.description}',
+          );
           _resetConnectionState();
           if (mounted && _shouldAutoConnect && _pskConfigured) {
             _scheduleReconnect();
@@ -484,6 +513,10 @@ class _UnlockScreenState extends State<UnlockScreen> {
   }
 
   void _resetConnectionState() {
+    if (_authCompleter != null && !_authCompleter!.isCompleted) {
+      _authCompleter!.complete(false);
+    }
+    _authCompleter = null;
     _statusSub?.cancel();
     _challengeSub?.cancel();
     _deviceReady = false;
@@ -532,22 +565,22 @@ class _UnlockScreenState extends State<UnlockScreen> {
       if (_challengeChar == null ||
           _commandChar == null ||
           _statusChar == null) {
-        debugPrint('Missing required characteristics');
-        if (mounted) {
-          setState(() {
-            _statusMessage = 'Service mismatch';
-          });
-        }
-        return;
+        throw StateError('Missing required BLE characteristics');
       }
 
       await _subscribeToChallengeAndStatus();
       if (!mounted || _device == null) return;
       setState(() {
+        _statusMessage = 'Authenticating...';
+      });
+      if (!await _authenticateLink()) {
+        throw StateError('BLE authentication did not complete');
+      }
+      if (!mounted || _device == null) return;
+      setState(() {
         _connectionState = BleConnectionState.connected;
         _statusMessage = 'Connected';
       });
-      await _sendAuthPing();
     } catch (e) {
       debugPrint('Service discovery failed (attempt $attempt): $e');
       if (attempt < 2 && _device != null && mounted) {
@@ -561,6 +594,10 @@ class _UnlockScreenState extends State<UnlockScreen> {
           _statusMessage = 'Discovery failed';
         });
       }
+      final failedDevice = _device;
+      await failedDevice?.disconnect();
+      _resetConnectionState();
+      _scheduleReconnect();
     }
   }
 
@@ -631,6 +668,9 @@ class _UnlockScreenState extends State<UnlockScreen> {
                 _lastResult = CommandResult.success;
               } else if (status == 'OK:AUTH') {
                 _statusMessage = 'Authenticated';
+                if (_authCompleter != null && !_authCompleter!.isCompleted) {
+                  _authCompleter!.complete(true);
+                }
               } else if (status == 'OK:PSK_UPDATED') {
                 _statusMessage = 'PSK updated on device';
                 _lastResult = CommandResult.success;
@@ -643,6 +683,9 @@ class _UnlockScreenState extends State<UnlockScreen> {
               } else if (status == 'ERR:AUTH') {
                 _statusMessage = 'Authentication failed';
                 _lastResult = CommandResult.error;
+                if (_authCompleter != null && !_authCompleter!.isCompleted) {
+                  _authCompleter!.complete(false);
+                }
               } else if (status.startsWith('ERR:')) {
                 _statusMessage = 'Error: ${status.substring(4)}';
                 _lastResult = CommandResult.error;
@@ -680,20 +723,46 @@ class _UnlockScreenState extends State<UnlockScreen> {
     return Uint8List.fromList([cmdType, ...hmac]);
   }
 
-  Future<void> _sendAuthPing() async {
-    if (_device == null || _commandChar == null || _currentNonce == null) {
-      return;
-    }
+  Future<bool> _authenticateLink({int attempt = 1}) async {
     try {
+      if (_currentNonce == null || _currentNonce!.isEmpty) {
+        await _readChallenge();
+      }
+      if (_device == null ||
+          _commandChar == null ||
+          _currentNonce == null ||
+          _currentNonce!.isEmpty) {
+        return false;
+      }
+
       final nonce = _currentNonce!;
       final payload = _buildCommandPayload(cmdAuthOnly, nonce, _psk);
+      _authCompleter = Completer<bool>();
       await _commandChar!.write(payload, withoutResponse: false);
       if (_currentNonce == nonce) {
         _currentNonce =
             null; // consumed by firmware — wait for fresh read/notification
       }
+      final authenticated = await _authCompleter!.future.timeout(
+        const Duration(seconds: 2),
+        onTimeout: () => false,
+      );
+      _authCompleter = null;
+      if (!authenticated && attempt < 2) {
+        _currentNonce = null;
+        await _readChallenge();
+        return _authenticateLink(attempt: attempt + 1);
+      }
+      return authenticated;
     } catch (e) {
       debugPrint('Auth ping failed: $e');
+      _authCompleter = null;
+      if (attempt < 2) {
+        _currentNonce = null;
+        await _readChallenge();
+        return _authenticateLink(attempt: attempt + 1);
+      }
+      return false;
     }
   }
 
