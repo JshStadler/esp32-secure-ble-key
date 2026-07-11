@@ -149,6 +149,10 @@ authentication by default. Use **App Settings → Require device authentication*
 to disable the launch gate during periods of frequent use. PSK changes remain
 protected by device authentication even when the main app gate is disabled.
 
+**App Settings → Use cached device address** enables an optional lower-latency
+direct connection. After three failed cached attempts the app offers a persistent
+scan fallback, while continuing cached retries until that fallback is selected.
+
 <img width="360" height="707" alt="image" src="https://github.com/user-attachments/assets/e33acc7a-7c9c-415d-9772-41116ede4fe0" /><img width="360" height="707" alt="image" src="https://github.com/user-attachments/assets/94fad788-adde-4d8a-987b-6423a58d1854" />
 
 ### ⌚ Garmin Watch App

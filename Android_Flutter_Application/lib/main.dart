@@ -34,6 +34,7 @@ const cmdPress = 0x02;
 const _pskStorageKey = 'car_unlock_psk';
 const _cachedMacStorageKey = 'car_unlock_cached_mac';
 const _biometricEnabledStorageKey = 'car_unlock_biometric_enabled';
+const _preferCachedDeviceStorageKey = 'car_unlock_prefer_cached_device';
 
 bool biometricPreferenceEnabled(String? storedValue) => storedValue != 'false';
 
@@ -123,7 +124,8 @@ class _AuthGateState extends State<AuthGate> {
 
   Future<void> _authenticate() async {
     try {
-      final bool canAuth = await _localAuth.canCheckBiometrics ||
+      final bool canAuth =
+          await _localAuth.canCheckBiometrics ||
           await _localAuth.isDeviceSupported();
 
       if (!canAuth) {
@@ -210,7 +212,8 @@ class UnlockScreen extends StatefulWidget {
   State<UnlockScreen> createState() => _UnlockScreenState();
 }
 
-class _UnlockScreenState extends State<UnlockScreen> {
+class _UnlockScreenState extends State<UnlockScreen>
+    with WidgetsBindingObserver {
   final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
   final LocalAuthentication _localAuth = LocalAuthentication();
 
@@ -246,15 +249,20 @@ class _UnlockScreenState extends State<UnlockScreen> {
 
   // Cached device MAC
   String? _cachedMac;
-  bool _allowCachedDirectConnect = true;
-  bool _checkedSystemDevices = false;
+  bool _preferCachedDevice = false;
+  bool _usingCachedDirectConnection = false;
+  bool _forceScanUntilConnected = false;
+  int _cachedConnectFailures = 0;
+  bool _offerScanFallback = false;
 
   // Auto-reconnect
   bool _shouldAutoConnect = true;
+  bool _appInForeground = true;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
 
     // Monitor Bluetooth adapter state
     _btStateSub = FlutterBluePlus.adapterState.listen((state) {
@@ -293,7 +301,9 @@ class _UnlockScreenState extends State<UnlockScreen> {
           _startConnection();
         } else {
           Future.delayed(
-              const Duration(milliseconds: 300), _showInitialPSKDialog);
+            const Duration(milliseconds: 300),
+            _showInitialPSKDialog,
+          );
         }
       });
     });
@@ -301,6 +311,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _connectionGeneration++;
     _scanSub?.cancel();
     _connectionSub?.cancel();
@@ -311,6 +322,22 @@ class _UnlockScreenState extends State<UnlockScreen> {
     _reconnectTimer?.cancel();
     _device?.disconnect();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final inForeground = state == AppLifecycleState.resumed;
+    _appInForeground = inForeground;
+    if (!inForeground) {
+      _reconnectTimer?.cancel();
+      return;
+    }
+    if (_shouldAutoConnect &&
+        _pskConfigured &&
+        _bluetoothOn &&
+        _connectionState == BleConnectionState.disconnected) {
+      _startConnection();
+    }
   }
 
   Future<void> _requestPermissions() async {
@@ -325,6 +352,9 @@ class _UnlockScreenState extends State<UnlockScreen> {
     try {
       final storedPsk = await _secureStorage.read(key: _pskStorageKey);
       final storedMac = await _secureStorage.read(key: _cachedMacStorageKey);
+      final preferCached = await _secureStorage.read(
+        key: _preferCachedDeviceStorageKey,
+      );
       if (!mounted) return;
       setState(() {
         if (storedPsk != null && storedPsk.isNotEmpty) {
@@ -332,6 +362,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
           _pskConfigured = true;
         }
         _cachedMac = storedMac;
+        _preferCachedDevice = preferCached == 'true';
       });
     } catch (e) {
       debugPrint('Failed to load config from secure storage: $e');
@@ -383,9 +414,9 @@ class _UnlockScreenState extends State<UnlockScreen> {
   bool _deviceReady = false;
 
   /// Start connection:
-  /// - On app launch, try the cached device directly first
-  /// - Fall back to scanning if that single direct attempt fails
-  /// - Later reconnects use scan only to avoid stale Android GATT attempts
+  /// - Scan by default for the most reliable fresh Android GATT connection
+  /// - Optionally use the cached MAC directly for lower connection latency
+  /// - Offer a manual scan fallback after three cached failures
   Future<void> _startConnection() async {
     if (_connectionState != BleConnectionState.disconnected) return;
     if (!_bluetoothOn) {
@@ -397,38 +428,16 @@ class _UnlockScreenState extends State<UnlockScreen> {
 
     _deviceReady = false;
 
+    final useCachedDirect =
+        _preferCachedDevice && _cachedMac != null && !_forceScanUntilConnected;
+
     setState(() {
       _connectionState = BleConnectionState.scanning;
-      _statusMessage = _cachedMac != null ? 'Connecting...' : 'Scanning...';
+      _statusMessage = useCachedDirect
+          ? 'Connecting to cached device...'
+          : 'Scanning...';
     });
-
-    // Reuse a link already held by the operating system before starting a new
-    // GATT request. This is especially useful after a short app restart.
-    if (!_checkedSystemDevices) {
-      _checkedSystemDevices = true;
-      try {
-        final systemDevices =
-            await FlutterBluePlus.systemDevices([serviceUuid]);
-        if (!mounted || _connectionState != BleConnectionState.scanning) {
-          return;
-        }
-        if (systemDevices.isNotEmpty) {
-          _deviceReady = true;
-          _setupDevice(systemDevices.first);
-          return;
-        }
-      } catch (e) {
-        debugPrint('System device lookup failed: $e');
-      }
-    }
-
-    if (!mounted || _connectionState != BleConnectionState.scanning) return;
-
-    // Never race scan-connect and direct-connect requests. Android serializes
-    // or batches GATT requests depending on OS version, and competing attempts
-    // can leave a stale connection behind after one path succeeds.
-    if (_cachedMac != null && _allowCachedDirectConnect) {
-      _allowCachedDirectConnect = false;
+    if (useCachedDirect) {
       _tryDirectConnect(_cachedMac!);
     } else {
       _startScan();
@@ -437,11 +446,12 @@ class _UnlockScreenState extends State<UnlockScreen> {
 
   void _startScan() {
     _scanSub?.cancel();
-    _scanSub = FlutterBluePlus.scanResults.listen(
+    _scanSub = FlutterBluePlus.onScanResults.listen(
       (results) {
         if (_deviceReady) return;
         for (final r in results) {
-          if (r.device.platformName == bleDeviceName ||
+          if (r.device.remoteId.str == _cachedMac ||
+              r.device.platformName == bleDeviceName ||
               r.advertisementData.serviceUuids.contains(serviceUuid)) {
             FlutterBluePlus.stopScan();
             _scanSub?.cancel();
@@ -456,6 +466,9 @@ class _UnlockScreenState extends State<UnlockScreen> {
             _connectionState = BleConnectionState.disconnected;
             _statusMessage = 'Scan error';
           });
+          if (_shouldAutoConnect && _pskConfigured) {
+            _scheduleReconnect();
+          }
         }
       },
     );
@@ -479,35 +492,6 @@ class _UnlockScreenState extends State<UnlockScreen> {
     });
   }
 
-  void _tryDirectConnect(String mac) {
-    final device = BluetoothDevice.fromId(mac);
-    device
-        .connect(
-      license: License.nonprofit,
-      timeout: const Duration(seconds: 3),
-      autoConnect: false,
-    )
-        .then((_) {
-      if (!mounted) return;
-      if (!_deviceReady) {
-        _deviceReady = true;
-        FlutterBluePlus.stopScan();
-        _scanSub?.cancel();
-        _setupDevice(device);
-      } else {
-        // Scan already won, disconnect this one
-        device.disconnect();
-      }
-    }).catchError((e) {
-      debugPrint('Direct connect failed, falling back to scan: $e');
-      if (mounted &&
-          !_deviceReady &&
-          _connectionState == BleConnectionState.scanning) {
-        _startScan();
-      }
-    });
-  }
-
   void _connectFromScan(BluetoothDevice device) {
     if (_deviceReady) return;
 
@@ -518,27 +502,83 @@ class _UnlockScreenState extends State<UnlockScreen> {
 
     device
         .connect(
-      license: License.nonprofit,
-      timeout: const Duration(seconds: 10),
-    )
+          license: License.nonprofit,
+          timeout: const Duration(seconds: 10),
+        )
         .then((_) {
-      if (!mounted) return;
-      if (!_deviceReady) {
-        _deviceReady = true;
-        _setupDevice(device);
-      } else {
-        device.disconnect();
+          if (!mounted) return;
+          if (!_deviceReady) {
+            _deviceReady = true;
+            _setupDevice(device);
+          } else {
+            device.disconnect();
+          }
+        })
+        .catchError((e) {
+          debugPrint('Scan connect failed: $e');
+          if (!mounted) return;
+          if (!_deviceReady) {
+            _handleConnectionFailure(cachedAttempt: false);
+          }
+        });
+  }
+
+  void _tryDirectConnect(String mac) {
+    final device = BluetoothDevice.fromId(mac);
+    _usingCachedDirectConnection = true;
+    device
+        .connect(
+          license: License.nonprofit,
+          timeout: const Duration(seconds: 3),
+          autoConnect: false,
+        )
+        .then((_) {
+          if (!mounted) return;
+          if (!_deviceReady) {
+            _deviceReady = true;
+            _setupDevice(device);
+          } else {
+            device.disconnect();
+          }
+        })
+        .catchError((e) {
+          debugPrint('Cached direct connect failed: $e');
+          if (mounted && !_deviceReady) {
+            _handleConnectionFailure(cachedAttempt: true);
+          }
+        });
+  }
+
+  void _handleConnectionFailure({required bool cachedAttempt}) {
+    _resetConnectionState(
+      statusMessage: cachedAttempt
+          ? 'Cached connection failed'
+          : 'Reconnecting...',
+    );
+
+    if (cachedAttempt && _preferCachedDevice) {
+      _cachedConnectFailures++;
+      if (_cachedConnectFailures >= 3) {
+        setState(() {
+          _offerScanFallback = true;
+          _statusMessage = 'Cached device unavailable';
+        });
       }
-    }).catchError((e) {
-      debugPrint('Scan connect failed: $e');
-      if (!mounted) return;
-      if (!_deviceReady) {
-        _resetConnectionState();
-        if (_shouldAutoConnect && _pskConfigured) {
-          _scheduleReconnect();
-        }
-      }
+    }
+
+    if (_shouldAutoConnect && _pskConfigured) {
+      _scheduleReconnect();
+    }
+  }
+
+  void _scanForDevice() {
+    if (_connectionState != BleConnectionState.disconnected) return;
+    setState(() {
+      _offerScanFallback = false;
+      _cachedConnectFailures = 0;
+      _forceScanUntilConnected = true;
     });
+    _startConnection();
   }
 
   /// Set up a connected device: listen for disconnects, cache MAC, discover services
@@ -554,22 +594,20 @@ class _UnlockScreenState extends State<UnlockScreen> {
 
     // Listen for future disconnects
     _connectionSub?.cancel();
-    _connectionSub = device.connectionState.listen(
-      (state) {
-        if (state == BluetoothConnectionState.disconnected) {
-          if (_device != device || generation != _connectionGeneration) return;
-          final reason = device.disconnectReason;
-          debugPrint(
-            'BLE disconnected: code=${reason?.code} '
-            'description=${reason?.description}',
-          );
-          _resetConnectionState();
-          if (mounted && _shouldAutoConnect && _pskConfigured) {
-            _scheduleReconnect();
-          }
-        }
-      },
-    );
+    _connectionSub = device.connectionState.listen((state) {
+      if (state == BluetoothConnectionState.disconnected) {
+        if (_device != device || generation != _connectionGeneration) return;
+        final cachedAttempt =
+            _usingCachedDirectConnection &&
+            _connectionState != BleConnectionState.connected;
+        final reason = device.disconnectReason;
+        debugPrint(
+          'BLE disconnected: code=${reason?.code} '
+          'description=${reason?.description}',
+        );
+        _handleConnectionFailure(cachedAttempt: cachedAttempt);
+      }
+    });
 
     _discoverAndSubscribe(device, generation);
   }
@@ -584,6 +622,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
     _challengeSub?.cancel();
     _deviceReady = false;
     _device = null;
+    _usingCachedDirectConnection = false;
     if (!mounted) return;
     setState(() {
       _connectionState = BleConnectionState.disconnected;
@@ -599,7 +638,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
 
   void _scheduleReconnect({Duration delay = const Duration(seconds: 1)}) {
     _reconnectTimer?.cancel();
-    if (!_shouldAutoConnect || !_pskConfigured) return;
+    if (!_shouldAutoConnect || !_pskConfigured || !_appInForeground) return;
     _reconnectTimer = Timer(delay, () {
       if (mounted &&
           _bluetoothOn &&
@@ -669,6 +708,10 @@ class _UnlockScreenState extends State<UnlockScreen> {
       setState(() {
         _connectionState = BleConnectionState.connected;
         _statusMessage = 'Connected';
+        _cachedConnectFailures = 0;
+        _offerScanFallback = false;
+        _forceScanUntilConnected = false;
+        _usingCachedDirectConnection = false;
       });
     } catch (e) {
       debugPrint('Service discovery failed (attempt $attempt): $e');
@@ -682,11 +725,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
         });
         await Future<void>.delayed(Duration(milliseconds: 350 * attempt));
         if (_device != device || generation != _connectionGeneration) return;
-        return _discoverAndSubscribe(
-          device,
-          generation,
-          attempt: attempt + 1,
-        );
+        return _discoverAndSubscribe(device, generation, attempt: attempt + 1);
       }
       if (_device != device || generation != _connectionGeneration) return;
       if (mounted) {
@@ -696,10 +735,10 @@ class _UnlockScreenState extends State<UnlockScreen> {
       }
       await _connectionSub?.cancel();
       _connectionSub = null;
+      final cachedAttempt = _usingCachedDirectConnection;
       await device.disconnect();
       if (_device != device || generation != _connectionGeneration) return;
-      _resetConnectionState(statusMessage: 'Reconnecting...');
-      _scheduleReconnect();
+      _handleConnectionFailure(cachedAttempt: cachedAttempt);
     }
   }
 
@@ -756,59 +795,56 @@ class _UnlockScreenState extends State<UnlockScreen> {
     await _challengeChar?.setNotifyValue(true);
 
     _statusSub?.cancel();
-    _statusSub = _statusChar?.onValueReceived.listen(
-      (data) {
-        if (!mounted) return;
-        try {
-          final status = utf8.decode(data);
-          if (status.startsWith('OK:') ||
-              status.startsWith('ERR:') ||
-              status.startsWith('WARN:') ||
-              status == 'READY') {
-            setState(() {
-              if (status == 'OK:PRESSED') {
-                _statusMessage = 'Command sent';
-                _lastResult = CommandResult.success;
-              } else if (status == 'OK:AUTH') {
-                _statusMessage = 'Authenticated';
-                if (_authCompleter != null && !_authCompleter!.isCompleted) {
-                  _authCompleter!.complete(true);
-                }
-              } else if (status == 'OK:PSK_UPDATED') {
-                _statusMessage = 'PSK updated on device';
-                _lastResult = CommandResult.success;
-              } else if (status == 'WARN:PSK_VOLATILE') {
-                _statusMessage = 'PSK updated (not saved to flash)';
-                _lastResult = CommandResult.success;
-              } else if (status == 'ERR:BUSY') {
-                _statusMessage = 'Button busy, try again';
-                _lastResult = CommandResult.error;
-              } else if (status == 'ERR:AUTH') {
-                _statusMessage = 'Authentication failed';
-                _lastResult = CommandResult.error;
-                if (_authCompleter != null && !_authCompleter!.isCompleted) {
-                  _authCompleter!.complete(false);
-                }
-              } else if (status.startsWith('ERR:')) {
-                _statusMessage = 'Error: ${status.substring(4)}';
-                _lastResult = CommandResult.error;
-              } else if (status == 'READY') {
-                _statusMessage = 'Connected';
+    _statusSub = _statusChar?.onValueReceived.listen((data) {
+      if (!mounted) return;
+      try {
+        final status = utf8.decode(data);
+        if (status.startsWith('OK:') ||
+            status.startsWith('ERR:') ||
+            status.startsWith('WARN:') ||
+            status == 'READY') {
+          setState(() {
+            if (status == 'OK:PRESSED') {
+              _statusMessage = 'Command sent';
+              _lastResult = CommandResult.success;
+            } else if (status == 'OK:AUTH') {
+              _statusMessage = 'Authenticated';
+              if (_authCompleter != null && !_authCompleter!.isCompleted) {
+                _authCompleter!.complete(true);
               }
-            });
-            _resultClearTimer?.cancel();
-            _resultClearTimer = Timer(const Duration(seconds: 2), () {
-              if (mounted) {
-                setState(() {
-                  _lastResult = null;
-                });
+            } else if (status == 'OK:PSK_UPDATED') {
+              _statusMessage = 'PSK updated on device';
+              _lastResult = CommandResult.success;
+            } else if (status == 'WARN:PSK_VOLATILE') {
+              _statusMessage = 'PSK updated (not saved to flash)';
+              _lastResult = CommandResult.success;
+            } else if (status == 'ERR:BUSY') {
+              _statusMessage = 'Button busy, try again';
+              _lastResult = CommandResult.error;
+            } else if (status == 'ERR:AUTH') {
+              _statusMessage = 'Authentication failed';
+              _lastResult = CommandResult.error;
+              if (_authCompleter != null && !_authCompleter!.isCompleted) {
+                _authCompleter!.complete(false);
               }
-            });
-          }
-        } catch (_) {}
-      },
-      onError: (error) {},
-    );
+            } else if (status.startsWith('ERR:')) {
+              _statusMessage = 'Error: ${status.substring(4)}';
+              _lastResult = CommandResult.error;
+            } else if (status == 'READY') {
+              _statusMessage = 'Connected';
+            }
+          });
+          _resultClearTimer?.cancel();
+          _resultClearTimer = Timer(const Duration(seconds: 2), () {
+            if (mounted) {
+              setState(() {
+                _lastResult = null;
+              });
+            }
+          });
+        }
+      } catch (_) {}
+    }, onError: (error) {});
     await _statusChar?.setNotifyValue(true);
 
     await _readChallenge();
@@ -1002,10 +1038,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
                     ),
                   ),
                 ] else ...[
-                  const Text(
-                    'Change PSK:',
-                    style: TextStyle(fontSize: 13),
-                  ),
+                  const Text('Change PSK:', style: TextStyle(fontSize: 13)),
                   const SizedBox(height: 12),
                   TextField(
                     controller: newPskController,
@@ -1077,7 +1110,8 @@ class _UnlockScreenState extends State<UnlockScreen> {
                         if (context.mounted) {
                           ScaffoldMessenger.of(context).showSnackBar(
                             const SnackBar(
-                                content: Text('Failed to read challenge')),
+                              content: Text('Failed to read challenge'),
+                            ),
                           );
                         }
                         return;
@@ -1085,16 +1119,19 @@ class _UnlockScreenState extends State<UnlockScreen> {
                       final nonce = _currentNonce!;
                       final hmac = _computeHMAC(nonce, _psk);
                       final separator = Uint8List.fromList([0x00]);
-                      final newPskBytes =
-                          Uint8List.fromList(utf8.encode(newPsk));
+                      final newPskBytes = Uint8List.fromList(
+                        utf8.encode(newPsk),
+                      );
                       final payload = Uint8List.fromList([
                         ...hmac,
                         ...separator,
                         ...newPskBytes,
                       ]);
 
-                      await _pskUpdateChar!
-                          .write(payload, withoutResponse: false);
+                      await _pskUpdateChar!.write(
+                        payload,
+                        withoutResponse: false,
+                      );
                       if (_currentNonce == nonce) {
                         _currentNonce = null; // consumed by firmware
                       }
@@ -1102,7 +1139,8 @@ class _UnlockScreenState extends State<UnlockScreen> {
                       if (context.mounted) {
                         ScaffoldMessenger.of(context).showSnackBar(
                           const SnackBar(
-                              content: Text('Failed to update PSK on device')),
+                            content: Text('Failed to update PSK on device'),
+                          ),
                         );
                       }
                       return;
@@ -1115,9 +1153,11 @@ class _UnlockScreenState extends State<UnlockScreen> {
                   Navigator.pop(context);
                   ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(
-                      content: Text(localOnly
-                          ? 'PSK saved locally'
-                          : 'PSK updated locally and on device'),
+                      content: Text(
+                        localOnly
+                            ? 'PSK saved locally'
+                            : 'PSK updated locally and on device',
+                      ),
                     ),
                   );
                 }
@@ -1132,58 +1172,107 @@ class _UnlockScreenState extends State<UnlockScreen> {
 
   Future<void> _showAppSettingsDialog() async {
     var biometricEnabled = widget.biometricEnabled;
+    var preferCachedDevice = _preferCachedDevice;
 
     await showDialog(
       context: context,
       builder: (context) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
           title: const Text('App Settings'),
-          content: SwitchListTile(
-            contentPadding: EdgeInsets.zero,
-            title: const Text('Require device authentication'),
-            subtitle: Text(
-              biometricEnabled
-                  ? 'Fingerprint, face, or device PIN is required when the app opens.'
-                  : 'The main car-key button opens without authentication. PSK settings remain protected.',
-            ),
-            value: biometricEnabled,
-            onChanged: (enabled) async {
-              if (!enabled) {
-                final confirmed = await showDialog<bool>(
-                      context: context,
-                      builder: (context) => AlertDialog(
-                        title: const Text('Disable authentication?'),
-                        content: const Text(
-                          'This removes authentication from the main car-key screen. '
-                          'Anyone who can unlock your phone will be able to operate the car key. '
-                          'Changing the PSK will still require device authentication.',
-                        ),
-                        actions: [
-                          TextButton(
-                            onPressed: () => Navigator.pop(context, false),
-                            child: const Text('Cancel'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Require device authentication'),
+                subtitle: Text(
+                  biometricEnabled
+                      ? 'Fingerprint, face, or device PIN is required when the app opens.'
+                      : 'The main car-key button opens without authentication. PSK settings remain protected.',
+                ),
+                value: biometricEnabled,
+                onChanged: (enabled) async {
+                  if (!enabled) {
+                    final confirmed =
+                        await showDialog<bool>(
+                          context: context,
+                          builder: (context) => AlertDialog(
+                            title: const Text('Disable authentication?'),
+                            content: const Text(
+                              'This removes authentication from the main car-key screen. '
+                              'Anyone who can unlock your phone will be able to operate the car key. '
+                              'Changing the PSK will still require device authentication.',
+                            ),
+                            actions: [
+                              TextButton(
+                                onPressed: () => Navigator.pop(context, false),
+                                child: const Text('Cancel'),
+                              ),
+                              FilledButton(
+                                onPressed: () => Navigator.pop(context, true),
+                                child: const Text('Disable'),
+                              ),
+                            ],
                           ),
-                          FilledButton(
-                            onPressed: () => Navigator.pop(context, true),
-                            child: const Text('Disable'),
-                          ),
-                        ],
-                      ),
-                    ) ??
-                    false;
-                if (!confirmed) return;
-              }
+                        ) ??
+                        false;
+                    if (!confirmed) return;
+                  }
 
-              final saved = await widget.onBiometricEnabledChanged(enabled);
-              if (!context.mounted) return;
-              if (saved) {
-                setDialogState(() => biometricEnabled = enabled);
-              } else {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Could not save app settings')),
-                );
-              }
-            },
+                  final saved = await widget.onBiometricEnabledChanged(enabled);
+                  if (!context.mounted) return;
+                  if (saved) {
+                    setDialogState(() => biometricEnabled = enabled);
+                  } else {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('Could not save app settings'),
+                      ),
+                    );
+                  }
+                },
+              ),
+              const Divider(),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Use cached device address'),
+                subtitle: Text(
+                  _cachedMac == null
+                      ? 'Connect by scanning once before enabling the cached fast path.'
+                      : 'Connect directly for speed. After three failures, the app offers a scan fallback.',
+                ),
+                value: preferCachedDevice,
+                onChanged: _cachedMac == null
+                    ? null
+                    : (enabled) async {
+                        try {
+                          await _secureStorage.write(
+                            key: _preferCachedDeviceStorageKey,
+                            value: enabled.toString(),
+                          );
+                          if (!mounted || !context.mounted) return;
+                          setState(() {
+                            _preferCachedDevice = enabled;
+                            _cachedConnectFailures = 0;
+                            _offerScanFallback = false;
+                            _forceScanUntilConnected = false;
+                          });
+                          setDialogState(() => preferCachedDevice = enabled);
+                        } catch (e) {
+                          debugPrint(
+                            'Failed to save cached-device setting: $e',
+                          );
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text('Could not save app settings'),
+                              ),
+                            );
+                          }
+                        }
+                      },
+              ),
+            ],
           ),
           actions: [
             TextButton(
@@ -1332,15 +1421,16 @@ class _UnlockScreenState extends State<UnlockScreen> {
                 child: ElevatedButton(
                   onPressed:
                       (_connectionState == BleConnectionState.connected &&
-                              _commandChar != null &&
-                              _currentNonce != null &&
-                              !_isProcessing)
-                          ? _sendCommand
-                          : null,
+                          _commandChar != null &&
+                          _currentNonce != null &&
+                          !_isProcessing)
+                      ? _sendCommand
+                      : null,
                   style: ElevatedButton.styleFrom(
                     shape: const CircleBorder(),
                     padding: const EdgeInsets.all(32),
-                    backgroundColor: _buttonColor ??
+                    backgroundColor:
+                        _buttonColor ??
                         Theme.of(context).colorScheme.primaryContainer,
                     foregroundColor: _buttonColor != null
                         ? Colors.white
@@ -1354,8 +1444,8 @@ class _UnlockScreenState extends State<UnlockScreen> {
                       Text(
                         _buttonText,
                         style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                              color: _buttonColor != null ? Colors.white : null,
-                            ),
+                          color: _buttonColor != null ? Colors.white : null,
+                        ),
                       ),
                     ],
                   ),
@@ -1367,6 +1457,16 @@ class _UnlockScreenState extends State<UnlockScreen> {
           ),
         ),
       ),
+      bottomNavigationBar: _preferCachedDevice && _offerScanFallback
+          ? SafeArea(
+              minimum: const EdgeInsets.fromLTRB(24, 8, 24, 24),
+              child: FilledButton.icon(
+                onPressed: _scanForDevice,
+                icon: const Icon(Icons.bluetooth_searching),
+                label: const Text('Scan for device'),
+              ),
+            )
+          : null,
     );
   }
 }
@@ -1385,7 +1485,4 @@ enum BleConnectionState {
   const BleConnectionState(this.label);
 }
 
-enum CommandResult {
-  success,
-  error,
-}
+enum CommandResult { success, error }
