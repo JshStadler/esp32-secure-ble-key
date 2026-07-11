@@ -136,10 +136,8 @@ class _AuthGateState extends State<AuthGate> {
 
       final bool result = await _localAuth.authenticate(
         localizedReason: 'Authenticate to access Car Key',
-        options: const AuthenticationOptions(
-          stickyAuth: true,
-          biometricOnly: false,
-        ),
+        persistAcrossBackgrounding: true,
+        biometricOnly: false,
       );
 
       setState(() {
@@ -485,6 +483,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
     final device = BluetoothDevice.fromId(mac);
     device
         .connect(
+      license: License.nonprofit,
       timeout: const Duration(seconds: 3),
       autoConnect: false,
     )
@@ -517,7 +516,12 @@ class _UnlockScreenState extends State<UnlockScreen> {
       _statusMessage = 'Connecting...';
     });
 
-    device.connect(timeout: const Duration(seconds: 10)).then((_) {
+    device
+        .connect(
+      license: License.nonprofit,
+      timeout: const Duration(seconds: 10),
+    )
+        .then((_) {
       if (!mounted) return;
       if (!_deviceReady) {
         _deviceReady = true;
@@ -570,7 +574,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
     _discoverAndSubscribe(device, generation);
   }
 
-  void _resetConnectionState() {
+  void _resetConnectionState({String statusMessage = 'Disconnected'}) {
     _connectionGeneration++;
     if (_authCompleter != null && !_authCompleter!.isCompleted) {
       _authCompleter!.complete(false);
@@ -583,7 +587,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
     if (!mounted) return;
     setState(() {
       _connectionState = BleConnectionState.disconnected;
-      _statusMessage = 'Disconnected';
+      _statusMessage = statusMessage;
       _currentNonce = null;
       _lastResult = null;
       _challengeChar = null;
@@ -613,6 +617,18 @@ class _UnlockScreenState extends State<UnlockScreen> {
     if (_device != device || generation != _connectionGeneration) return;
 
     try {
+      // Android can report the link connected slightly before its GATT client
+      // is ready. A short first-attempt delay avoids a needless disconnect and
+      // full scan cycle on phones with a busy Bluetooth stack.
+      if (attempt == 1) {
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        if (_device != device || generation != _connectionGeneration) return;
+      }
+
+      _challengeChar = null;
+      _commandChar = null;
+      _statusChar = null;
+      _pskUpdateChar = null;
       final services = await device.discoverServices();
       if (_device != device || generation != _connectionGeneration) return;
 
@@ -656,7 +672,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
       });
     } catch (e) {
       debugPrint('Service discovery failed (attempt $attempt): $e');
-      if (attempt < 2 &&
+      if (attempt < 3 &&
           _device == device &&
           generation == _connectionGeneration &&
           device.isConnected &&
@@ -664,6 +680,8 @@ class _UnlockScreenState extends State<UnlockScreen> {
         setState(() {
           _statusMessage = 'Retrying discovery...';
         });
+        await Future<void>.delayed(Duration(milliseconds: 350 * attempt));
+        if (_device != device || generation != _connectionGeneration) return;
         return _discoverAndSubscribe(
           device,
           generation,
@@ -673,12 +691,14 @@ class _UnlockScreenState extends State<UnlockScreen> {
       if (_device != device || generation != _connectionGeneration) return;
       if (mounted) {
         setState(() {
-          _statusMessage = 'Discovery failed';
+          _statusMessage = 'Reconnecting...';
         });
       }
+      await _connectionSub?.cancel();
+      _connectionSub = null;
       await device.disconnect();
       if (_device != device || generation != _connectionGeneration) return;
-      _resetConnectionState();
+      _resetConnectionState(statusMessage: 'Reconnecting...');
       _scheduleReconnect();
     }
   }
@@ -897,10 +917,8 @@ class _UnlockScreenState extends State<UnlockScreen> {
     try {
       return await _localAuth.authenticate(
         localizedReason: 'Authenticate to access PSK settings',
-        options: const AuthenticationOptions(
-          stickyAuth: true,
-          biometricOnly: false,
-        ),
+        persistAcrossBackgrounding: true,
+        biometricOnly: false,
       );
     } catch (_) {
       return false;

@@ -19,8 +19,10 @@ pluginManagement {
 
 plugins {
     id("dev.flutter.flutter-plugin-loader") version "1.0.0"
-    id("com.android.application") version "8.11.1" apply false
-    id("org.jetbrains.kotlin.android") version "2.2.20" apply false
+    id("com.android.application") version "9.0.1" apply false
+    // Temporary classpath compatibility for Flutter plugins that have not yet
+    // adopted AGP 9 built-in Kotlin. The app module does not apply this plugin.
+    id("org.jetbrains.kotlin.android") version "2.3.20" apply false
 }
 
 include(":app")

@@ -14,7 +14,8 @@ The companion mobile app for the BLE Car Key system. Connects to the ESP32 over 
 
 ## Requirements
 
-- Flutter SDK 3.0+
+- Flutter SDK 3.44+
+- JDK 17
 - Android device with BLE support (Android 6.0+) or iOS 12+
 
 ## Setup

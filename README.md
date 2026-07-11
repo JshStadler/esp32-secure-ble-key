@@ -129,7 +129,7 @@ Wire GPIO 5 to the **other leg** (the encoder input side).
 
 ### 📱 Android App (Flutter)
 
-**Requirements:** [Flutter SDK](https://flutter.dev/docs/get-started/install) (3.0+)
+**Requirements:** [Flutter SDK](https://flutter.dev/docs/get-started/install) 3.44+ and JDK 17
 
 1. Navigate to `Android_Flutter_Application/`
 2. Install dependencies:
