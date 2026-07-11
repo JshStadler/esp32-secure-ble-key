@@ -16,4 +16,11 @@ void main() {
     expect(BleConnectionState.connecting.label, 'Connecting...');
     expect(BleConnectionState.connected.label, 'Connected');
   });
+
+  test('device authentication defaults on and persists an explicit opt-out',
+      () {
+    expect(biometricPreferenceEnabled(null), isTrue);
+    expect(biometricPreferenceEnabled('true'), isTrue);
+    expect(biometricPreferenceEnabled('false'), isFalse);
+  });
 }

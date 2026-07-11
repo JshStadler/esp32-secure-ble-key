@@ -33,6 +33,9 @@ const cmdPress = 0x02;
 // Secure storage keys
 const _pskStorageKey = 'car_unlock_psk';
 const _cachedMacStorageKey = 'car_unlock_cached_mac';
+const _biometricEnabledStorageKey = 'car_unlock_biometric_enabled';
+
+bool biometricPreferenceEnabled(String? storedValue) => storedValue != 'false';
 
 void main() {
   runApp(const CarKeyApp());
@@ -68,13 +71,54 @@ class AuthGate extends StatefulWidget {
 
 class _AuthGateState extends State<AuthGate> {
   final LocalAuthentication _localAuth = LocalAuthentication();
+  final FlutterSecureStorage _secureStorage = const FlutterSecureStorage();
   bool _authenticated = false;
   bool _checking = true;
+  bool _biometricEnabled = true;
 
   @override
   void initState() {
     super.initState();
-    _authenticate();
+    _initializeAuthentication();
+  }
+
+  Future<void> _initializeAuthentication() async {
+    try {
+      final stored = await _secureStorage.read(
+        key: _biometricEnabledStorageKey,
+      );
+      _biometricEnabled = biometricPreferenceEnabled(stored);
+    } catch (e) {
+      debugPrint('Failed to load biometric preference: $e');
+    }
+
+    if (!mounted) return;
+    if (!_biometricEnabled) {
+      setState(() {
+        _authenticated = true;
+        _checking = false;
+      });
+      return;
+    }
+    await _authenticate();
+  }
+
+  Future<bool> _setBiometricEnabled(bool enabled) async {
+    try {
+      await _secureStorage.write(
+        key: _biometricEnabledStorageKey,
+        value: enabled.toString(),
+      );
+      if (!mounted) return false;
+      setState(() {
+        _biometricEnabled = enabled;
+        if (!enabled) _authenticated = true;
+      });
+      return true;
+    } catch (e) {
+      debugPrint('Failed to save biometric preference: $e');
+      return false;
+    }
   }
 
   Future<void> _authenticate() async {
@@ -115,7 +159,10 @@ class _AuthGateState extends State<AuthGate> {
     return Stack(
       children: [
         // UnlockScreen is always mounted so BLE connects immediately
-        const UnlockScreen(),
+        UnlockScreen(
+          biometricEnabled: _biometricEnabled,
+          onBiometricEnabledChanged: _setBiometricEnabled,
+        ),
 
         // Auth overlay - blocks interaction until authenticated
         if (!_authenticated)
@@ -152,7 +199,14 @@ class _AuthGateState extends State<AuthGate> {
 // ============================================================
 
 class UnlockScreen extends StatefulWidget {
-  const UnlockScreen({super.key});
+  const UnlockScreen({
+    required this.biometricEnabled,
+    required this.onBiometricEnabledChanged,
+    super.key,
+  });
+
+  final bool biometricEnabled;
+  final Future<bool> Function(bool enabled) onBiometricEnabledChanged;
 
   @override
   State<UnlockScreen> createState() => _UnlockScreenState();
@@ -1058,6 +1112,72 @@ class _UnlockScreenState extends State<UnlockScreen> {
     );
   }
 
+  Future<void> _showAppSettingsDialog() async {
+    var biometricEnabled = widget.biometricEnabled;
+
+    await showDialog(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('App Settings'),
+          content: SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Require device authentication'),
+            subtitle: Text(
+              biometricEnabled
+                  ? 'Fingerprint, face, or device PIN is required when the app opens.'
+                  : 'The main car-key button opens without authentication. PSK settings remain protected.',
+            ),
+            value: biometricEnabled,
+            onChanged: (enabled) async {
+              if (!enabled) {
+                final confirmed = await showDialog<bool>(
+                      context: context,
+                      builder: (context) => AlertDialog(
+                        title: const Text('Disable authentication?'),
+                        content: const Text(
+                          'This removes authentication from the main car-key screen. '
+                          'Anyone who can unlock your phone will be able to operate the car key. '
+                          'Changing the PSK will still require device authentication.',
+                        ),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(context, false),
+                            child: const Text('Cancel'),
+                          ),
+                          FilledButton(
+                            onPressed: () => Navigator.pop(context, true),
+                            child: const Text('Disable'),
+                          ),
+                        ],
+                      ),
+                    ) ??
+                    false;
+                if (!confirmed) return;
+              }
+
+              final saved = await widget.onBiometricEnabledChanged(enabled);
+              if (!context.mounted) return;
+              if (saved) {
+                setDialogState(() => biometricEnabled = enabled);
+              } else {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Could not save app settings')),
+                );
+              }
+            },
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Done'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   // --------------------------------------------------------
   // UI
   // --------------------------------------------------------
@@ -1113,6 +1233,11 @@ class _UnlockScreenState extends State<UnlockScreen> {
       appBar: AppBar(
         title: const Text('Car Key'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.settings),
+            tooltip: 'App Settings',
+            onPressed: _showAppSettingsDialog,
+          ),
           IconButton(
             icon: const Icon(Icons.key),
             tooltip: 'PSK Settings',

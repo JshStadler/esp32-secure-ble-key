@@ -29,9 +29,14 @@ The C3 firmware is built on ESP-IDF (no longer Arduino) so it can use FreeRTOS t
 Android_Flutter_Application/     Flutter mobile app (Android; iOS untested)
 Garmin_Watch_App/                Garmin Connect IQ watch app
 ESP32-C3_Firmware/               ESP32-C3 ESP-IDF firmware (PlatformIO) — recommended
-ESP32_Arduino_Firmware/          ESP32 Arduino firmware (PlatformIO) — POC, not maintained
-ESP32-C3_Arduino_Firmware/       ESP32-C3 Arduino firmware (PlatformIO) — POC, not maintained
+ESP32_Arduino_Firmware/          LEGACY ESP32 Arduino proof of concept — unsupported
+ESP32-C3_Arduino_Firmware/       LEGACY ESP32-C3 Arduino proof of concept — unsupported
 ```
+
+> **Legacy firmware:** Both Arduino firmware directories are retained only for
+> historical reference and migration. They are not maintained, are not included
+> in releases, and should not be used for new installations. Use
+> `ESP32-C3_Firmware/` for reliable simultaneous phone/watch connections.
 
 ## 🔒 Security
 
@@ -43,7 +48,11 @@ Authentication uses HMAC-SHA256 with a challenge-response protocol:
 4. The ESP32 verifies using constant-time comparison
 5. The nonce is rotated unconditionally after every verification attempt (success or failure) to prevent replay
 
-Additional protections include biometric gating on the phone (fingerprint/face), auto-disconnect timeouts (15s unauthenticated, 5min authenticated), and secure storage for the PSK on both the phone/watch and ESP32 (stored in NVS).
+Additional protections include optional device-authentication gating on the phone
+(fingerprint, face, or device PIN), auto-disconnect timeouts (15s unauthenticated,
+5min authenticated), and secure storage for the PSK on both the phone/watch and
+ESP32 (stored in NVS). The app gate can be disabled for faster frequent use;
+changing the PSK always requires device authentication.
 
 The PSK can be updated over BLE from the phone app after initial setup — the update itself is authenticated against the existing PSK, so only an already-authorised client can change it.
 
@@ -55,12 +64,12 @@ The C3 firmware is designed for long term always-on operation in a parked vehicl
 
 | Metric             | Value                            |
 |--------------------|----------------------------------|
-| Idle current draw  | AI estimated at ~2-5 mA             |
+| Idle current draw  | Measure on installed hardware       |
 | CPU idle frequency | 10 MHz (auto-scaled via DFS)     |
 | CPU active freq    | 80 MHz                           |
-| Sleep mode         | Auto light sleep (tickless idle) |
+| Sleep mode         | Tickless idle + DFS configured      |
 | Wi-Fi              | Excluded at build time           |
-| BLE modem sleep    | Cooperates with PM light sleep   |
+| BLE modem sleep    | Disabled for link reliability       |
 
 Achieved through ESP-IDF features unavailable in the Arduino framework:
 - `CONFIG_PM_ENABLE` + `CONFIG_FREERTOS_USE_TICKLESS_IDLE`
@@ -134,7 +143,11 @@ Wire GPIO 5 to the **other leg** (the encoder input side).
    flutter build apk --release -v
    ```
 
-On first launch, set the PSK in the app's settings to match what you flashed onto the ESP32-C3. The app stores it in encrypted secure storage and gates access behind biometric authentication on supported devices.
+On first launch, set the PSK in the app's settings to match what you flashed onto
+the ESP32-C3. The app stores it in encrypted secure storage and requires device
+authentication by default. Use **App Settings → Require device authentication**
+to disable the launch gate during periods of frequent use. PSK changes remain
+protected by device authentication even when the main app gate is disabled.
 
 <img width="360" height="707" alt="image" src="https://github.com/user-attachments/assets/e33acc7a-7c9c-415d-9772-41116ede4fe0" /><img width="360" height="707" alt="image" src="https://github.com/user-attachments/assets/94fad788-adde-4d8a-987b-6423a58d1854" />
 
@@ -205,8 +218,10 @@ Key constants in `main/main.c`:
 | `DEBUG_LED_GPIO` | `GPIO_NUM_8` | GPIO for debug LED (SuperMini onboard LED) |
 | `BLE_DEVICE_NAME` | `BLE-Device` | BLE advertised name |
 | `BLE_TX_POWER` | `3` | TX power in dBm |
-| `ADV_INTERVAL_MIN` | `1600` | Min advertising interval (×0.625 ms) |
-| `ADV_INTERVAL_MAX` | `3200` | Max advertising interval (×0.625 ms) |
+| `ADV_FAST_INTERVAL_MIN` | `80` | Fast advertising minimum (50 ms) |
+| `ADV_FAST_INTERVAL_MAX` | `160` | Fast advertising maximum (100 ms) |
+| `ADV_IDLE_INTERVAL_MIN` | `320` | Idle advertising minimum (200 ms) |
+| `ADV_IDLE_INTERVAL_MAX` | `640` | Idle advertising maximum (400 ms) |
 | `MAX_CONNECTIONS` | `3` | Simultaneous BLE connections |
 | `UNAUTH_TIMEOUT_SEC` | `15` | Auto-disconnect for unauthenticated clients |
 | `AUTH_TIMEOUT_SEC` | `300` | Auto-disconnect for authenticated clients |
