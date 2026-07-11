@@ -73,11 +73,12 @@ CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
 CONFIG_NVS_FLASH_ENABLED=y
 
 # ---- Logging ----
-# Default log level for production. Override per-tag at runtime
-# when DEBUG is defined in main.c.
+# Compile logging out of production. Debug builds must change these settings
+# together with enabling the console and defining DEBUG in main.c.
 # 0=NONE, 1=ERROR, 2=WARN, 3=INFO, 4=DEBUG, 5=VERBOSE
-CONFIG_LOG_DEFAULT_LEVEL=1
-CONFIG_LOG_MAXIMUM_LEVEL=4
+CONFIG_LOG_DEFAULT_LEVEL_NONE=y
+CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=y
+CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
 
 # ---- USB Console ----
 # Disable USB-CDC console in production to save power.

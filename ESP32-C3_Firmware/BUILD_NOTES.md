@@ -74,7 +74,10 @@ To enable serial logging during development:
 2. In `platformio.ini`, uncomment `build_flags = -DDEBUG`
 3. In `sdkconfig.defaults`, change:
    - `CONFIG_ESP_CONSOLE_NONE=y` → `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`
-   - `CONFIG_LOG_DEFAULT_LEVEL=1` → `CONFIG_LOG_DEFAULT_LEVEL=3`
+   - `CONFIG_LOG_DEFAULT_LEVEL_NONE=y` → `CONFIG_LOG_DEFAULT_LEVEL_INFO=y`
+   - Remove `CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=y` and add
+     `CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y`
+   - `CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y` → `CONFIG_BOOTLOADER_LOG_LEVEL_INFO=y`
 4. **Delete `sdkconfig.esp32c3`** so it regenerates from defaults.
 5. Rebuild: `pio run -e esp32c3`
 
@@ -106,7 +109,11 @@ pio run -e esp32c3 -t upload
 
 3. **Watchdog**: ESP-IDF 6.0.1 may already have the watchdog initialized, so the
    firmware initializes or reconfigures it as needed. The main loop task
-   subscribes itself with `esp_task_wdt_add(NULL)`.
+   subscribes itself with `esp_task_wdt_add(NULL)`. A separate event heartbeat
+   is posted to NimBLE's own queue; five missed acknowledgements reboot the ESP
+   even if the main task is still healthy. The maintenance loop also reconciles
+   `adv_active` against `ble_gap_adv_active()` and reboots after three failed
+   advertising recoveries.
 
 4. **LED pin parking**: Still parks GPIO 8 low in production, same as the
    Arduino version. Only runs when `DEBUG_LED_ENABLED` is not defined.

@@ -87,11 +87,10 @@ static const char *TAG = "CAR_UNLOCK";
 #define LOG_W(tag, fmt, ...) ESP_LOGW(tag, fmt, ##__VA_ARGS__)
 #define LOG_E(tag, fmt, ...) ESP_LOGE(tag, fmt, ##__VA_ARGS__)
 #else
-/* Keep firmware diagnostics visible while BLE reliability is being tuned.
- * ESP_LOG levels are still tag-controlled at runtime. */
-#define LOG_I(tag, fmt, ...) ESP_LOGI(tag, fmt, ##__VA_ARGS__)
-#define LOG_W(tag, fmt, ...) ESP_LOGW(tag, fmt, ##__VA_ARGS__)
-#define LOG_E(tag, fmt, ...) ESP_LOGE(tag, fmt, ##__VA_ARGS__)
+/* Production has no console, so compile application log formatting out too. */
+#define LOG_I(tag, fmt, ...) do { (void)(tag); } while (0)
+#define LOG_W(tag, fmt, ...) do { (void)(tag); } while (0)
+#define LOG_E(tag, fmt, ...) do { (void)(tag); } while (0)
 #endif
 
 /* ============================================================
@@ -173,6 +172,12 @@ static const char *TAG = "CAR_UNLOCK";
 /* Task watchdog timeout in seconds. Must exceed LOOP_INTERVAL_MS
  * to avoid false triggers during normal sleep. */
 #define WDT_TIMEOUT_SEC 30
+
+/* BLE host heartbeat: the maintenance task posts an event to NimBLE's own
+ * queue every LOOP_INTERVAL_MS. Five missed acknowledgements means the host
+ * event loop has stopped making progress and the safest recovery is a reboot. */
+#define BLE_HEALTH_MAX_MISSED_HEARTBEATS 5
+#define BLE_ADV_HEALTH_MAX_FAILURES 3
 
 /* ---- Power Management ----
  * DFS frequency limits (MHz). CPU scales between these automatically.
@@ -267,6 +272,9 @@ static uint8_t adv_failure_count = 0;
 static bool adv_using_fast_interval = false;
 static int64_t fast_adv_until_ms = 0;
 static bool task_wdt_enabled = false;
+static struct ble_npl_event ble_health_event;
+static volatile uint32_t ble_heartbeat_ack_count = 0;
+static uint8_t adv_health_failure_count = 0;
 
 /* Non-blocking button press: one-shot timer releases the GPIO */
 static esp_timer_handle_t button_timer = NULL;
@@ -284,6 +292,7 @@ static void generate_nonce_for_slot(int slot, bool notify);
 static int  ensure_client_slot(uint16_t conn_handle);
 static struct os_mbuf *om_from_buf(const void *buf, uint16_t len);
 static int  gap_event_handler(struct ble_gap_event *event, void *arg);
+static void ble_health_event_callback(struct ble_npl_event *event);
 
 /* ============================================================
  * Utility: time helpers
@@ -474,6 +483,11 @@ static bool compute_hmac(const uint8_t *nonce, size_t nonce_len,
     psa_reset_key_attributes(&attributes);
 
     return status == PSA_SUCCESS && hmac_len == HMAC_LEN;
+}
+
+static void ble_health_event_callback(struct ble_npl_event *event) {
+    (void)event;
+    ble_heartbeat_ack_count++;
 }
 
 /* ============================================================
@@ -1195,6 +1209,8 @@ static void nimble_host_task(void *param) {
     /* This function returns only when nimble_port_stop() is called */
     nimble_port_run();
     nimble_port_freertos_deinit();
+    /* The host loop should never exit during normal operation. */
+    esp_restart();
 }
 
 /* ============================================================
@@ -1215,11 +1231,32 @@ static void main_loop_task(void *param) {
         }
     }
 
+    uint32_t last_ble_heartbeat_ack = ble_heartbeat_ack_count;
+    uint8_t missed_ble_heartbeats = 0;
+
     while (1) {
         if (subscribed_to_wdt) {
             esp_task_wdt_reset();
         }
         int64_t now = now_ms();
+
+        /* ---- NimBLE host event-loop watchdog ----
+         * This event can only be acknowledged by the NimBLE host task. If the
+         * queue stops progressing, the normal task watchdog may still be fed
+         * by this maintenance task, so detect that failure independently. */
+        if (!ble_npl_event_is_queued(&ble_health_event)) {
+            ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &ble_health_event);
+        }
+        uint32_t heartbeat_ack = ble_heartbeat_ack_count;
+        if (heartbeat_ack == last_ble_heartbeat_ack) {
+            if (++missed_ble_heartbeats >= BLE_HEALTH_MAX_MISSED_HEARTBEATS) {
+                LOG_E(TAG, "NimBLE host heartbeat stalled, restarting");
+                esp_restart();
+            }
+        } else {
+            last_ble_heartbeat_ack = heartbeat_ack;
+            missed_ble_heartbeats = 0;
+        }
 
         /* ---- Ghost slot reaper ----
          * If we have more in_use slots than NimBLE has active connections,
@@ -1243,9 +1280,30 @@ static void main_loop_task(void *param) {
             }
         }
 
-        /* If we freed slots and aren't at capacity, re-enable advertising */
-        if (nimble_count < MAX_CONNECTIONS && !adv_active) {
-            start_advertising();
+        /* Reconcile the cached flag with NimBLE's actual GAP state. This
+         * prevents a stale true adv_active value from suppressing recovery. */
+        if (nimble_count < MAX_CONNECTIONS) {
+            bool actual_adv_active = ble_gap_adv_active() != 0;
+            if (adv_active != actual_adv_active) {
+                LOG_W(TAG, "Advertising state corrected: cached=%d actual=%d",
+                      adv_active ? 1 : 0, actual_adv_active ? 1 : 0);
+                adv_active = actual_adv_active;
+            }
+            if (!actual_adv_active) {
+                start_advertising();
+                if (!ble_gap_adv_active()) {
+                    if (++adv_health_failure_count >= BLE_ADV_HEALTH_MAX_FAILURES) {
+                        LOG_E(TAG, "Advertising health recovery failed, restarting");
+                        esp_restart();
+                    }
+                } else {
+                    adv_health_failure_count = 0;
+                }
+            } else {
+                adv_health_failure_count = 0;
+            }
+        } else {
+            adv_health_failure_count = 0;
         }
 
         /* Drop back to low-power advertising after the fast reconnect window. */
@@ -1301,7 +1359,9 @@ static void main_loop_task(void *param) {
  * ============================================================ */
 
 void app_main(void) {
+#ifdef DEBUG
     esp_log_level_set(TAG, ESP_LOG_INFO);
+#endif
     LOG_I(TAG, "ESP32-C3 BLE Car Unlock starting...");
 
     /* ---- GPIO init ---- */
@@ -1364,6 +1424,8 @@ void app_main(void) {
     rc = ble_gatts_add_svcs(gatt_svcs);
     assert(rc == 0);
 
+    ble_npl_event_init(&ble_health_event, ble_health_event_callback, NULL);
+
     /* ---- Task watchdog ---- */
     esp_task_wdt_config_t wdt_config = {
         .timeout_ms  = WDT_TIMEOUT_SEC * 1000,
@@ -1388,5 +1450,10 @@ void app_main(void) {
     /* ---- Start main loop task ----
      * Stack: 4096 bytes is plenty for ghost reaper + timeout logic.
      * Priority 5: above tIDLE(0) but below NimBLE host task. */
-    xTaskCreate(main_loop_task, "main_loop", 4096, NULL, 5, NULL);
+    BaseType_t task_created =
+        xTaskCreate(main_loop_task, "main_loop", 4096, NULL, 5, NULL);
+    if (task_created != pdPASS) {
+        LOG_E(TAG, "Failed to create main maintenance task, restarting");
+        esp_restart();
+    }
 }
