@@ -1,5 +1,10 @@
 # BLE Car Key — Flutter App
 
+> **Legacy / unsupported:** This Flutter client is retained for historical
+> reference and migration only. Use `../Native_Android_Application/` for new
+> installations and development. Release APKs are built from the native Kotlin
+> application.
+
 The companion mobile app for the BLE Car Key system. Connects to the ESP32 over Bluetooth Low Energy, authenticates with HMAC-SHA256, and sends unlock/lock commands.
 
 ## Features

@@ -19,14 +19,15 @@ Designed for both convenience and security:
 
 ## 🛠️ How It Works
 
-The ESP32-C3 sits inside the car, powered from the 12V system via a buck converter. A GPIO pin is wired directly across the car remote's button — no MOSFET or relay needed since both share the same 3.3V supply. When you want to unlock the car, the Flutter app on your phone (or the Garmin watch app) connects over BLE, completes an HMAC-SHA256 challenge-response handshake using a pre-shared key (PSK), and sends a command. The ESP32-C3 verifies the HMAC and drives the GPIO to simulate a button press on the remote.
+The ESP32-C3 sits inside the car, powered from the 12V system via a buck converter. A GPIO pin is wired directly across the car remote's button — no MOSFET or relay needed since both share the same 3.3V supply. When you want to unlock the car, the native Android app (or the Garmin watch app) connects over BLE, completes an HMAC-SHA256 challenge-response handshake using a pre-shared key (PSK), and sends a command. The ESP32-C3 verifies the HMAC and drives the GPIO to simulate a button press on the remote.
 
 The C3 firmware is built on ESP-IDF (no longer Arduino) so it can use FreeRTOS tickless idle, dynamic frequency scaling, and automatic light sleep — keeping the device draw very low for operation off a parked car's battery.
 
 ## 🧱 Project Structure
 
 ```
-Android_Flutter_Application/     Flutter mobile app (Android; iOS untested)
+Native_Android_Application/      Native Kotlin Android app — recommended
+Android_Flutter_Application/     LEGACY Flutter mobile app — unsupported
 Garmin_Watch_App/                Garmin Connect IQ watch app
 ESP32-C3_Firmware/               ESP32-C3 ESP-IDF firmware (PlatformIO) — recommended
 ESP32_Arduino_Firmware/          LEGACY ESP32 Arduino proof of concept — unsupported
@@ -37,6 +38,10 @@ ESP32-C3_Arduino_Firmware/       LEGACY ESP32-C3 Arduino proof of concept — un
 > historical reference and migration. They are not maintained, are not included
 > in releases, and should not be used for new installations. Use
 > `ESP32-C3_Firmware/` for reliable simultaneous phone/watch connections.
+
+> **Legacy mobile app:** `Android_Flutter_Application/` is retained for history
+> and migration only. New development and release APKs use
+> `Native_Android_Application/`.
 
 ## 🔒 Security
 
@@ -127,21 +132,17 @@ Wire GPIO 5 to the **other leg** (the encoder input side).
    ```
 5. Production builds disable the serial console for power savings. To enable logging during development, see `BUILD_NOTES.md` for the debug build steps.
 
-### 📱 Android App (Flutter)
+### 📱 Android App (native Kotlin)
 
-**Requirements:** [Flutter SDK](https://flutter.dev/docs/get-started/install) 3.44+ and JDK 17
+Download the current APK from [GitHub Releases](https://github.com/JshStadler/esp32-secure-ble-key/releases), or build it with JDK 17 and Android SDK 36.
 
-1. Navigate to `Android_Flutter_Application/`
-2. Install dependencies:
-   ```
-   flutter pub get
-   ```
-3. Build apk:
-   ```
-   flutter clean
-   dart run flutter_launcher_icons
-   flutter build apk --release -v
-   ```
+```powershell
+cd Native_Android_Application
+$env:JAVA_HOME = 'C:\path\to\jdk-17'
+.\gradlew.bat assembleRelease
+```
+
+The APK is written to `Native_Android_Application/app/build/outputs/apk/release/`.
 
 On first launch, set the PSK in the app's settings to match what you flashed onto
 the ESP32-C3. The app stores it in encrypted secure storage and requires device
@@ -153,7 +154,9 @@ protected by device authentication even when the main app gate is disabled.
 direct connection. After three failed cached attempts the app offers a persistent
 scan fallback, while continuing cached retries until that fallback is selected.
 
-<img width="360" height="707" alt="image" src="https://github.com/user-attachments/assets/e33acc7a-7c9c-415d-9772-41116ede4fe0" /><img width="360" height="707" alt="image" src="https://github.com/user-attachments/assets/94fad788-adde-4d8a-987b-6423a58d1854" />
+The native app also includes connection diagnostics, shareable logs, a seven-day
+operation history, and optional location pins for the latest 30 foreground
+sessions. Location recording is opt-in and does not affect BLE operation.
 
 ### ⌚ Garmin Watch App
 

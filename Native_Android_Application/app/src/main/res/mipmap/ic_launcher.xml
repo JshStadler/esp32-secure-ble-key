@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@color/icon_background" />
+    <item>
+        <inset android:drawable="@drawable/app_icon" android:inset="14%" />
+    </item>
+</layer-list>
