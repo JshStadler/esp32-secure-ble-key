@@ -6,7 +6,7 @@
   BLE Car Key Solution
 </h1>
 
-A Bluetooth Low Energy (BLE) system that turns your phone and/or Garmin watch into a car key. An ESP32-C3 wired to your car remote's button acts as a bridge — your phone or watch authenticates over BLE and triggers the remote, unlocking or locking the car.
+ESP32 Secure BLE Key is an open-source Bluetooth Low Energy access-control system that uses an ESP32-C3, a native Kotlin Android app, and a Garmin Connect IQ watch app. It authenticates commands using HMAC-SHA256 challenge-response authentication and can trigger a car remote, gate, garage door, or similar low-voltage control.
 
 While designed for automotive use, the system can be adapted to any application requiring a secure BLE-triggered action, such as doors, gates, or other access control systems.
 *(This is not for keyless ignition/starting.)*
