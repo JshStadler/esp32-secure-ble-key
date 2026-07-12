@@ -158,6 +158,9 @@ The native app also includes connection diagnostics, shareable logs, a seven-day
 operation history, and optional location pins for the latest 30 foreground
 sessions. Location recording is opt-in and does not affect BLE operation.
 
+<img width="360" height="746" alt="image" src="https://github.com/user-attachments/assets/c017401e-025e-4bce-90b5-59f338a4a504" />
+
+
 ### ⌚ Garmin Watch App
 
 **Requirements:** Connect IQ SDK with `minSdkVersion 5.2.0` or newer. Currently targets the Forerunner 165 — other devices need to be added to the manifest.
@@ -171,7 +174,7 @@ sessions. Location recording is opt-in and does not affect BLE operation.
 - **BACK** — exit app (preserves BLE pairing for fast reconnect on next launch)
 - **MENU** (long-press UP) — force unpair, useful after firmware updates that change the GATT service table
 
-The watch persists its BLE pairing across app sessions, so subsequent launches reconnect in 1-2 seconds instead of repeating the full GATT service discovery (~15s).
+The watch persists its BLE pairing across app sessions, so subsequent launches reconnect in 1-2 seconds instead of repeating the full GATT service discovery.
 
 <img width="360" height="539" alt="image" src="https://github.com/user-attachments/assets/28264123-9bf5-41ac-bad2-cb6732b7731b" />
 
