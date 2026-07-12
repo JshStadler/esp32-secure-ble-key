@@ -21,15 +21,14 @@ object EventLog {
 
     @Synchronized
     fun addSessionPress(context: Context, message: String, session: String) {
-        val entries = read(context, Kind.PRESS).filterNot { it.session == session }.toMutableList()
-        entries += Entry(System.currentTimeMillis(), message, session)
+        val replacement = Entry(System.currentTimeMillis(), message, session)
+        val entries = AppPolicies.replaceSession(read(context, Kind.PRESS), session, Entry::session, replacement)
         write(context, Kind.PRESS, entries)
     }
 
     @Synchronized
     fun read(context: Context, kind: Kind): List<Entry> {
-        val retention = if (kind == Kind.DIAGNOSTIC) 24L * 60 * 60 * 1000 else 7L * 24 * 60 * 60 * 1000
-        val cutoff = System.currentTimeMillis() - retention
+        val cutoff = AppPolicies.retentionCutoff(System.currentTimeMillis(), kind == Kind.DIAGNOSTIC)
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val raw = prefs.getString(kind.key, "[]") ?: "[]"
         val result = mutableListOf<Entry>()
@@ -56,8 +55,8 @@ object EventLog {
     fun addLocation(context: Context, latitude: Double, longitude: Double, accuracy: Float, session: String, operationTime: Long) {
         val current = readLocations(context)
         if (current.any { it.session == session && it.timestamp > operationTime }) return
-        val entries = current.filterNot { it.session == session }.toMutableList()
-        entries.add(0, LocationEntry(operationTime, latitude, longitude, accuracy, session))
+        val replacement = LocationEntry(operationTime, latitude, longitude, accuracy, session)
+        val entries = AppPolicies.replaceSession(current, session, LocationEntry::session, replacement).sortedByDescending { it.timestamp }
         writeLocations(context, entries.take(30))
     }
 

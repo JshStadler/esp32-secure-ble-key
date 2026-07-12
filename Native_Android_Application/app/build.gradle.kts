@@ -2,6 +2,8 @@ plugins {
     id("com.android.application")
 }
 
+val releaseKeystorePath = System.getenv("CAR_KEY_KEYSTORE_PATH")
+
 android {
     namespace = "dev.jshstadler.carkey"
     compileSdk = 36
@@ -10,8 +12,8 @@ android {
         applicationId = "dev.jshstadler.carkey"
         minSdk = 23
         targetSdk = 36
-        versionCode = 7
-        versionName = "2.0.0"
+        versionCode = 8
+        versionName = "2.0.1"
     }
 
     buildFeatures {
@@ -23,10 +25,19 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    signingConfigs {
+        create("release") {
+            storeFile = file(releaseKeystorePath ?: "missing-release-keystore.jks")
+            storePassword = System.getenv("CAR_KEY_STORE_PASSWORD")
+            keyAlias = System.getenv("CAR_KEY_KEY_ALIAS")
+            keyPassword = System.getenv("CAR_KEY_KEY_PASSWORD")
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 }
@@ -35,4 +46,5 @@ dependencies {
     implementation("androidx.activity:activity:1.12.4")
     implementation("androidx.biometric:biometric:1.1.0")
     implementation("androidx.fragment:fragment:1.8.9")
+    testImplementation("junit:junit:4.13.2")
 }

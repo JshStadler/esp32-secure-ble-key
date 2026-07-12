@@ -143,6 +143,7 @@ $env:JAVA_HOME = 'C:\path\to\jdk-17'
 ```
 
 The APK is written to `Native_Android_Application/app/build/outputs/apk/release/`.
+See `Native_Android_Application/README.md` for release-signing configuration.
 
 On first launch, set the PSK in the app's settings to match what you flashed onto
 the ESP32-C3. The app stores it in encrypted secure storage and requires device

@@ -10,8 +10,6 @@ import android.os.Handler
 import android.os.Looper
 import java.nio.charset.StandardCharsets
 import java.util.UUID
-import javax.crypto.Mac
-import javax.crypto.spec.SecretKeySpec
 
 class BleCarKeyClient(
     private val context: Context,
@@ -250,12 +248,6 @@ class BleCarKeyClient(
         }
     }
 
-    private fun hmac(challengeBytes: ByteArray, key: String): ByteArray =
-        Mac.getInstance("HmacSHA256").run {
-            init(SecretKeySpec(key.toByteArray(StandardCharsets.UTF_8), "HmacSHA256"))
-            doFinal(challengeBytes)
-        }
-
     private fun authenticate() {
         val current = nonce ?: return
         authAttempts++
@@ -263,7 +255,7 @@ class BleCarKeyClient(
         val generation = ++authGeneration
         listener.onDiagnostic("Sending authentication challenge response, attempt $authAttempts")
         listener.onState(State.CONNECTING, "Authenticating…")
-        write(command ?: return, byteArrayOf(0x01) + hmac(current, psk))
+        write(command ?: return, CarKeyProtocol.command(CarKeyProtocol.AUTH_COMMAND, current, psk))
         nonce = null
         handler.postDelayed({
             if (authInFlight && !ready && generation == authGeneration) {
@@ -277,7 +269,7 @@ class BleCarKeyClient(
     fun press() {
         val current = nonce ?: return listener.onCommandResult(false, "Waiting for fresh challenge")
         listener.onDiagnostic("Sending authenticated button-press command")
-        write(command ?: return, byteArrayOf(0x02) + hmac(current, psk))
+        write(command ?: return, CarKeyProtocol.command(CarKeyProtocol.PRESS_COMMAND, current, psk))
         nonce = null
         listener.onReadyChanged(false)
     }
@@ -285,7 +277,7 @@ class BleCarKeyClient(
     fun updatePsk(newPsk: String): Boolean {
         val current = nonce ?: return false
         val characteristic = pskUpdate ?: return false
-        write(characteristic, hmac(current, psk) + byteArrayOf(0) + newPsk.toByteArray(StandardCharsets.UTF_8))
+        write(characteristic, CarKeyProtocol.pskUpdate(current, psk, newPsk))
         nonce = null
         psk = newPsk
         listener.onReadyChanged(false)
@@ -334,7 +326,7 @@ class BleCarKeyClient(
     }
 
     private fun scheduleReconnect() {
-        if (directFailures >= 3 && preferDirect) {
+        if (AppPolicies.shouldOfferScanFallback(directFailures, preferDirect)) {
             awaitingScanFallback = true
             listener.onState(State.DISCONNECTED, "Cached device unavailable — scan fallback available")
             handler.removeCallbacksAndMessages(null)
