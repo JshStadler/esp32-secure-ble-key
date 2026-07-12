@@ -18,16 +18,16 @@ jobs:
       run:
         working-directory: Native_Android_Application
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
       - run: chmod +x gradlew
       - run: ./gradlew testDebugUnitTest lintDebug assembleDebug
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: android-verification-reports
           path: |
@@ -41,13 +41,14 @@ jobs:
       run:
         working-directory: Native_Android_Application
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
+      - run: chmod +x gradlew
       - name: Restore release keystore
         shell: bash
         run: printf '%s' "$CAR_KEY_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/car-key-release.jks"
@@ -60,7 +61,7 @@ jobs:
           CAR_KEY_STORE_PASSWORD: ${{ secrets.CAR_KEY_STORE_PASSWORD }}
           CAR_KEY_KEY_ALIAS: ${{ secrets.CAR_KEY_KEY_ALIAS }}
           CAR_KEY_KEY_PASSWORD: ${{ secrets.CAR_KEY_KEY_PASSWORD }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Car-Key-${{ github.ref_name }}
           path: Native_Android_Application/app/build/outputs/apk/release/app-release.apk
