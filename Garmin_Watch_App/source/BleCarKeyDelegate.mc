@@ -10,9 +10,9 @@ class BleCarKeyDelegate extends WatchUi.BehaviorDelegate {
         _bleHandler = bleHandler;
     }
 
-    // SELECT button = unlock
+    // SELECT button = press the remote button
     function onSelect() {
-        _bleHandler.sendUnlock();
+        _bleHandler.sendPress();
         return true;
     }
 

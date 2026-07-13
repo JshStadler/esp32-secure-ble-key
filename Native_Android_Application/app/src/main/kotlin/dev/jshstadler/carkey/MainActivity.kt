@@ -13,6 +13,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.CancellationSignal
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -53,7 +55,9 @@ class MainActivity : FragmentActivity(), BleCarKeyClient.Listener {
     private var recordLocation = false
     private var authenticated = false
     private var scanFallbackOffered = false
+    private var suppressDisconnectVibration = false
     private var foregroundSession = UUID.randomUUID().toString()
+    private val vibrator by lazy { getSystemService(Vibrator::class.java) }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
@@ -106,6 +110,7 @@ class MainActivity : FragmentActivity(), BleCarKeyClient.Listener {
     }
 
     override fun onDestroy() {
+        suppressDisconnectVibration = true
         client.stop(true)
         super.onDestroy()
     }
@@ -445,13 +450,24 @@ class MainActivity : FragmentActivity(), BleCarKeyClient.Listener {
     }
 
     override fun onCommandResult(success: Boolean, message: String) = runOnUiThread {
-        EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Command result: $message")
-        if (success && message == "Command sent") {
-            EventLog.addSessionPress(this, "Car-key operation completed successfully", foregroundSession)
+        EventLog.add(
+            this,
+            EventLog.Kind.DIAGNOSTIC,
+            if (success && message == "Pressed") "Remote button pressed" else "Command result: $message",
+        )
+        if (success && message == "Pressed") {
+            EventLog.addSessionPress(this, "Remote button pressed", foregroundSession)
             captureOperationLocation()
+            vibrateSuccess()
+        } else if (!success) {
+            vibrateFailure()
         }
         statusMessage.text = message
-        actionLabel.text = if (success) "Sent" else "Failed"
+        actionLabel.text = if (success) {
+            if (message == "Pressed") "Pressed" else "Updated"
+        } else {
+            message
+        }
         actionIcon.setImageResource(if (success) R.drawable.ic_check else R.drawable.ic_error)
         actionButton.background = rounded(if (success) Color.rgb(30, 140, 82) else Color.rgb(170, 45, 55), 120f)
         actionButton.alpha = 1f
@@ -464,7 +480,19 @@ class MainActivity : FragmentActivity(), BleCarKeyClient.Listener {
     }
 
     private fun updateState(newState: BleCarKeyClient.State, message: String) {
+        val previousState = state
         state = newState
+        if (newState == BleCarKeyClient.State.CONNECTED && previousState != BleCarKeyClient.State.CONNECTED) {
+            // A cached BLE connection can complete during the launch transition,
+            // when Android may suppress vibration. Wait until the activity UI is settled.
+            actionButton.postDelayed({
+                if (state == BleCarKeyClient.State.CONNECTED) vibrateConnected()
+            }, 500)
+        } else if (newState == BleCarKeyClient.State.DISCONNECTED &&
+            previousState == BleCarKeyClient.State.CONNECTED && !suppressDisconnectVibration) {
+            vibrateDisconnected()
+        }
+        if (newState == BleCarKeyClient.State.DISCONNECTED) suppressDisconnectVibration = false
         statusTitle.text = when (newState) {
             BleCarKeyClient.State.DISCONNECTED -> "Disconnected"
             BleCarKeyClient.State.SCANNING -> "Scanning…"
@@ -490,6 +518,24 @@ class MainActivity : FragmentActivity(), BleCarKeyClient.Listener {
         actionButton.isEnabled = false
         actionButton.alpha = 0.48f
         scanFallbackButton.visibility = if (scanFallbackOffered) View.VISIBLE else View.GONE
+    }
+
+    private fun vibrateConnected() = vibrate(longArrayOf(0, 120), intArrayOf(0, 140))
+
+    private fun vibrateDisconnected() = vibrate(longArrayOf(0, 120, 100, 120), intArrayOf(0, 180, 0, 180))
+
+    private fun vibrateSuccess() = vibrate(longArrayOf(0, 180), intArrayOf(0, 220))
+
+    private fun vibrateFailure() = vibrate(longArrayOf(0, 220, 140, 220), intArrayOf(0, 255, 0, 255))
+
+    @Suppress("DEPRECATION")
+    private fun vibrate(timings: LongArray, amplitudes: IntArray) {
+        if (!vibrator.hasVibrator()) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            vibrator.vibrate(VibrationEffect.createWaveform(timings, amplitudes, -1))
+        } else {
+            vibrator.vibrate(timings, -1)
+        }
     }
 
     private fun pskInput(hintText: String) = EditText(this).apply {

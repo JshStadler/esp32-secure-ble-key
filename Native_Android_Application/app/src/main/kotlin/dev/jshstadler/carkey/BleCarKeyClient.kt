@@ -54,6 +54,8 @@ class BleCarKeyClient(
     private var authGeneration = 0
     private var attemptingDirect = false
     private var awaitingScanFallback = false
+    private var pressInFlight = false
+    private var pressGeneration = 0
 
     private val scanner get() = bluetoothManager.adapter?.bluetoothLeScanner
 
@@ -156,7 +158,10 @@ class BleCarKeyClient(
                 if (gatt === g) clearGatt()
                 if (!wasReady && attemptingDirect) directFailures++
                 listener.onReadyChanged(false)
-                if (!manuallyStopped) scheduleReconnect()
+                if (!manuallyStopped) {
+                    if (wasReady) listener.onState(State.DISCONNECTED, "Connection lost; reconnectingâ€¦")
+                    scheduleReconnect()
+                }
             }
         }
 
@@ -235,7 +240,11 @@ class BleCarKeyClient(
                 listener.onState(State.CONNECTED, "Authenticated")
                 listener.onReadyChanged(nonce != null)
             }
-            value == "OK:PRESSED" -> listener.onCommandResult(true, "Command sent")
+            value == "OK:PRESSED" && pressInFlight -> {
+                finishPress()
+                listener.onCommandResult(true, "Pressed")
+            }
+            value == "OK:PRESSED" -> listener.onDiagnostic("Ignoring stale press confirmation")
             value == "OK:PSK_UPDATED" -> listener.onCommandResult(true, "PSK updated on device")
             value == "WARN:PSK_VOLATILE" -> listener.onCommandResult(true, "PSK updated, but not saved to flash")
             value == "ERR:AUTH" && !ready -> {
@@ -243,8 +252,17 @@ class BleCarKeyClient(
                 authGeneration++
                 if (authAttempts < 2) readChallenge() else fail("BLE authentication failed; check the PSK")
             }
-            value == "ERR:BUSY" -> listener.onCommandResult(false, "Button busy, try again")
-            value.startsWith("ERR:") -> listener.onCommandResult(false, "Error: ${value.removePrefix("ERR:")}")
+            value == "ERR:BUSY" && pressInFlight -> {
+                finishPress()
+                listener.onDiagnostic("Remote button press failed: device busy")
+                listener.onCommandResult(false, "Command failed")
+            }
+            value.startsWith("ERR:") && pressInFlight -> {
+                finishPress()
+                listener.onDiagnostic("Remote button press failed: $value")
+                listener.onCommandResult(false, "Command failed")
+            }
+            value.startsWith("ERR:") -> listener.onDiagnostic("Ignoring status with no command in flight: $value")
         }
     }
 
@@ -267,11 +285,26 @@ class BleCarKeyClient(
     }
 
     fun press() {
-        val current = nonce ?: return listener.onCommandResult(false, "Waiting for fresh challenge")
+        val current = nonce ?: return listener.onCommandResult(false, "Command failed")
+        val commandCharacteristic = command ?: return listener.onCommandResult(false, "Command failed")
         listener.onDiagnostic("Sending authenticated button-press command")
-        write(command ?: return, CarKeyProtocol.command(CarKeyProtocol.PRESS_COMMAND, current, psk))
+        pressInFlight = true
+        val generation = ++pressGeneration
+        write(commandCharacteristic, CarKeyProtocol.command(CarKeyProtocol.PRESS_COMMAND, current, psk))
         nonce = null
         listener.onReadyChanged(false)
+        handler.postDelayed({
+            if (pressInFlight && generation == pressGeneration) {
+                finishPress()
+                listener.onDiagnostic("Remote button press received no confirmation")
+                listener.onCommandResult(false, "No confirmation")
+            }
+        }, 2_500)
+    }
+
+    private fun finishPress() {
+        pressInFlight = false
+        pressGeneration++
     }
 
     fun updatePsk(newPsk: String): Boolean {

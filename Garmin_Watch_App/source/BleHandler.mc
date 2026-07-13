@@ -67,7 +67,7 @@ class BleHandler extends Ble.BleDelegate {
     var _pendingCommand = CarKeyProfile.CMD_PRESS;
     var _profileRegistered = false;
     var _pendingPart2 = null;
-    var _hasPendingUnlock = false;
+    var _hasPendingPress = false;
     var _scanRequested = false;
     var _notificationsReady = false;
     var _notificationSetupStarted = false;
@@ -77,6 +77,7 @@ class BleHandler extends Ble.BleDelegate {
     var _shouldAutoReconnect = true;
     var _connectionTimeoutStage = 0;
     var _rapidRetryCount = 0;
+    var _connectionFeedbackState = false;
 
     function initialize() {
         BleDelegate.initialize();
@@ -131,7 +132,7 @@ class BleHandler extends Ble.BleDelegate {
         }
     }
 
-    function sendUnlock() {
+    function sendPress() {
         // Debounce: ignore if a BLE operation is already in flight
         if (_state == STATE_READING_CHALLENGE ||
             _state == STATE_SENDING_COMMAND ||
@@ -143,16 +144,16 @@ class BleHandler extends Ble.BleDelegate {
 
         if (_device == null || !_device.isConnected()) {
             // Not connected — scan and execute after connect
-            _hasPendingUnlock = true;
-            _statusText = "Unlock queued";
+            _hasPendingPress = true;
+            _statusText = "Press queued";
             WatchUi.requestUpdate();
             startScan();
             return;
         }
 
         if (!_notificationsReady) {
-            _hasPendingUnlock = true;
-            _statusText = "Unlock queued";
+            _hasPendingPress = true;
+            _statusText = "Press queued";
             WatchUi.requestUpdate();
             if (!_notificationSetupStarted) {
                 enableStatusNotifications();
@@ -165,11 +166,15 @@ class BleHandler extends Ble.BleDelegate {
 
     function disconnect() {
         _shouldAutoReconnect = false;
-        _hasPendingUnlock = false;
+        _hasPendingPress = false;
         _notificationsReady = false;
         _notificationSetupStarted = false;
         _timer.stop();
         _connectionTimer.stop();
+        if (_connectionFeedbackState) {
+            _connectionFeedbackState = false;
+            vibrateDisconnected();
+        }
         if (_device != null) {
             Ble.unpairDevice(_device);
             _device = null;
@@ -185,7 +190,11 @@ class BleHandler extends Ble.BleDelegate {
     function forceUnpair() {
         _timer.stop();
         _connectionTimer.stop();
-        _hasPendingUnlock = false;
+        _hasPendingPress = false;
+        if (_connectionFeedbackState) {
+            _connectionFeedbackState = false;
+            vibrateDisconnected();
+        }
         stopScan();
         if (_device != null) {
             Ble.unpairDevice(_device);
@@ -205,7 +214,8 @@ class BleHandler extends Ble.BleDelegate {
     // launch reconnects in ~1-2s instead of ~15s full discovery.
     function cleanup() {
         _shouldAutoReconnect = false;
-        _hasPendingUnlock = false;
+        _connectionFeedbackState = false;
+        _hasPendingPress = false;
         _notificationsReady = false;
         _notificationSetupStarted = false;
         _timer.stop();
@@ -225,8 +235,8 @@ class BleHandler extends Ble.BleDelegate {
         return _device != null && _device.isConnected();
     }
 
-    function hasPendingUnlock() {
-        return _hasPendingUnlock;
+    function hasPendingPress() {
+        return _hasPendingPress;
     }
 
     // ============================================================
@@ -236,16 +246,20 @@ class BleHandler extends Ble.BleDelegate {
     private function readChallenge() {
         var service = _device.getService(CarKeyProfile.SERVICE_UUID);
         if (service == null) {
-            _statusText = "Service not found";
+            _statusText = "Command failed";
+            System.println("Remote button press failed: service not found");
             _state = STATE_ERROR;
+            vibrateFailure();
             WatchUi.requestUpdate();
             return;
         }
 
         var challengeChar = service.getCharacteristic(CarKeyProfile.CHALLENGE_CHAR_UUID);
         if (challengeChar == null) {
-            _statusText = "Challenge char not found";
+            _statusText = "Command failed";
+            System.println("Remote button press failed: challenge characteristic not found");
             _state = STATE_ERROR;
+            vibrateFailure();
             WatchUi.requestUpdate();
             return;
         }
@@ -258,10 +272,11 @@ class BleHandler extends Ble.BleDelegate {
         try {
             challengeChar.requestRead();
         } catch (e) {
-            _statusText = "Read failed";
+            _statusText = "Command failed";
             _state = STATE_CONNECTED;
             cancelOperationTimeout();
-            System.println("Read error: " + e.getErrorMessage());
+            System.println("Remote button press failed: " + e.getErrorMessage());
+            vibrateFailure();
             WatchUi.requestUpdate();
         }
     }
@@ -291,16 +306,20 @@ class BleHandler extends Ble.BleDelegate {
 
         var service = _device.getService(CarKeyProfile.SERVICE_UUID);
         if (service == null) {
-            _statusText = "Service lost";
+            _statusText = "Command failed";
+            System.println("Remote button press failed: service lost");
             _state = STATE_ERROR;
+            vibrateFailure();
             WatchUi.requestUpdate();
             return;
         }
 
         var pt1Char = service.getCharacteristic(CarKeyProfile.COMMAND_PT1_CHAR_UUID);
         if (pt1Char == null) {
-            _statusText = "Split char not found";
+            _statusText = "Command failed";
+            System.println("Remote button press failed: split command characteristic not found");
             _state = STATE_ERROR;
+            vibrateFailure();
             WatchUi.requestUpdate();
             return;
         }
@@ -327,9 +346,11 @@ class BleHandler extends Ble.BleDelegate {
             pt1Char.requestWrite(part1, {:writeType => Ble.WRITE_TYPE_WITH_RESPONSE});
             startOperationTimeout();
         } catch (e) {
-            _statusText = "Write pt1: " + e.getErrorMessage();
+            _statusText = "Command failed";
             _state = STATE_CONNECTED;
             _pendingPart2 = null;
+            System.println("Remote button press failed: " + e.getErrorMessage());
+            vibrateFailure();
             WatchUi.requestUpdate();
         }
     }
@@ -364,8 +385,8 @@ class BleHandler extends Ble.BleDelegate {
     private function finishNotificationSetup(success) {
         _notificationsReady = success;
         _notificationSetupStarted = false;
-        if (_hasPendingUnlock && _device != null && _device.isConnected()) {
-            _hasPendingUnlock = false;
+        if (_hasPendingPress && _device != null && _device.isConnected()) {
+            _hasPendingPress = false;
             if (!success) {
                 _statusText = "Sending without feedback";
             }
@@ -387,7 +408,9 @@ class BleHandler extends Ble.BleDelegate {
     function onStatusTimeout() as Void {
         if (_state == STATE_WAITING_STATUS) {
             _state = STATE_CONNECTED;
-            _statusText = "No response";
+            _statusText = "No confirmation";
+            System.println("Remote button press received no confirmation");
+            vibrateFailure();
             WatchUi.requestUpdate();
         }
     }
@@ -479,7 +502,9 @@ class BleHandler extends Ble.BleDelegate {
             } else {
                 _state = STATE_IDLE;
             }
-            _statusText = "Operation timeout";
+            _statusText = "No confirmation";
+            System.println("Remote button press timed out");
+            vibrateFailure();
             WatchUi.requestUpdate();
         }
     }
@@ -570,7 +595,11 @@ class BleHandler extends Ble.BleDelegate {
             _notificationsReady = false;
             _notificationSetupStarted = false;
             _state = STATE_CONNECTED;
-            _statusText = _hasPendingUnlock ? "Unlock queued" : "Connected";
+            _statusText = _hasPendingPress ? "Press queued" : "Connected";
+            if (!_connectionFeedbackState) {
+                _connectionFeedbackState = true;
+                vibrateConnected();
+            }
             WatchUi.requestUpdate();
 
             // Enable notifications on status characteristic.
@@ -579,6 +608,8 @@ class BleHandler extends Ble.BleDelegate {
             enableStatusNotifications();
 
         } else {
+            var wasConnected = _connectionFeedbackState;
+            _connectionFeedbackState = false;
             _device = null;
             _pendingPart2 = null;
             _connectionTimer.stop();
@@ -587,6 +618,9 @@ class BleHandler extends Ble.BleDelegate {
             cancelOperationTimeout();
             _state = STATE_IDLE;
             _statusText = "Disconnected";
+            if (wasConnected) {
+                vibrateDisconnected();
+            }
             WatchUi.requestUpdate();
 
             // Auto-reconnect after 2 seconds
@@ -599,8 +633,10 @@ class BleHandler extends Ble.BleDelegate {
     function onCharacteristicRead(char, status, value) {
         if (status != Ble.STATUS_SUCCESS) {
             cancelOperationTimeout();
-            _statusText = "Read error";
+            _statusText = "Command failed";
+            System.println("Remote button press failed: challenge read status " + status);
             _state = STATE_CONNECTED;
+            vibrateFailure();
             WatchUi.requestUpdate();
             return;
         }
@@ -626,8 +662,10 @@ class BleHandler extends Ble.BleDelegate {
                             pt2Char.requestWrite(_pendingPart2, {:writeType => Ble.WRITE_TYPE_WITH_RESPONSE});
                             return;
                         } catch (e) {
-                            _statusText = "Write pt2: " + e.getErrorMessage();
+                            _statusText = "Command failed";
+                            System.println("Remote button press failed: " + e.getErrorMessage());
                             _state = STATE_CONNECTED;
+                            vibrateFailure();
                         }
                     }
                 }
@@ -635,10 +673,12 @@ class BleHandler extends Ble.BleDelegate {
                 cancelOperationTimeout();
                 WatchUi.requestUpdate();
             } else if (status != Ble.STATUS_SUCCESS) {
-                _statusText = "Write pt1 err: " + status;
+                _statusText = "Command failed";
+                System.println("Remote button press failed: part 1 write status " + status);
                 _state = STATE_CONNECTED;
                 _pendingPart2 = null;
                 cancelOperationTimeout();
+                vibrateFailure();
                 WatchUi.requestUpdate();
             }
         } else if (uuid.equals(CarKeyProfile.COMMAND_PT2_CHAR_UUID)) {
@@ -650,8 +690,10 @@ class BleHandler extends Ble.BleDelegate {
                 _timer.stop();
                 _timer.start(method(:onStatusTimeout), 2000, false);
             } else {
-                _statusText = "Write pt2 err: " + status;
+                _statusText = "Command failed";
+                System.println("Remote button press failed: part 2 write status " + status);
                 _state = STATE_CONNECTED;
+                vibrateFailure();
             }
             WatchUi.requestUpdate();
         } else if (uuid.equals(CarKeyProfile.COMMAND_CHAR_UUID)) {
@@ -662,8 +704,10 @@ class BleHandler extends Ble.BleDelegate {
                 _timer.stop();
                 _timer.start(method(:onStatusTimeout), 2000, false);
             } else {
-                _statusText = "Write error: " + status;
+                _statusText = "Command failed";
+                System.println("Remote button press failed: command write status " + status);
                 _state = STATE_CONNECTED;
+                vibrateFailure();
             }
             WatchUi.requestUpdate();
         }
@@ -675,26 +719,28 @@ class BleHandler extends Ble.BleDelegate {
             // Parse status from ESP32
             var statusStr = byteArrayToString(value as Lang.ByteArray);
             if (statusStr.find("OK:PRESSED") != null) {
-                _statusText = "Button pressed";
+                _statusText = "Pressed";
                 _state = STATE_CONNECTED;
-                // Vibrate for feedback
-                if (Toybox.Attention has :vibrate) {
-                    Toybox.Attention.vibrate([
-                        new Toybox.Attention.VibeProfile(100, 200)
-                    ]);
-                }
+                System.println("Remote button pressed");
+                vibrateSuccess();
             } else if (statusStr.find("OK:AUTH") != null) {
                 _statusText = "Authenticated";
                 _state = STATE_CONNECTED;
             } else if (statusStr.find("ERR:BUSY") != null) {
-                _statusText = "Busy, try again";
+                _statusText = "Command failed";
+                System.println("Remote button press failed: busy");
+                vibrateFailure();
                 _state = STATE_CONNECTED; // recoverable, not an error state
             } else if (statusStr.find("ERR:AUTH") != null) {
-                _statusText = "Auth failed";
+                _statusText = "Command failed";
+                System.println("Remote button press failed: authentication");
+                vibrateFailure();
                 _state = STATE_CONNECTED; // recoverable — user can retry
             } else if (statusStr.find("ERR") != null) {
-                _statusText = "Error: " + statusStr;
+                _statusText = "Command failed";
+                System.println("Remote button press failed: " + statusStr);
                 _state = STATE_ERROR;
+                vibrateFailure();
             } else if (statusStr.find("WARN") != null) {
                 _statusText = statusStr;
                 _state = STATE_CONNECTED;
@@ -719,6 +765,36 @@ class BleHandler extends Ble.BleDelegate {
     // ============================================================
     // Helpers
     // ============================================================
+
+    private function vibrateConnected() {
+        vibrate([new Toybox.Attention.VibeProfile(100, 80)]);
+    }
+
+    private function vibrateDisconnected() {
+        vibrate([
+            new Toybox.Attention.VibeProfile(100, 80),
+            new Toybox.Attention.VibeProfile(0, 60),
+            new Toybox.Attention.VibeProfile(100, 80)
+        ]);
+    }
+
+    private function vibrateSuccess() {
+        vibrate([new Toybox.Attention.VibeProfile(100, 200)]);
+    }
+
+    private function vibrateFailure() {
+        vibrate([
+            new Toybox.Attention.VibeProfile(100, 220),
+            new Toybox.Attention.VibeProfile(0, 140),
+            new Toybox.Attention.VibeProfile(100, 220)
+        ]);
+    }
+
+    private function vibrate(pattern) {
+        if (Toybox.Attention has :vibrate) {
+            Toybox.Attention.vibrate(pattern);
+        }
+    }
 
     // Fix: Explicitly type 'bytes' so the compiler knows it can be indexed
     private function byteArrayToString(bytes as Lang.ByteArray) {

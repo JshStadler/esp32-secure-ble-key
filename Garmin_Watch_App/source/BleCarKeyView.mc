@@ -30,7 +30,7 @@ class BleCarKeyView extends WatchUi.View {
 
         // 2. Connection status indicator (The Dot)
         var connected = _bleHandler.isConnected();
-        var queued = _bleHandler.hasPendingUnlock();
+        var queued = _bleHandler.hasPendingPress();
         var state = _bleHandler.getState();
 
         if (queued) {
