@@ -26,10 +26,12 @@ The C3 firmware is built on ESP-IDF (no longer Arduino) so it can use FreeRTOS t
 ## 🧱 Project Structure
 
 ```
-Native_Android_Application/      Native Kotlin Android app — recommended
+Native_Android_Application/      Native Kotlin multi-device Android app — recommended
 Android_Flutter_Application/     LEGACY Flutter mobile app — unsupported
-Garmin_Watch_App/                Garmin Connect IQ watch app
+Garmin_Watch_App/                Garmin Connect IQ car watch app
+Garmin_Gate_Watch_App/           Garmin Connect IQ gate watch app
 ESP32-C3_Firmware/               ESP32-C3 ESP-IDF firmware (PlatformIO) — recommended
+ESPHome_Gate_Firmware/            ESPHome gate BLE API-v2 firmware
 ESP32_Arduino_Firmware/          LEGACY ESP32 Arduino proof of concept — unsupported
 ESP32-C3_Arduino_Firmware/       LEGACY ESP32-C3 Arduino proof of concept — unsupported
 ```
@@ -45,13 +47,18 @@ ESP32-C3_Arduino_Firmware/       LEGACY ESP32-C3 Arduino proof of concept — un
 
 ## 🔒 Security
 
-Authentication uses HMAC-SHA256 with a challenge-response protocol:
+Both Car and Gate now use API v2:
 
 1. The ESP32 generates a random 16-byte nonce
-2. The phone/watch reads the nonce and computes `HMAC-SHA256(nonce, PSK)`
+2. The phone/watch authenticates the API-v2 domain, device binding, exact
+   command, and nonce with HMAC-SHA256
 3. The phone/watch sends the HMAC along with a command byte
 4. The ESP32 verifies using constant-time comparison
 5. The nonce is rotated unconditionally after every verification attempt (success or failure) to prevent replay
+
+Car uses the `car-main` binding and Gate uses `gate-main`, preventing a valid
+response from being redirected between devices or actions. See
+[PROTOCOL.md](PROTOCOL.md) for the byte-exact definition.
 
 Additional protections include optional device-authentication gating on the phone
 (fingerprint, face, or device PIN), auto-disconnect timeouts (15s unauthenticated,
@@ -132,6 +139,18 @@ Wire GPIO 5 to the **other leg** (the encoder input side).
    ```
 5. Production builds disable the serial console for power savings. To enable logging during development, see `BUILD_NOTES.md` for the debug build steps.
 
+The first upgrade from the original single-app layout to signed BLE OTA needs
+four USB-flashed binaries at specific offsets while preserving NVS. See
+[`ESP32-C3_Firmware/OTA_BOOTSTRAP.md`](ESP32-C3_Firmware/OTA_BOOTSTRAP.md) for
+the files, partition values, exact command, PSK-preservation warning, and later
+mobile BLE-OTA procedure.
+
+Production Android, Garmin, and firmware signing identities are backed up as
+encrypted GitHub Actions secrets and excluded from Git. Device/user PSKs are
+not build secrets and are never stored in the repository; keep them in a
+password manager and, for ESPHome, an ignored `secrets.yaml`. See
+[`SIGNING_KEYS.md`](SIGNING_KEYS.md) for the key-continuity and recovery policy.
+
 ### 📱 Android App (native Kotlin)
 
 Download the current APK from [GitHub Releases](https://github.com/JshStadler/esp32-secure-ble-key/releases), or build it with JDK 17 and Android SDK 36.
@@ -145,7 +164,7 @@ $env:JAVA_HOME = 'C:\path\to\jdk-17'
 The APK is written to `Native_Android_Application/app/build/outputs/apk/release/`.
 See `Native_Android_Application/README.md` for release-signing configuration.
 
-On first launch, set the PSK in the app's settings to match what you flashed onto
+On first launch, set the per-device PSKs in the app to match what you flashed onto
 the ESP32-C3. The app stores it in encrypted secure storage and requires device
 authentication by default. Use **App Settings → Require device authentication**
 to disable the launch gate during periods of frequent use. PSK changes remain
@@ -157,18 +176,27 @@ scan fallback, while continuing cached retries until that fallback is selected.
 
 The native app also includes connection diagnostics, shareable logs, a seven-day
 operation history, and optional location pins for the latest 30 foreground
-sessions. Location recording is opt-in and does not affect BLE operation.
+sessions. Location recording is opt-in per device, allowing the mobile car to
+record locations while leaving a fixed gate disabled, and does not affect BLE
+operation.
 
 <img width="360" height="746" alt="image" src="https://github.com/user-attachments/assets/c017401e-025e-4bce-90b5-59f338a4a504" />
 
 
 ### ⌚ Garmin Watch App
 
-**Requirements:** Connect IQ SDK with `minSdkVersion 5.2.0` or newer. Currently targets the Forerunner 165 — other devices need to be added to the manifest.
+**Requirements:** Connect IQ SDK with `minSdkVersion 5.2.0` or newer. The
+current Car and Gate builds target the Forerunner 165, 165 Music, 265, 265S,
+and 965.
 
-> **Note:** The minimum SDK version can likely be lowered (down to around 3.x) to support older devices. The app only uses the standard BLE central API and the native HMAC-SHA256 cryptography API. This is untested as the app is only built for the FR165, so you may need to experiment with different `minSdkVersion` values to find what works for your device.
+> **Note:** The minimum SDK version may be able to be lowered for older devices,
+> but this has not been tested. Any additional watch model must also be added to
+> both app manifests and tested with its BLE implementation.
 
-> **Note:** PSK needs to be set before compiling the app (via `properties.xml` or the app's runtime settings).
+Configure each watch app's PSK through Garmin Connect or the Connect IQ Store
+app after installation. The value is entered through a masked password setting;
+use the Car PSK for BLE Car Key and the Gate PSK for BLE Gate Key. The two apps
+have separate identities and can be installed together.
 
 **Controls:**
 - **SELECT** — send unlock command (works whether connected or disconnected; auto-connects if needed)
@@ -191,6 +219,10 @@ The watch persists its BLE pairing across app sessions, so subsequent launches r
 | Command Pt2 | `...7896` | Write, WriteNR | Split write path: last 16 HMAC bytes |
 
 Service UUID: `a1b2c3d4-e5f6-7890-abcd-ef1234567890`
+
+The ESPHome gate uses the distinct API-v2 service UUID
+`b1b2c3d4-e5f6-7890-abcd-ef1234567890`. Packet sizes and characteristic
+suffixes remain the same across the two API-v2 device families.
 
 The split Pt1/Pt2 path exists because Garmin Connect IQ doesn't expose MTU negotiation, leaving the watch stuck at the default 23-byte ATT MTU. A 33-byte command can't fit in a single write at that MTU, so the watch sends it as two writes. The phone app uses the single-write path since it can negotiate a larger MTU.
 

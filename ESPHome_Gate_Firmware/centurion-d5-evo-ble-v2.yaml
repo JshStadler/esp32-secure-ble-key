@@ -1,0 +1,951 @@
+substitutions:
+  name: "centurion-d5-evo"
+  friendly_name: "Centurion D5 Evo"
+  comment: "Control Centurion D5 Evo gate motor remotely. Including Kocom bell ringing"
+  gate_ble_build: "gate-ble-v2.6.0-5key-pulse-decoder-production"
+
+  # Gate LED pulse-meter decoder tuning. pulse_meter captures rising edges
+  # in its ISR path; the shared binary sensor is only used to determine the
+  # final steady ON/OFF level once pulsing has stopped.
+  gate_led_steady_time: "2100ms"
+  gate_led_opening_min_ppm: "70.0"
+  gate_led_opening_max_ppm: "145.0"
+  gate_led_closing_min_ppm: "165.0"
+  gate_led_closing_max_ppm: "330.0"
+
+  relay_1_pin: GPIO32
+  relay_2_pin: GPIO33
+  relay_3_pin: GPIO25
+  relay_4_pin: GPIO26
+  led_pin: GPIO23
+  bell_pin: GPIO19
+  # API-v2 gate keyring. Empty PSKs disable their slots. Keep slot 1 as the
+  # generic fallback, or give every phone/watch its own named secret.
+  # Event IDs must use lowercase letters, numbers and underscores only.
+  gate_ble_key_1_name: "BLE Remote"
+  gate_ble_key_1_event: "ble_remote"
+  gate_ble_key_1_psk: !secret ble_psk
+  gate_ble_key_2_name: "BLE Remote 2"
+  gate_ble_key_2_event: "ble_remote_2"
+  gate_ble_key_2_psk: ""
+  gate_ble_key_3_name: "BLE Remote 3"
+  gate_ble_key_3_event: "ble_remote_3"
+  gate_ble_key_3_psk: ""
+  gate_ble_key_4_name: "BLE Remote 4"
+  gate_ble_key_4_event: "ble_remote_4"
+  gate_ble_key_4_psk: ""
+  gate_ble_key_5_name: "BLE Remote 5"
+  gate_ble_key_5_event: "ble_remote_5"
+  gate_ble_key_5_psk: ""
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  comment: ${comment}
+  min_version: 2026.7.3
+  includes:
+    - <esp_bt.h>
+  on_boot:
+    - priority: 600
+      then:
+        - lambda: |-
+            // ESPHome's normal notify() broadcasts one shared value to every
+            // subscriber. For five secure sessions, populate the characteristic
+            // immediately before each connection-specific read instead.
+            id(gate_ble_challenge).on_read([](uint16_t conn_id) {
+              for (size_t slot = 0; slot < id(gate_ble_conn_ids).size(); ++slot) {
+                if (id(gate_ble_conn_ids)[slot] == conn_id) {
+                  id(gate_ble_challenge).set_value(std::vector<uint8_t>(
+                      id(gate_ble_nonces)[slot].begin(), id(gate_ble_nonces)[slot].end()));
+                  return;
+                }
+              }
+              id(gate_ble_challenge).set_value(
+                  std::vector<uint8_t>(16, 0));
+            });
+            id(gate_ble_status).on_read([](uint16_t conn_id) {
+              for (size_t slot = 0; slot < id(gate_ble_conn_ids).size(); ++slot) {
+                if (id(gate_ble_conn_ids)[slot] == conn_id) {
+                  id(gate_ble_status).set_value(id(gate_ble_statuses)[slot]);
+                  return;
+                }
+              }
+              id(gate_ble_status).set_value("ERR:NO_SESSION");
+            });
+            ESP_LOGW("gate_ble", "BUILD ${gate_ble_build}: API v2 ready; max BLE clients = 5");
+        - delay: 1s
+        - lambda: |-
+            const esp_err_t default_result =
+                esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+            const esp_err_t advertising_result =
+                esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+            ESP_LOGW("gate_ble", "BLE TX power set to +9 dBm (default=%s, advertising=%s)",
+                     esp_err_to_name(default_result), esp_err_to_name(advertising_result));
+    - priority: -100
+      then:
+        - text_sensor.template.publish:
+            id: ble_firmware_build
+            state: "${gate_ble_build}"
+
+esp32:
+  cpu_frequency: 80MHz
+  framework:
+    type: esp-idf
+  variant: ESP32
+
+# Enable logging
+logger:
+  level: INFO
+  baud_rate: 0
+  logs:
+    gate_ble: INFO
+    gate_decoder: INFO
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Preserve the installed gate controller's existing network identity.
+  manual_ip:
+    static_ip: 10.0.0.32
+    gateway: 10.0.0.254
+    subnet: 255.255.255.0
+    dns1: 10.0.0.254
+
+  ap:
+    ssid: "Gate Fallback Hotspot"
+    password: !secret ap_password
+  min_auth_mode: WPA2
+
+captive_portal:
+
+web_server:
+  port: 80
+  ota: false
+  auth:
+    username: !secret web_server_username
+    password: !secret web_server_password
+    type: digest
+
+# Load ESPHome's built-in HMAC-SHA256 helper. All protocol state remains in
+# globals below, allowing this firmware to stay in one YAML file.
+hmac_sha256:
+
+globals:
+  - id: gate_ble_conn_ids
+    type: 'std::array<uint16_t, 5>'
+    restore_value: false
+    initial_value: '{65535, 65535, 65535, 65535, 65535}'
+  - id: gate_ble_nonces
+    type: 'std::array<std::array<uint8_t, 16>, 5>'
+    restore_value: false
+    initial_value: '{0}'
+  - id: gate_ble_statuses
+    type: 'std::array<std::string, 5>'
+    restore_value: false
+    initial_value: '{"READY", "READY", "READY", "READY", "READY"}'
+  - id: gate_ble_split_hmac_part1
+    type: 'std::array<std::array<uint8_t, 16>, 5>'
+    restore_value: false
+    initial_value: '{0}'
+  - id: gate_ble_split_pending
+    type: 'std::array<bool, 5>'
+    restore_value: false
+    initial_value: '{false, false, false, false, false}'
+  - id: gate_ble_split_command
+    type: 'std::array<uint8_t, 5>'
+    restore_value: false
+    initial_value: '{0}'
+  - id: gate_ble_split_started_ms
+    type: 'std::array<uint32_t, 5>'
+    restore_value: false
+    initial_value: '{0}'
+  - id: gate_ble_has_pressed
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: gate_ble_last_press_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  # Centurion status decoder state.
+  # 0=unknown, 1=closed, 2=open, 3=opening, 4=closing,
+  # 5=pillar override, 6=no mains, 7=low battery.
+  - id: gate_decoder_state
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: gate_motion_candidate
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: gate_motion_samples
+    type: uint8_t
+    restore_value: false
+    initial_value: '0'
+  - id: gate_prev_rate_1
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+  - id: gate_prev_rate_2
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+
+# Five connections each receive independent nonce, status, and Garmin split-write
+# state. Challenge/status are read per connection rather than broadcast.
+esp32_ble:
+  disable_bt_logs: true
+  connection_timeout: 20s
+  max_connections: 5
+
+esp32_ble_server:
+  manufacturer: "JshStadler"
+  model: "Secure BLE Gate API v2"
+  max_clients: 5
+  on_connect:
+    - lambda: |-
+        int slot = -1;
+        for (size_t i = 0; i < id(gate_ble_conn_ids).size(); ++i) {
+          if (id(gate_ble_conn_ids)[i] == 65535) {
+            slot = static_cast<int>(i);
+            break;
+          }
+        }
+        if (slot < 0) {
+          ESP_LOGE("gate_ble", "Client %u connected without a free session slot",
+                   static_cast<unsigned>(id));
+          return;
+        }
+        id(gate_ble_conn_ids)[slot] = id;
+        for (size_t offset = 0; offset < id(gate_ble_nonces)[slot].size(); offset += 4) {
+          const uint32_t random = random_uint32();
+          memcpy(id(gate_ble_nonces)[slot].data() + offset, &random, 4);
+        }
+        id(gate_ble_split_pending)[slot] = false;
+        id(gate_ble_statuses)[slot] = "READY";
+        ESP_LOGW("gate_ble", "BLE EVENT: client %u connected in session slot %d",
+                 static_cast<unsigned>(id), slot);
+  on_disconnect:
+    - lambda: |-
+        for (size_t slot = 0; slot < id(gate_ble_conn_ids).size(); ++slot) {
+          if (id(gate_ble_conn_ids)[slot] == id) {
+            id(gate_ble_conn_ids)[slot] = 65535;
+            id(gate_ble_split_pending)[slot] = false;
+            id(gate_ble_nonces)[slot].fill(0);
+            id(gate_ble_statuses)[slot] = "READY";
+            ESP_LOGW("gate_ble", "BLE EVENT: client %u disconnected from session slot %u",
+                     static_cast<unsigned>(id), static_cast<unsigned>(slot));
+            return;
+          }
+        }
+  services:
+    # Gate-specific API-v2 UUID family. The car keeps the a1... API-v1 family.
+    - uuid: b1b2c3d4-e5f6-7890-abcd-ef1234567890
+      advertise: true
+      characteristics:
+        - id: gate_ble_challenge
+          uuid: b1b2c3d4-e5f6-7890-abcd-ef1234567891
+          read: true
+          value:
+            data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+        # Status must be declared before command handlers reference it during
+        # ESPHome generated-code setup.
+        - id: gate_ble_status
+          uuid: b1b2c3d4-e5f6-7890-abcd-ef1234567893
+          read: true
+          value:
+            data: "READY"
+            type: string
+
+        # Android path: command byte followed by a 32-byte HMAC-SHA256.
+        # API v2 authenticates the protocol domain, device, action, and nonce:
+        # BLEKEY-V2 || 0x00 || gate-main || 0x00 || command || nonce
+        - id: gate_ble_command
+          uuid: b1b2c3d4-e5f6-7890-abcd-ef1234567892
+          write: true
+          write_no_response: true
+          on_write:
+            then:
+              - lambda: |-
+                  ESP_LOGW("gate_ble", "BLE EVENT: Android write from client %u (%u bytes)",
+                           static_cast<unsigned>(id), static_cast<unsigned>(x.size()));
+
+                  int slot = -1;
+                  for (size_t i = 0; i < id(gate_ble_conn_ids).size(); ++i) {
+                    if (id(gate_ble_conn_ids)[i] == id) {
+                      slot = static_cast<int>(i);
+                      break;
+                    }
+                  }
+                  if (slot < 0) {
+                    ESP_LOGW("gate_ble", "Android write rejected: no session for client %u",
+                             static_cast<unsigned>(id));
+                    return;
+                  }
+
+                  const auto rotate_challenge = [&]() {
+                    for (size_t offset = 0; offset < id(gate_ble_nonces)[slot].size(); offset += 4) {
+                      const uint32_t random = random_uint32();
+                      memcpy(id(gate_ble_nonces)[slot].data() + offset, &random, 4);
+                    }
+                  };
+
+                  if (x.size() != 33) {
+                    ESP_LOGW("gate_ble", "Android write rejected: expected 33 bytes, received %u",
+                             static_cast<unsigned>(x.size()));
+                    id(gate_ble_statuses)[slot] = "ERR:EMPTY";
+                    return;
+                  }
+
+                  const uint8_t command = x[0];
+                  if (command != 0x01 && command != 0x02) {
+                    ESP_LOGW("gate_ble", "Android write rejected: unknown command 0x%02X",
+                             static_cast<unsigned>(command));
+                    id(gate_ble_statuses)[slot] = "ERR:UNKNOWN_CMD";
+                    return;
+                  }
+
+                  const std::array<std::string, 5> psks{{
+                    R"gatekey(${gate_ble_key_1_psk})gatekey",
+                    R"gatekey(${gate_ble_key_2_psk})gatekey",
+                    R"gatekey(${gate_ble_key_3_psk})gatekey",
+                    R"gatekey(${gate_ble_key_4_psk})gatekey",
+                    R"gatekey(${gate_ble_key_5_psk})gatekey",
+                  }};
+                  const std::array<std::string, 5> key_names{{
+                    R"gatename(${gate_ble_key_1_name})gatename",
+                    R"gatename(${gate_ble_key_2_name})gatename",
+                    R"gatename(${gate_ble_key_3_name})gatename",
+                    R"gatename(${gate_ble_key_4_name})gatename",
+                    R"gatename(${gate_ble_key_5_name})gatename",
+                  }};
+                  const std::array<std::string, 5> event_ids{{
+                    R"gateevent(${gate_ble_key_1_event})gateevent",
+                    R"gateevent(${gate_ble_key_2_event})gateevent",
+                    R"gateevent(${gate_ble_key_3_event})gateevent",
+                    R"gateevent(${gate_ble_key_4_event})gateevent",
+                    R"gateevent(${gate_ble_key_5_event})gateevent",
+                  }};
+                  static const uint8_t domain[] = {'B','L','E','K','E','Y','-','V','2'};
+                  static const uint8_t binding[] = {'g','a','t','e','-','m','a','i','n'};
+                  const uint8_t separator = 0;
+                  int matched_key = -1;
+                  for (size_t key = 0; key < psks.size(); ++key) {
+                    if (psks[key].empty()) continue;
+                    hmac_sha256::HmacSHA256 hmac;
+                    hmac.init(psks[key]);
+                    hmac.add(domain, sizeof(domain));
+                    hmac.add(&separator, 1);
+                    hmac.add(binding, sizeof(binding));
+                    hmac.add(&separator, 1);
+                    hmac.add(&command, 1);
+                    hmac.add(id(gate_ble_nonces)[slot].data(), id(gate_ble_nonces)[slot].size());
+                    hmac.calculate();
+                    std::array<uint8_t, 32> expected{};
+                    hmac.get_bytes(expected.data());
+                    uint8_t difference = 0;
+                    for (size_t i = 0; i < expected.size(); ++i) {
+                      difference |= expected[i] ^ x[i + 1];
+                    }
+                    expected.fill(0);
+                    if (difference == 0 && matched_key < 0) matched_key = static_cast<int>(key);
+                  }
+                  rotate_challenge();
+
+                  if (matched_key < 0) {
+                    ESP_LOGW("gate_ble", "Android authentication failed for client %u",
+                             static_cast<unsigned>(id));
+                    id(gate_ble_statuses)[slot] = "ERR:AUTH";
+                  } else if (command == 0x01) {
+                    ESP_LOGI("gate_ble", "Android client %u authenticated as %s",
+                             static_cast<unsigned>(id), key_names[matched_key].c_str());
+                    id(gate_ble_statuses)[slot] = "OK:AUTH";
+                  } else {
+                    const uint32_t current_ms = millis();
+                    if (id(gate_ble_has_pressed) &&
+                        current_ms - id(gate_ble_last_press_ms) < 1000) {
+                      ESP_LOGW("gate_ble", "Android press rejected: one-second cooldown active");
+                      id(gate_ble_statuses)[slot] = "ERR:BUSY";
+                    } else {
+                      id(gate_ble_has_pressed) = true;
+                      id(gate_ble_last_press_ms) = current_ms;
+                      id(button_1).press();
+                      id(gate_ble_remote_event).trigger(event_ids[matched_key] + "_android_press");
+                      id(gate_ble_last_remote).publish_state(key_names[matched_key] + " (Android)");
+                      ESP_LOGW("gate_ble", "BLE EVENT: %s via Android client %u invoked gate relay button_1",
+                               key_names[matched_key].c_str(), static_cast<unsigned>(id));
+                      id(gate_ble_statuses)[slot] = "OK:PRESSED";
+                    }
+                  }
+
+        # Garmin path part 1: command byte plus the first 16 HMAC bytes.
+        - id: gate_ble_command_part1
+          uuid: b1b2c3d4-e5f6-7890-abcd-ef1234567895
+          write: true
+          write_no_response: true
+          on_write:
+            then:
+              - lambda: |-
+                  ESP_LOGI("gate_ble", "Garmin part 1 from client %u (%u bytes)",
+                           static_cast<unsigned>(id), static_cast<unsigned>(x.size()));
+                  int slot = -1;
+                  for (size_t i = 0; i < id(gate_ble_conn_ids).size(); ++i) {
+                    if (id(gate_ble_conn_ids)[i] == id) {
+                      slot = static_cast<int>(i);
+                      break;
+                    }
+                  }
+                  if (slot < 0) return;
+                  if (x.size() != 17) {
+                    ESP_LOGW("gate_ble", "Garmin part 1 rejected: expected 17 bytes, received %u",
+                             static_cast<unsigned>(x.size()));
+                    id(gate_ble_split_pending)[slot] = false;
+                    id(gate_ble_statuses)[slot] = "ERR:PT1_LEN";
+                    return;
+                  }
+                  id(gate_ble_split_command)[slot] = x[0];
+                  std::copy_n(x.begin() + 1, 16, id(gate_ble_split_hmac_part1)[slot].begin());
+                  id(gate_ble_split_started_ms)[slot] = millis();
+                  id(gate_ble_split_pending)[slot] = true;
+                  ESP_LOGD("gate_ble", "Garmin part 1 accepted for command 0x%02X",
+                           static_cast<unsigned>(id(gate_ble_split_command)[slot]));
+
+        # Garmin path part 2: remaining 16 HMAC bytes.
+        - id: gate_ble_command_part2
+          uuid: b1b2c3d4-e5f6-7890-abcd-ef1234567896
+          write: true
+          write_no_response: true
+          on_write:
+            then:
+              - lambda: |-
+                  ESP_LOGI("gate_ble", "Garmin part 2 from client %u (%u bytes)",
+                           static_cast<unsigned>(id), static_cast<unsigned>(x.size()));
+                  int slot = -1;
+                  for (size_t i = 0; i < id(gate_ble_conn_ids).size(); ++i) {
+                    if (id(gate_ble_conn_ids)[i] == id) {
+                      slot = static_cast<int>(i);
+                      break;
+                    }
+                  }
+                  if (slot < 0) return;
+                  if (x.size() != 16) {
+                    ESP_LOGW("gate_ble", "Garmin part 2 rejected: expected 16 bytes, received %u",
+                             static_cast<unsigned>(x.size()));
+                    id(gate_ble_split_pending)[slot] = false;
+                    id(gate_ble_statuses)[slot] = "ERR:PT2_LEN";
+                    return;
+                  }
+                  if (!id(gate_ble_split_pending)[slot]) {
+                    ESP_LOGW("gate_ble", "Garmin part 2 rejected: no pending part 1");
+                    id(gate_ble_statuses)[slot] = "ERR:NO_PT1";
+                    return;
+                  }
+                  if (millis() - id(gate_ble_split_started_ms)[slot] > 5000) {
+                    ESP_LOGW("gate_ble", "Garmin part 2 rejected: part 1 timed out");
+                    id(gate_ble_split_pending)[slot] = false;
+                    id(gate_ble_statuses)[slot] = "ERR:TIMEOUT";
+                    return;
+                  }
+
+                  const uint8_t command = id(gate_ble_split_command)[slot];
+                  std::array<uint8_t, 32> received{};
+                  std::copy(id(gate_ble_split_hmac_part1)[slot].begin(),
+                            id(gate_ble_split_hmac_part1)[slot].end(), received.begin());
+                  std::copy(x.begin(), x.end(), received.begin() + 16);
+                  id(gate_ble_split_pending)[slot] = false;
+
+                  if (command != 0x01 && command != 0x02) {
+                    ESP_LOGW("gate_ble", "Garmin write rejected: unknown command 0x%02X",
+                             static_cast<unsigned>(command));
+                    id(gate_ble_statuses)[slot] = "ERR:UNKNOWN_CMD";
+                    return;
+                  }
+
+                  const std::array<std::string, 5> psks{{
+                    R"gatekey(${gate_ble_key_1_psk})gatekey",
+                    R"gatekey(${gate_ble_key_2_psk})gatekey",
+                    R"gatekey(${gate_ble_key_3_psk})gatekey",
+                    R"gatekey(${gate_ble_key_4_psk})gatekey",
+                    R"gatekey(${gate_ble_key_5_psk})gatekey",
+                  }};
+                  const std::array<std::string, 5> key_names{{
+                    R"gatename(${gate_ble_key_1_name})gatename",
+                    R"gatename(${gate_ble_key_2_name})gatename",
+                    R"gatename(${gate_ble_key_3_name})gatename",
+                    R"gatename(${gate_ble_key_4_name})gatename",
+                    R"gatename(${gate_ble_key_5_name})gatename",
+                  }};
+                  const std::array<std::string, 5> event_ids{{
+                    R"gateevent(${gate_ble_key_1_event})gateevent",
+                    R"gateevent(${gate_ble_key_2_event})gateevent",
+                    R"gateevent(${gate_ble_key_3_event})gateevent",
+                    R"gateevent(${gate_ble_key_4_event})gateevent",
+                    R"gateevent(${gate_ble_key_5_event})gateevent",
+                  }};
+                  static const uint8_t domain[] = {'B','L','E','K','E','Y','-','V','2'};
+                  static const uint8_t binding[] = {'g','a','t','e','-','m','a','i','n'};
+                  const uint8_t separator = 0;
+                  int matched_key = -1;
+                  for (size_t key = 0; key < psks.size(); ++key) {
+                    if (psks[key].empty()) continue;
+                    hmac_sha256::HmacSHA256 hmac;
+                    hmac.init(psks[key]);
+                    hmac.add(domain, sizeof(domain));
+                    hmac.add(&separator, 1);
+                    hmac.add(binding, sizeof(binding));
+                    hmac.add(&separator, 1);
+                    hmac.add(&command, 1);
+                    hmac.add(id(gate_ble_nonces)[slot].data(), id(gate_ble_nonces)[slot].size());
+                    hmac.calculate();
+                    std::array<uint8_t, 32> expected{};
+                    hmac.get_bytes(expected.data());
+                    uint8_t difference = 0;
+                    for (size_t i = 0; i < expected.size(); ++i) {
+                      difference |= expected[i] ^ received[i];
+                    }
+                    expected.fill(0);
+                    if (difference == 0 && matched_key < 0) matched_key = static_cast<int>(key);
+                  }
+                  received.fill(0);
+
+                  for (size_t offset = 0; offset < id(gate_ble_nonces)[slot].size(); offset += 4) {
+                    const uint32_t random = random_uint32();
+                    memcpy(id(gate_ble_nonces)[slot].data() + offset, &random, 4);
+                  }
+
+                  if (matched_key < 0) {
+                    ESP_LOGW("gate_ble", "Garmin authentication failed for client %u",
+                             static_cast<unsigned>(id));
+                    id(gate_ble_statuses)[slot] = "ERR:AUTH";
+                  } else if (command == 0x01) {
+                    ESP_LOGI("gate_ble", "Garmin client %u authenticated as %s",
+                             static_cast<unsigned>(id), key_names[matched_key].c_str());
+                    id(gate_ble_statuses)[slot] = "OK:AUTH";
+                  } else {
+                    const uint32_t current_ms = millis();
+                    if (id(gate_ble_has_pressed) &&
+                        current_ms - id(gate_ble_last_press_ms) < 1000) {
+                      ESP_LOGW("gate_ble", "Garmin press rejected: one-second cooldown active");
+                      id(gate_ble_statuses)[slot] = "ERR:BUSY";
+                    } else {
+                      id(gate_ble_has_pressed) = true;
+                      id(gate_ble_last_press_ms) = current_ms;
+                      id(button_1).press();
+                      id(gate_ble_remote_event).trigger(event_ids[matched_key] + "_garmin_press");
+                      id(gate_ble_last_remote).publish_state(key_names[matched_key] + " (Garmin)");
+                      ESP_LOGW("gate_ble", "BLE EVENT: %s via Garmin client %u invoked gate relay button_1",
+                               key_names[matched_key].c_str(), static_cast<unsigned>(id));
+                      id(gate_ble_statuses)[slot] = "OK:PRESSED";
+                    }
+                  }
+
+        # Stable API-v2 identity/capabilities descriptor. "gate-main" is also
+        # included in every authenticated transcript above.
+        - id: gate_ble_identity
+          uuid: b1b2c3d4-e5f6-7890-abcd-ef1234567897
+          read: true
+          value:
+            data: "blekey|2|gate-main|gate|press"
+            type: string
+
+event:
+  - platform: template
+    id: gate_ble_remote_event
+    name: "Gate BLE Remote"
+    device_class: button
+    event_types:
+      - ${gate_ble_key_1_event}_android_press
+      - ${gate_ble_key_1_event}_garmin_press
+      - ${gate_ble_key_2_event}_android_press
+      - ${gate_ble_key_2_event}_garmin_press
+      - ${gate_ble_key_3_event}_android_press
+      - ${gate_ble_key_3_event}_garmin_press
+      - ${gate_ble_key_4_event}_android_press
+      - ${gate_ble_key_4_event}_garmin_press
+      - ${gate_ble_key_5_event}_android_press
+      - ${gate_ble_key_5_event}_garmin_press
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: ${bell_pin}
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    id: bell_sensor
+    name: "Bell Sensor"
+    icon: mdi:bell
+    trigger_on_initial_state: true
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 10s
+
+  - platform: gpio
+    pin:
+      number: ${led_pin}
+      allow_other_uses: true
+      mode:
+        input: true
+    # This shared GPIO sensor is intentionally polling. It does NOT decode the
+    # blink timing; pulse_meter below does that using interrupts. Its only job
+    # is to tell us whether the LED is steadily ON or OFF after the pulse_meter
+    # timeout expires.
+    use_interrupt: false
+    id: status_led
+    name: "Status LED"
+    entity_category: diagnostic
+    icon: mdi:led-outline
+    disabled_by_default: true
+    trigger_on_initial_state: true
+    filters:
+      - delayed_on_off: 20ms
+
+script:
+  - id: gate_publish_closed
+    mode: restart
+    then:
+      - lambda: |-
+          id(gate_decoder_state) = 1;
+      - logger.log: "Closed"
+      - text_sensor.template.publish:
+          id: status
+          state: "Closed"
+      - cover.template.publish:
+          id: gate
+          state: CLOSED
+          current_operation: IDLE
+
+  - id: gate_publish_open
+    mode: restart
+    then:
+      - lambda: |-
+          id(gate_decoder_state) = 2;
+      - logger.log: "Open"
+      - text_sensor.template.publish:
+          id: status
+          state: "Open"
+      - cover.template.publish:
+          id: gate
+          state: OPEN
+          current_operation: IDLE
+
+  - id: gate_publish_opening
+    mode: restart
+    then:
+      - lambda: |-
+          id(gate_decoder_state) = 3;
+      - logger.log: "Opening"
+      - text_sensor.template.publish:
+          id: status
+          state: "Opening"
+      - cover.template.publish:
+          id: gate
+          current_operation: OPENING
+
+  - id: gate_publish_closing
+    mode: restart
+    then:
+      - lambda: |-
+          id(gate_decoder_state) = 4;
+      - logger.log: "Closing"
+      - text_sensor.template.publish:
+          id: status
+          state: "Closing"
+      - cover.template.publish:
+          id: gate
+          current_operation: CLOSING
+
+  - id: gate_publish_pillar_override
+    mode: restart
+    then:
+      - lambda: |-
+          id(gate_decoder_state) = 5;
+      - logger.log: "Pillar light override"
+      - text_sensor.template.publish:
+          id: status
+          state: "Pillar light override"
+      - cover.template.publish:
+          id: gate
+          current_operation: IDLE
+
+  - id: gate_publish_no_mains
+    mode: restart
+    then:
+      - lambda: |-
+          id(gate_decoder_state) = 6;
+      - logger.log: "No Mains"
+      - text_sensor.template.publish:
+          id: status
+          state: "No Mains"
+      - cover.template.publish:
+          id: gate
+          current_operation: IDLE
+
+  - id: gate_publish_low_battery
+    mode: restart
+    then:
+      - lambda: |-
+          id(gate_decoder_state) = 7;
+      - logger.log: "Low Battery"
+      - text_sensor.template.publish:
+          id: status
+          state: "Low Battery"
+      - cover.template.publish:
+          id: gate
+          current_operation: IDLE
+
+output:
+  - platform: gpio
+    pin: ${relay_1_pin}
+    id: relay_1
+    inverted: true
+
+  - platform: gpio
+    pin: ${relay_2_pin}
+    id: relay_2
+    inverted: true
+
+  - platform: gpio
+    pin: ${relay_3_pin}
+    id: relay_3
+    inverted: true
+
+button:
+  - platform: output
+    output: relay_1
+    id: button_1
+    disabled_by_default: true
+    duration: 300ms
+    name: "Open or Auto Close"
+    icon: "mdi:gate"
+  - platform: output
+    output: relay_2
+    id: button_2
+    disabled_by_default: true
+    duration: 3000ms
+    name: "Open or Manual Close"
+    icon: "mdi:gate"
+  - platform: output
+    output: relay_3
+    id: button_3
+    duration: 500ms
+    name: "Pedestrian"
+    icon: "mdi:walk"
+
+switch:
+  - platform: gpio
+    pin:
+      number: ${relay_4_pin}
+    id: relay_4
+    icon: "mdi:lock"
+    name: "Lock"
+    inverted: true
+  - platform: restart
+    name: "ESP Restart"
+
+cover:
+  - platform: template
+    name: "Gate"
+    device_class: gate
+    id: gate
+    open_action:
+      - button.press: button_1
+    close_action:
+      - button.press: button_1
+    stop_action:
+      - button.press: button_1
+    optimistic: false
+
+text_sensor:
+  - platform: template
+    id: gate_ble_last_remote
+    name: "Last BLE Remote"
+    icon: mdi:account-key
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: template
+    id: ble_firmware_build
+    name: "BLE Firmware Build"
+    icon: mdi:bluetooth
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: template
+    icon: mdi:information-outline
+    id: status
+    name: "Status"
+
+sensor:
+  # ISR-backed movement decoder. pulse_meter measures the interval between
+  # rising edges, so 100-200 ms ON/OFF closing flashes produce a much higher
+  # pulses/min value than the 200-400 ms opening flashes.
+  - platform: pulse_meter
+    pin:
+      number: ${led_pin}
+      allow_other_uses: true
+      mode:
+        input: true
+    id: gate_led_pulse_rate
+    name: "Gate LED Pulse Rate"
+    icon: mdi:pulse
+    entity_category: diagnostic
+    disabled_by_default: true
+    accuracy_decimals: 1
+    internal_filter: 30ms
+    internal_filter_mode: PULSE
+    timeout: ${gate_led_steady_time}
+    on_value:
+      then:
+        - lambda: |-
+            const float rate = x;
+            const float opening_min = ${gate_led_opening_min_ppm};
+            const float opening_max = ${gate_led_opening_max_ppm};
+            const float closing_min = ${gate_led_closing_min_ppm};
+            const float closing_max = ${gate_led_closing_max_ppm};
+
+            ESP_LOGI("gate_decoder", "LED pulse rate %.1f pulses/min", rate);
+
+            const auto reset_motion_candidate = [&]() {
+              id(gate_motion_candidate) = 0;
+              id(gate_motion_samples) = 0;
+            };
+            const auto reset_rate_history = [&]() {
+              id(gate_prev_rate_1) = 0.0f;
+              id(gate_prev_rate_2) = 0.0f;
+            };
+            const auto remember_rate = [&]() {
+              id(gate_prev_rate_2) = id(gate_prev_rate_1);
+              id(gate_prev_rate_1) = rate;
+            };
+
+            // pulse_meter publishes zero after gate_led_steady_time with no
+            // rising edge. At that point the polling binary sensor has had
+            // ample time to settle and can safely identify final Open/Closed.
+            if (rate <= 0.1f) {
+              reset_motion_candidate();
+              reset_rate_history();
+
+              if (id(status_led).state) {
+                if (id(gate_decoder_state) != 2)
+                  id(gate_publish_open).execute();
+              } else {
+                if (id(gate_decoder_state) != 1)
+                  id(gate_publish_closed).execute();
+              }
+              return;
+            }
+
+            // Ignore special-pattern classification for the first pulse after
+            // a steady state. There is no useful previous interval yet.
+            const float prev1 = id(gate_prev_rate_1);
+            const float prev2 = id(gate_prev_rate_2);
+
+            // No mains: a normal ~0.4-0.6 s pulse period followed by the
+            // distinctive ~1.4-1.7 s long period. Check this prefix-qualified
+            // pattern before the broader pillar-light range below.
+            if (prev1 >= 90.0f && prev1 <= 165.0f &&
+                rate >= 30.0f && rate <= 50.0f) {
+              ESP_LOGI("gate_decoder", "No Mains pulse pattern detected");
+              reset_motion_candidate();
+              reset_rate_history();
+              id(gate_publish_no_mains).execute();
+              return;
+            }
+
+            // Pillar-light override: roughly one pulse every ~1.9-2.1 s.
+            if (prev1 > 0.0f && rate >= 25.0f && rate <= 40.0f) {
+              ESP_LOGI("gate_decoder", "Pillar light override pattern at %.1f ppm", rate);
+              reset_motion_candidate();
+              reset_rate_history();
+              id(gate_publish_pillar_override).execute();
+              return;
+            }
+
+            // Low battery: two ~0.4-0.6 s periods followed by a longer
+            // ~0.7-1.3 s period. Check the full 46-86 ppm range before
+            // movement classification; the two normal prefix periods keep
+            // this distinct from a genuine opening pulse train.
+            if (prev2 >= 90.0f && prev2 <= 165.0f &&
+                prev1 >= 90.0f && prev1 <= 165.0f &&
+                rate >= 45.0f && rate <= 90.0f) {
+              ESP_LOGI("gate_decoder", "Low Battery pulse pattern detected");
+              reset_motion_candidate();
+              reset_rate_history();
+              id(gate_publish_low_battery).execute();
+              return;
+            }
+
+            remember_rate();
+
+            // Fast pulse train = Closing. Require two consecutive samples to
+            // avoid a single odd interval changing the Home Assistant state.
+            if (rate >= closing_min && rate <= closing_max) {
+              if (id(gate_motion_candidate) == 4) {
+                if (id(gate_motion_samples) < 255)
+                  id(gate_motion_samples)++;
+              } else {
+                id(gate_motion_candidate) = 4;
+                id(gate_motion_samples) = 1;
+              }
+
+              if (id(gate_motion_samples) >= 2 && id(gate_decoder_state) != 4) {
+                ESP_LOGI("gate_decoder", "Closing confirmed at %.1f ppm", rate);
+                id(gate_publish_closing).execute();
+              }
+              return;
+            }
+
+            // Slower continuous pulse train = Opening. Three consecutive
+            // samples are required so No-Mains/Low-Battery prefixes are not
+            // mistaken for gate movement.
+            if (rate >= opening_min && rate <= opening_max) {
+              if (id(gate_motion_candidate) == 3) {
+                if (id(gate_motion_samples) < 255)
+                  id(gate_motion_samples)++;
+              } else {
+                id(gate_motion_candidate) = 3;
+                id(gate_motion_samples) = 1;
+              }
+
+              if (id(gate_motion_samples) >= 3 && id(gate_decoder_state) != 3) {
+                ESP_LOGI("gate_decoder", "Opening confirmed at %.1f ppm", rate);
+                id(gate_publish_opening).execute();
+              }
+              return;
+            }
+
+            // 145-165 ppm is intentionally a dead-band around the nominal
+            // opening/closing boundary. Other unrecognised rates also reset
+            // only the movement candidate; final Open/Closed still comes from
+            // the pulse_meter timeout.
+            reset_motion_candidate();
+
+  - platform: uptime
+    name: Uptime
+    id: sys_uptime
+    device_class: "duration"
+    state_class: "TOTAL_INCREASING"
+    update_interval: 60s
+    entity_category: "diagnostic"
+
+  - platform: wifi_signal
+    name: RSSI
+    id: wifi_signal_db
+    update_interval: 60s
+    device_class: "signal_strength"
+    state_class: "measurement"
+    entity_category: "diagnostic"

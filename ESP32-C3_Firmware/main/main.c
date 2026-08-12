@@ -12,7 +12,7 @@
  *   - Powered from car 12V via buck converter to 3.3V (also powers remote)
  *
  * Power optimisations (ESP-IDF):
- *   - Wi-Fi fully excluded at build time (CONFIG_ESP_WIFI_ENABLED=n)
+ *   - Wi-Fi is never initialized; only the BLE radio is active at runtime
  *   - DFS: CPU scales 80 MHz <-> 10 MHz automatically via PM framework
  *   - Auto light sleep: CPU enters light sleep during FreeRTOS tickless
  *     idle (~2-5 mA idle vs ~15-20 mA with Arduino framework)
@@ -49,6 +49,8 @@
 #include "esp_pm.h"
 #include "esp_sleep.h"
 #include "esp_task_wdt.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "driver/gpio.h"
@@ -160,6 +162,9 @@ static const char *TAG = "CAR_UNLOCK";
 /* Command type prefixes */
 #define CMD_AUTH_ONLY 0x01
 #define CMD_PRESS     0x02
+#define CMD_PSK_UPDATE 0x03
+#define COMMAND_AUTH_DOMAIN "BLEKEY-V2"
+#define COMMAND_DEVICE_BINDING "car-main"
 
 /* Max PSK length */
 #define MAX_PSK_LEN 128
@@ -232,6 +237,22 @@ static const ble_uuid128_t command_pt2_uuid =
     UUID128_INIT(0x96,0x78,0x56,0x34,0x12,0xef,0xcd,0xab,
                  0x90,0x78,0xf6,0xe5,0xd4,0xc3,0xb2,0xa1);
 
+/* ...7897: stable device identity/capabilities */
+static const ble_uuid128_t identity_uuid =
+    UUID128_INIT(0x97,0x78,0x56,0x34,0x12,0xef,0xcd,0xab,
+                 0x90,0x78,0xf6,0xe5,0xd4,0xc3,0xb2,0xa1);
+
+/* ...7898 / ...7899 / ...789a: authenticated BLE OTA */
+static const ble_uuid128_t ota_control_uuid =
+    UUID128_INIT(0x98,0x78,0x56,0x34,0x12,0xef,0xcd,0xab,
+                 0x90,0x78,0xf6,0xe5,0xd4,0xc3,0xb2,0xa1);
+static const ble_uuid128_t ota_data_uuid =
+    UUID128_INIT(0x99,0x78,0x56,0x34,0x12,0xef,0xcd,0xab,
+                 0x90,0x78,0xf6,0xe5,0xd4,0xc3,0xb2,0xa1);
+static const ble_uuid128_t ota_status_uuid =
+    UUID128_INIT(0x9a,0x78,0x56,0x34,0x12,0xef,0xcd,0xab,
+                 0x90,0x78,0xf6,0xe5,0xd4,0xc3,0xb2,0xa1);
+
 /* ============================================================
  * Globals
  * ============================================================ */
@@ -241,9 +262,33 @@ static char    current_psk[MAX_PSK_LEN + 1];
 /* GATT attribute handles (populated by NimBLE after registration) */
 static uint16_t challenge_val_handle;
 static uint16_t status_val_handle;
+static uint16_t ota_status_val_handle;
 
 /* Status string (persists between reads) */
 static char status_str[32] = "READY";
+static char ota_status_str[32] = "OTA:IDLE";
+
+#define OTA_OP_START 0x01
+#define OTA_OP_FINISH 0x02
+#define OTA_OP_ABORT 0x03
+#define OTA_START_LEN (1 + 4 + 32 + HMAC_LEN)
+#define OTA_AUTH_DOMAIN "BLEKEY-OTA1"
+#define OTA_MAX_IMAGE_SIZE (0x1e0000)
+
+typedef struct {
+    bool active;
+    bool hash_started;
+    uint16_t conn_handle;
+    esp_ota_handle_t handle;
+    const esp_partition_t *partition;
+    uint32_t expected_size;
+    uint32_t received;
+    uint8_t expected_sha256[32];
+    psa_hash_operation_t hash_operation;
+} ota_session_t;
+
+static ota_session_t ota_session;
+static esp_timer_handle_t ota_reboot_timer = NULL;
 
 typedef struct {
     uint16_t conn_handle;
@@ -293,6 +338,7 @@ static int  ensure_client_slot(uint16_t conn_handle);
 static struct os_mbuf *om_from_buf(const void *buf, uint16_t len);
 static int  gap_event_handler(struct ble_gap_event *event, void *arg);
 static void ble_health_event_callback(struct ble_npl_event *event);
+static void ota_abort_session(void);
 
 /* ============================================================
  * Utility: time helpers
@@ -627,6 +673,79 @@ static void set_status(uint16_t conn_handle, const char *msg) {
     }
 }
 
+static void set_ota_status(uint16_t conn_handle, const char *msg) {
+    strncpy(ota_status_str, msg, sizeof(ota_status_str) - 1);
+    ota_status_str[sizeof(ota_status_str) - 1] = '\0';
+
+    struct ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(conn_handle, &desc) == 0) {
+        int rc = ble_gatts_notify_custom(conn_handle, ota_status_val_handle,
+                                         om_from_buf(ota_status_str, strlen(ota_status_str)));
+        if (rc != 0) {
+            LOG_W(TAG, "OTA status notify failed handle=%d rc=%d msg=%s",
+                  conn_handle, rc, ota_status_str);
+        }
+    }
+}
+
+static bool constant_time_equal(const uint8_t *a, const uint8_t *b, size_t len) {
+    uint8_t diff = 0;
+    for (size_t i = 0; i < len; i++) diff |= a[i] ^ b[i];
+    return diff == 0;
+}
+
+static void ota_abort_session(void) {
+    if (ota_session.active) esp_ota_abort(ota_session.handle);
+    if (ota_session.hash_started) psa_hash_abort(&ota_session.hash_operation);
+    memset(&ota_session, 0, sizeof(ota_session));
+    ota_session.hash_operation = psa_hash_operation_init();
+}
+
+static void ota_reboot_callback(void *arg) {
+    (void)arg;
+    esp_restart();
+}
+
+static bool ota_client_is_authenticated(uint16_t conn_handle) {
+    int slot = find_client_by_handle(conn_handle);
+    return slot >= 0 && clients[slot].authenticated;
+}
+
+static bool ota_verify_start_auth(uint16_t conn_handle, uint32_t image_size,
+                                  const uint8_t digest[32], const uint8_t supplied[HMAC_LEN]) {
+    int slot = find_client_by_handle(conn_handle);
+    if (slot < 0 || !clients[slot].authenticated) return false;
+
+    /* Domain || NUL || size-LE || SHA-256 || the client's current nonce. */
+    uint8_t transcript[sizeof(OTA_AUTH_DOMAIN) - 1 + 1 + 4 + 32 + NONCE_LEN];
+    size_t offset = 0;
+    memcpy(transcript + offset, OTA_AUTH_DOMAIN, sizeof(OTA_AUTH_DOMAIN) - 1);
+    offset += sizeof(OTA_AUTH_DOMAIN) - 1;
+    transcript[offset++] = 0;
+    transcript[offset++] = (uint8_t)(image_size);
+    transcript[offset++] = (uint8_t)(image_size >> 8);
+    transcript[offset++] = (uint8_t)(image_size >> 16);
+    transcript[offset++] = (uint8_t)(image_size >> 24);
+    memcpy(transcript + offset, digest, 32);
+    offset += 32;
+    memcpy(transcript + offset, clients[slot].nonce, NONCE_LEN);
+
+    uint8_t expected[HMAC_LEN];
+    bool computed = compute_hmac(transcript, sizeof(transcript), current_psk, expected);
+    bool valid = computed && constant_time_equal(expected, supplied, HMAC_LEN);
+    generate_nonce_for_slot(slot, true); /* a START token is always single-use */
+    return valid;
+}
+
+static void confirm_running_ota_image(void) {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    if (esp_ota_get_state_partition(running, &state) == ESP_OK &&
+        state == ESP_OTA_IMG_PENDING_VERIFY) {
+        ESP_ERROR_CHECK(esp_ota_mark_app_valid_cancel_rollback());
+    }
+}
+
 static void mark_ble_activity(void) {
     fast_adv_until_ms = now_ms() + ((int64_t)FAST_ADV_WINDOW_SEC * 1000);
 }
@@ -635,7 +754,8 @@ static void mark_ble_activity(void) {
  * Verify HMAC payload against current nonce and PSK.
  * Always rotates the nonce afterwards (even on failure) to prevent replay.
  */
-static bool verify_auth(uint16_t conn_handle, const uint8_t *payload, size_t len) {
+static bool verify_auth(uint16_t conn_handle, uint8_t command,
+                        const uint8_t *payload, size_t len) {
     int slot = ensure_client_slot(conn_handle);
     if (slot < 0) {
         LOG_W(TAG, "Auth failed: no client slot handle=%d", conn_handle);
@@ -649,8 +769,21 @@ static bool verify_auth(uint16_t conn_handle, const uint8_t *payload, size_t len
         return false;
     }
 
+    /* API v2: domain || NUL || device binding || NUL || command || nonce. */
+    uint8_t transcript[(sizeof(COMMAND_AUTH_DOMAIN) - 1) + 1 +
+                       (sizeof(COMMAND_DEVICE_BINDING) - 1) + 1 + 1 + NONCE_LEN];
+    size_t offset = 0;
+    memcpy(transcript + offset, COMMAND_AUTH_DOMAIN, sizeof(COMMAND_AUTH_DOMAIN) - 1);
+    offset += sizeof(COMMAND_AUTH_DOMAIN) - 1;
+    transcript[offset++] = 0;
+    memcpy(transcript + offset, COMMAND_DEVICE_BINDING, sizeof(COMMAND_DEVICE_BINDING) - 1);
+    offset += sizeof(COMMAND_DEVICE_BINDING) - 1;
+    transcript[offset++] = 0;
+    transcript[offset++] = command;
+    memcpy(transcript + offset, clients[slot].nonce, NONCE_LEN);
+
     uint8_t expected[HMAC_LEN];
-    if (!compute_hmac(clients[slot].nonce, NONCE_LEN, current_psk, expected)) {
+    if (!compute_hmac(transcript, sizeof(transcript), current_psk, expected)) {
         LOG_E(TAG, "Auth failed: HMAC compute error handle=%d slot=%d",
               conn_handle, slot);
         generate_nonce_for_slot(slot, true);
@@ -729,7 +862,7 @@ static int chr_access_command(uint16_t conn_handle, uint16_t attr_handle,
         return 0;
     }
 
-    if (verify_auth(conn_handle, hmac_payload, hmac_len)) {
+    if (verify_auth(conn_handle, cmd_type, hmac_payload, hmac_len)) {
         mark_ble_activity();
         mark_authenticated(conn_handle);
         if (cmd_type == CMD_PRESS) {
@@ -842,7 +975,7 @@ static int chr_access_command_pt2(uint16_t conn_handle, uint16_t attr_handle,
         return 0;
     }
 
-    if (verify_auth(conn_handle, full_hmac, HMAC_LEN)) {
+    if (verify_auth(conn_handle, cmd_type, full_hmac, HMAC_LEN)) {
         mark_ble_activity();
         mark_authenticated(conn_handle);
         if (cmd_type == CMD_PRESS) {
@@ -856,7 +989,7 @@ static int chr_access_command_pt2(uint16_t conn_handle, uint16_t attr_handle,
     return 0;
 }
 
-/* PSK Update characteristic: write with [HMAC(32)] [0x00] [newPSK] */
+/* API-v2 PSK update: [HMAC(v2 transcript, command=0x03)] [0x00] [newPSK] */
 static int chr_access_psk_update(uint16_t conn_handle, uint16_t attr_handle,
                                  struct ble_gatt_access_ctxt *ctxt, void *arg) {
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
@@ -882,7 +1015,7 @@ static int chr_access_psk_update(uint16_t conn_handle, uint16_t attr_handle,
 
     int sep_idx = HMAC_LEN;
 
-    if (!verify_auth(conn_handle, buf, sep_idx)) {
+    if (!verify_auth(conn_handle, CMD_PSK_UPDATE, buf, sep_idx)) {
         set_status(conn_handle, "ERR:PSK_AUTH");
         return 0;
     }
@@ -900,6 +1033,182 @@ static int chr_access_psk_update(uint16_t conn_handle, uint16_t attr_handle,
     bool persisted = save_psk(new_psk);
     mark_authenticated(conn_handle);
     set_status(conn_handle, persisted ? "OK:PSK_UPDATED" : "WARN:PSK_VOLATILE");
+    return 0;
+}
+
+static int chr_access_identity(uint16_t conn_handle, uint16_t attr_handle,
+                               struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    static const char identity[] = "blekey|2|car-main|car|press,ota1";
+    if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
+    return os_mbuf_append(ctxt->om, identity, sizeof(identity) - 1) == 0
+        ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+static int chr_access_ota_status(uint16_t conn_handle, uint16_t attr_handle,
+                                 struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
+    return os_mbuf_append(ctxt->om, ota_status_str, strlen(ota_status_str)) == 0
+        ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+static int chr_access_ota_control(uint16_t conn_handle, uint16_t attr_handle,
+                                  struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
+
+    uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+    uint8_t payload[OTA_START_LEN];
+    if (len == 0 || len > sizeof(payload)) {
+        set_ota_status(conn_handle, "ERR:OTA_FORMAT");
+        return 0;
+    }
+    os_mbuf_copydata(ctxt->om, 0, len, payload);
+
+    if (payload[0] == OTA_OP_ABORT) {
+        if (ota_session.active && ota_session.conn_handle == conn_handle) {
+            ota_abort_session();
+            set_ota_status(conn_handle, "OTA:ABORTED");
+        }
+        return 0;
+    }
+
+    if (payload[0] == OTA_OP_START) {
+        if (len != OTA_START_LEN) {
+            set_ota_status(conn_handle, "ERR:OTA_FORMAT");
+            return 0;
+        }
+        uint32_t image_size = (uint32_t)payload[1] |
+                              ((uint32_t)payload[2] << 8) |
+                              ((uint32_t)payload[3] << 16) |
+                              ((uint32_t)payload[4] << 24);
+        if (image_size == 0 || image_size > OTA_MAX_IMAGE_SIZE) {
+            set_ota_status(conn_handle, "ERR:OTA_SIZE");
+            return 0;
+        }
+        if (!ota_client_is_authenticated(conn_handle) ||
+            !ota_verify_start_auth(conn_handle, image_size, payload + 5, payload + 37)) {
+            set_ota_status(conn_handle, "ERR:OTA_AUTH");
+            return 0;
+        }
+        if (ota_session.active && ota_session.conn_handle != conn_handle) {
+            set_ota_status(conn_handle, "ERR:OTA_BUSY");
+            return 0;
+        }
+        if (ota_session.active) ota_abort_session();
+
+        const esp_partition_t *partition = esp_ota_get_next_update_partition(NULL);
+        if (partition == NULL || partition->size < image_size) {
+            set_ota_status(conn_handle, "ERR:OTA_SIZE");
+            return 0;
+        }
+
+        esp_ota_handle_t handle = 0;
+        esp_err_t err = esp_ota_begin(partition, image_size, &handle);
+        if (err != ESP_OK) {
+            set_ota_status(conn_handle, "ERR:OTA_BEGIN");
+            return 0;
+        }
+
+        memset(&ota_session, 0, sizeof(ota_session));
+        ota_session.active = true;
+        ota_session.conn_handle = conn_handle;
+        ota_session.handle = handle;
+        ota_session.partition = partition;
+        ota_session.expected_size = image_size;
+        memcpy(ota_session.expected_sha256, payload + 5, 32);
+        ota_session.hash_operation = psa_hash_operation_init();
+        psa_status_t hash_status = psa_hash_setup(&ota_session.hash_operation, PSA_ALG_SHA_256);
+        if (hash_status != PSA_SUCCESS) {
+            ota_abort_session();
+            set_ota_status(conn_handle, "ERR:OTA_HASH");
+            return 0;
+        }
+        ota_session.hash_started = true;
+        mark_ble_activity();
+        set_ota_status(conn_handle, "OTA:READY");
+        return 0;
+    }
+
+    if (payload[0] == OTA_OP_FINISH) {
+        if (len != 1 || !ota_session.active || ota_session.conn_handle != conn_handle) {
+            set_ota_status(conn_handle, "ERR:OTA_STATE");
+            return 0;
+        }
+        if (ota_session.received != ota_session.expected_size) {
+            set_ota_status(conn_handle, "ERR:OTA_SIZE");
+            return 0;
+        }
+
+        uint8_t actual_sha256[32];
+        size_t actual_len = 0;
+        psa_status_t hash_status = psa_hash_finish(&ota_session.hash_operation,
+                                                   actual_sha256, sizeof(actual_sha256),
+                                                   &actual_len);
+        ota_session.hash_started = false;
+        if (hash_status != PSA_SUCCESS || actual_len != sizeof(actual_sha256) ||
+            !constant_time_equal(actual_sha256, ota_session.expected_sha256, 32)) {
+            ota_abort_session();
+            set_ota_status(conn_handle, "ERR:OTA_DIGEST");
+            return 0;
+        }
+
+        esp_ota_handle_t handle = ota_session.handle;
+        const esp_partition_t *partition = ota_session.partition;
+        ota_session.active = false;
+        esp_err_t err = esp_ota_end(handle); /* also verifies signed images */
+        if (err != ESP_OK || esp_ota_set_boot_partition(partition) != ESP_OK) {
+            memset(&ota_session, 0, sizeof(ota_session));
+            ota_session.hash_operation = psa_hash_operation_init();
+            set_ota_status(conn_handle, "ERR:OTA_IMAGE");
+            return 0;
+        }
+
+        memset(&ota_session, 0, sizeof(ota_session));
+        ota_session.hash_operation = psa_hash_operation_init();
+        set_ota_status(conn_handle, "OTA:OK");
+        esp_timer_start_once(ota_reboot_timer, 1000 * 1000);
+        return 0;
+    }
+
+    set_ota_status(conn_handle, "ERR:OTA_OP");
+    return 0;
+}
+
+static int chr_access_ota_data(uint16_t conn_handle, uint16_t attr_handle,
+                               struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
+    uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+    if (!ota_session.active || ota_session.conn_handle != conn_handle) {
+        set_ota_status(conn_handle, "ERR:OTA_STATE");
+        return 0;
+    }
+    if (len <= 4 || len > 512) {
+        set_ota_status(conn_handle, "ERR:OTA_CHUNK");
+        return 0;
+    }
+
+    uint8_t payload[512];
+    os_mbuf_copydata(ctxt->om, 0, len, payload);
+    uint32_t offset = (uint32_t)payload[0] |
+                      ((uint32_t)payload[1] << 8) |
+                      ((uint32_t)payload[2] << 16) |
+                      ((uint32_t)payload[3] << 24);
+    uint32_t chunk_len = len - 4;
+    if (offset != ota_session.received || chunk_len > ota_session.expected_size - ota_session.received) {
+        set_ota_status(conn_handle, "ERR:OTA_OFFSET");
+        return 0;
+    }
+
+    esp_err_t err = esp_ota_write(ota_session.handle, payload + 4, chunk_len);
+    psa_status_t hash_status = err == ESP_OK
+        ? psa_hash_update(&ota_session.hash_operation, payload + 4, chunk_len)
+        : PSA_ERROR_GENERIC_ERROR;
+    if (err != ESP_OK || hash_status != PSA_SUCCESS) {
+        ota_abort_session();
+        set_ota_status(conn_handle, "ERR:OTA_WRITE");
+        return 0;
+    }
+    ota_session.received += chunk_len;
+    mark_ble_activity();
     return 0;
 }
 
@@ -950,6 +1259,27 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
                 .uuid       = &command_pt2_uuid.u,
                 .access_cb  = chr_access_command_pt2,
                 .flags      = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+            },
+            {
+                .uuid       = &identity_uuid.u,
+                .access_cb  = chr_access_identity,
+                .flags      = BLE_GATT_CHR_F_READ,
+            },
+            {
+                .uuid       = &ota_control_uuid.u,
+                .access_cb  = chr_access_ota_control,
+                .flags      = BLE_GATT_CHR_F_WRITE,
+            },
+            {
+                .uuid       = &ota_data_uuid.u,
+                .access_cb  = chr_access_ota_data,
+                .flags      = BLE_GATT_CHR_F_WRITE,
+            },
+            {
+                .uuid       = &ota_status_uuid.u,
+                .access_cb  = chr_access_ota_status,
+                .val_handle = &ota_status_val_handle,
+                .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
             },
             { 0 }, /* Terminator */
         },
@@ -1045,6 +1375,9 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
         }
 
         invalidate_split_cmd_for(conn_handle);
+        if (ota_session.active && ota_session.conn_handle == conn_handle) {
+            ota_abort_session();
+        }
 
         /* Use fast advertising after disconnect because reconnects are likely. */
         mark_ble_activity();
@@ -1272,6 +1605,9 @@ static void main_loop_task(void *param) {
                 LOG_I(TAG, "Reaped ghost slot %d (handle %d)",
                       i, clients[i].conn_handle);
                 invalidate_split_cmd_for(clients[i].conn_handle);
+                if (ota_session.active && ota_session.conn_handle == clients[i].conn_handle) {
+                    ota_abort_session();
+                }
                 clients[i].in_use = false;
                 clients[i].authenticated = false;
                 log_client_state("ghost-reaped");
@@ -1329,6 +1665,9 @@ static void main_loop_task(void *param) {
                 clients[i].in_use = false;
                 clients[i].authenticated = false;
                 invalidate_split_cmd_for(handle);
+                if (ota_session.active && ota_session.conn_handle == handle) {
+                    ota_abort_session();
+                }
                 log_client_state("client-timeout");
 
                 /* Ask NimBLE to tear down the link */
@@ -1374,6 +1713,12 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(esp_timer_create(&btn_timer_args, &button_timer));
 
+    const esp_timer_create_args_t ota_reboot_timer_args = {
+        .callback = ota_reboot_callback,
+        .name     = "ota_reboot",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&ota_reboot_timer_args, &ota_reboot_timer));
+
 #ifdef DEBUG_LED_ENABLED
     gpio_init_led();
 #else
@@ -1382,6 +1727,8 @@ void app_main(void) {
 
     /* ---- Client state init ---- */
     memset(clients, 0, sizeof(clients));
+    memset(&ota_session, 0, sizeof(ota_session));
+    ota_session.hash_operation = psa_hash_operation_init();
 
     /* ---- Power management: DFS + auto light sleep ---- */
     configure_power_management();
@@ -1456,4 +1803,8 @@ void app_main(void) {
         LOG_E(TAG, "Failed to create main maintenance task, restarting");
         esp_restart();
     }
+
+    /* Reaching this point proves the new image can initialize persistent
+     * storage, crypto, GPIO, BLE/GATT, timers, and its maintenance task. */
+    confirm_running_ota_image();
 }

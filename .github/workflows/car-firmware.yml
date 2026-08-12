@@ -1,0 +1,43 @@
+name: Car firmware
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['firmware-v*']
+
+permissions:
+  contents: read
+
+jobs:
+  signed-firmware:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ESP32-C3_Firmware
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Install PlatformIO
+        run: python -m pip install --disable-pip-version-check platformio==6.1.18
+      - name: Restore firmware signing key
+        shell: bash
+        run: printf '%s' "$ESP_FIRMWARE_SIGNING_KEY_BASE64" | base64 --decode > secure_boot_signing_key.pem
+        env:
+          ESP_FIRMWARE_SIGNING_KEY_BASE64: ${{ secrets.ESP_FIRMWARE_SIGNING_KEY_BASE64 }}
+      - name: Build signed firmware
+        run: pio run
+      - name: Remove restored signing key
+        if: always()
+        run: rm -f secure_boot_signing_key.pem
+      - uses: actions/upload-artifact@v7
+        with:
+          name: BLE-Car-Key-firmware-${{ github.ref_name }}
+          path: |
+            ESP32-C3_Firmware/.pio/build/esp32c3/firmware.bin
+            ESP32-C3_Firmware/.pio/build/esp32c3/bootloader.bin
+            ESP32-C3_Firmware/.pio/build/esp32c3/partitions.bin
+            ESP32-C3_Firmware/.pio/build/esp32c3/ota_data_initial.bin
+            ESP32-C3_Firmware/.pio/build/esp32c3/flasher_args.json
+          if-no-files-found: error

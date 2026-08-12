@@ -1,0 +1,178 @@
+# Compatibility package for the existing Android and Garmin apps.
+#
+# This intentionally implements protocol v1 (HMAC-SHA256 over the 16-byte
+# challenge only) so the current apps can be used without modification.
+# Do not treat this as the final security design; migrate to protocol v2 after
+# validating BLE discovery, authentication, notifications and relay operation.
+
+substitutions:
+  gate_ble_psk: !secret ble_psk
+
+esphome:
+  includes:
+    - secure_ble_key_v1.h
+  on_boot:
+    - priority: 600
+      then:
+        - lambda: |-
+            const std::string psk = R"gatepsk(${gate_ble_psk})gatepsk";
+            if (!secure_ble_key_v1::gate_protocol.begin(psk)) {
+              ESP_LOGE("secure_ble_key", "Could not initialise protocol v1");
+            }
+            id(gate_ble_challenge).set_value(
+                secure_ble_key_v1::gate_protocol.challenge());
+            id(gate_ble_status).set_value("READY");
+
+esp32_ble:
+  disable_bt_logs: true
+  connection_timeout: 20s
+  max_connections: 1
+
+esp32_ble_server:
+  manufacturer: "JshStadler"
+  model: "Secure BLE Gate v1"
+  max_clients: 1
+  on_connect:
+    - lambda: |-
+        secure_ble_key_v1::gate_protocol.on_connect(id);
+        id(gate_ble_challenge).set_value(
+            secure_ble_key_v1::gate_protocol.challenge());
+        id(gate_ble_status).set_value("READY");
+  on_disconnect:
+    - lambda: |-
+        secure_ble_key_v1::gate_protocol.on_disconnect(id);
+  services:
+    - uuid: b1b2c3d4-e5f6-7890-abcd-ef1234567890
+      advertise: true
+      characteristics:
+        - id: gate_ble_challenge
+          uuid: b1b2c3d4-e5f6-7890-abcd-ef1234567891
+          read: true
+          notify: true
+          value:
+            data: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+        # Declare status before the command handlers because those handlers
+        # publish through it during ESPHome's generated-code setup.
+        - id: gate_ble_status
+          uuid: b1b2c3d4-e5f6-7890-abcd-ef1234567893
+          read: true
+          notify: true
+          value:
+            data: "READY"
+            type: string
+
+        - id: gate_ble_command
+          uuid: b1b2c3d4-e5f6-7890-abcd-ef1234567892
+          write: true
+          write_no_response: true
+          on_write:
+            then:
+              - lambda: |-
+                  const auto result =
+                      secure_ble_key_v1::gate_protocol.process_full(x);
+
+                  // A verification attempt always rotates the challenge.
+                  id(gate_ble_challenge).set_value(
+                      secure_ble_key_v1::gate_protocol.challenge());
+                  id(gate_ble_challenge).notify();
+
+                  const char *status = "ERR:AUTH";
+                  switch (result) {
+                    case secure_ble_key_v1::CommandResult::AUTHENTICATED:
+                      status = "OK:AUTH";
+                      break;
+                    case secure_ble_key_v1::CommandResult::PRESS:
+                      id(button_1).press();
+                      status = "OK:PRESSED";
+                      break;
+                    case secure_ble_key_v1::CommandResult::BUSY:
+                      status = "ERR:BUSY";
+                      break;
+                    case secure_ble_key_v1::CommandResult::UNKNOWN_COMMAND:
+                      status = "ERR:UNKNOWN_CMD";
+                      break;
+                    case secure_ble_key_v1::CommandResult::BAD_LENGTH:
+                      status = "ERR:EMPTY";
+                      break;
+                    default:
+                      status = "ERR:AUTH";
+                      break;
+                  }
+                  id(gate_ble_status).set_value(status);
+                  id(gate_ble_status).notify();
+
+        # Garmin's default ATT MTU cannot carry a 33-byte command. These two
+        # characteristics preserve the existing 17-byte + 16-byte split path.
+        - id: gate_ble_command_part1
+          uuid: b1b2c3d4-e5f6-7890-abcd-ef1234567895
+          write: true
+          write_no_response: true
+          on_write:
+            then:
+              - lambda: |-
+                  const auto result =
+                      secure_ble_key_v1::gate_protocol.store_split_part1(x, id);
+                  if (result != secure_ble_key_v1::CommandResult::SPLIT_STORED) {
+                    id(gate_ble_status).set_value("ERR:PT1_LEN");
+                    id(gate_ble_status).notify();
+                  }
+
+        - id: gate_ble_command_part2
+          uuid: b1b2c3d4-e5f6-7890-abcd-ef1234567896
+          write: true
+          write_no_response: true
+          on_write:
+            then:
+              - lambda: |-
+                  const auto result =
+                      secure_ble_key_v1::gate_protocol.process_split_part2(x, id);
+
+                  const char *status = "ERR:AUTH";
+                  bool verification_attempted = false;
+                  switch (result) {
+                    case secure_ble_key_v1::CommandResult::AUTHENTICATED:
+                      status = "OK:AUTH";
+                      verification_attempted = true;
+                      break;
+                    case secure_ble_key_v1::CommandResult::PRESS:
+                      id(button_1).press();
+                      status = "OK:PRESSED";
+                      verification_attempted = true;
+                      break;
+                    case secure_ble_key_v1::CommandResult::AUTH_ERROR:
+                    case secure_ble_key_v1::CommandResult::CRYPTO_ERROR:
+                      status = "ERR:AUTH";
+                      verification_attempted = true;
+                      break;
+                    case secure_ble_key_v1::CommandResult::BUSY:
+                      status = "ERR:BUSY";
+                      verification_attempted = true;
+                      break;
+                    case secure_ble_key_v1::CommandResult::UNKNOWN_COMMAND:
+                      status = "ERR:UNKNOWN_CMD";
+                      break;
+                    case secure_ble_key_v1::CommandResult::BAD_LENGTH:
+                      status = "ERR:PT2_LEN";
+                      break;
+                    case secure_ble_key_v1::CommandResult::SPLIT_MISSING:
+                      status = "ERR:NO_PT1";
+                      break;
+                    case secure_ble_key_v1::CommandResult::SPLIT_CLIENT_MISMATCH:
+                      status = "ERR:CONN_MISMATCH";
+                      break;
+                    case secure_ble_key_v1::CommandResult::SPLIT_TIMEOUT:
+                      status = "ERR:TIMEOUT";
+                      break;
+                    default:
+                      status = "ERR:AUTH";
+                      break;
+                  }
+
+                  if (verification_attempted) {
+                    id(gate_ble_challenge).set_value(
+                        secure_ble_key_v1::gate_protocol.challenge());
+                    id(gate_ble_challenge).notify();
+                  }
+                  id(gate_ble_status).set_value(status);
+                  id(gate_ble_status).notify();
