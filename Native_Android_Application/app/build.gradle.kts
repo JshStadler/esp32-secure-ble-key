@@ -12,8 +12,9 @@ android {
         applicationId = "dev.jshstadler.carkey"
         minSdk = 23
         targetSdk = 36
-        versionCode = 9
-        versionName = "2.0.2"
+        versionCode = 19
+        versionName = "2.4.0"
+        manifestPlaceholders["appLabel"] = "BLE Key"
     }
 
     buildFeatures {
@@ -35,6 +36,11 @@ android {
     }
 
     buildTypes {
+        debug {
+            applicationIdSuffix = ".test"
+            versionNameSuffix = "-test"
+            manifestPlaceholders["appLabel"] = "BLE Key"
+        }
         release {
             isMinifyEnabled = false
             signingConfig = signingConfigs.getByName("release")

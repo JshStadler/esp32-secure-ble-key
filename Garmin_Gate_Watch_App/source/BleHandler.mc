@@ -8,16 +8,19 @@ using Toybox.Timer;
 
 // UUIDs matching the ESP32 firmware
 class CarKeyProfile {
-    static const SERVICE_UUID         = Ble.longToUuid(0xa1b2c3d4e5f67890l, 0xabcdef1234567890l);
-    static const CHALLENGE_CHAR_UUID  = Ble.longToUuid(0xa1b2c3d4e5f67890l, 0xabcdef1234567891l);
-    static const COMMAND_CHAR_UUID    = Ble.longToUuid(0xa1b2c3d4e5f67890l, 0xabcdef1234567892l);
-    static const STATUS_CHAR_UUID     = Ble.longToUuid(0xa1b2c3d4e5f67890l, 0xabcdef1234567893l);
-    static const COMMAND_PT1_CHAR_UUID = Ble.longToUuid(0xa1b2c3d4e5f67890l, 0xabcdef1234567895l);
-    static const COMMAND_PT2_CHAR_UUID = Ble.longToUuid(0xa1b2c3d4e5f67890l, 0xabcdef1234567896l);
+    // Address reported by the ESPHome test board. Address matching bypasses
+    // differences in how watch firmware exposes ESPHome advertising fields.
+    static const TARGET_ADDRESS        = "A0:B7:65:4A:15:EE";
+    static const SERVICE_UUID         = Ble.longToUuid(0xb1b2c3d4e5f67890l, 0xabcdef1234567890l);
+    static const CHALLENGE_CHAR_UUID  = Ble.longToUuid(0xb1b2c3d4e5f67890l, 0xabcdef1234567891l);
+    static const COMMAND_CHAR_UUID    = Ble.longToUuid(0xb1b2c3d4e5f67890l, 0xabcdef1234567892l);
+    static const STATUS_CHAR_UUID     = Ble.longToUuid(0xb1b2c3d4e5f67890l, 0xabcdef1234567893l);
+    static const COMMAND_PT1_CHAR_UUID = Ble.longToUuid(0xb1b2c3d4e5f67890l, 0xabcdef1234567895l);
+    static const COMMAND_PT2_CHAR_UUID = Ble.longToUuid(0xb1b2c3d4e5f67890l, 0xabcdef1234567896l);
 
     static const CCCD_UUID = Ble.cccdUuid();
 
-    // Command types (must match ESP32 firmware)
+    // API-v2 command types and fixed security binding (must match ESPHome).
     static const CMD_AUTH_ONLY = 0x01;
     static const CMD_PRESS     = 0x02;
 
@@ -26,8 +29,7 @@ class CarKeyProfile {
             :uuid => SERVICE_UUID,
             :characteristics => [
                 {
-                    :uuid => CHALLENGE_CHAR_UUID,
-                    :descriptors => [CCCD_UUID]
+                    :uuid => CHALLENGE_CHAR_UUID
                 },
                 {
                     :uuid => COMMAND_CHAR_UUID
@@ -39,8 +41,7 @@ class CarKeyProfile {
                     :uuid => COMMAND_PT2_CHAR_UUID
                 },
                 {
-                    :uuid => STATUS_CHAR_UUID,
-                    :descriptors => [CCCD_UUID]
+                    :uuid => STATUS_CHAR_UUID
                 }
             ]
         };
@@ -369,14 +370,16 @@ class BleHandler extends Ble.BleDelegate {
         }
 
         // API v2 transcript:
-        // BLEKEY-V2 || 0x00 || car-main || 0x00 || command || nonce
+        // BLEKEY-V2 || 0x00 || gate-main || 0x00 || command || nonce
+        // Binding the device and command prevents a valid response being
+        // redirected to another action or another BLE Key device.
         var hmacEngine = new Cryptography.HashBasedMessageAuthenticationCode({
             :algorithm => Cryptography.HASH_SHA256,
             :key => keyBytes
         });
         hmacEngine.update([0x42, 0x4c, 0x45, 0x4b, 0x45, 0x59, 0x2d, 0x56, 0x32]b);
         hmacEngine.update([0x00]b);
-        hmacEngine.update([0x63, 0x61, 0x72, 0x2d, 0x6d, 0x61, 0x69, 0x6e]b);
+        hmacEngine.update([0x67, 0x61, 0x74, 0x65, 0x2d, 0x6d, 0x61, 0x69, 0x6e]b);
         hmacEngine.update([0x00, _pendingCommand]b);
         hmacEngine.update(nonce as Lang.ByteArray);
         var hmac = hmacEngine.digest() as Lang.ByteArray;
@@ -431,7 +434,7 @@ class BleHandler extends Ble.BleDelegate {
             WatchUi.requestUpdate();
         }
     }
-    
+
     private function enableStatusNotifications() {
         _notificationSetupStarted = true;
         var service = _device.getService(CarKeyProfile.SERVICE_UUID);
@@ -666,11 +669,12 @@ class BleHandler extends Ble.BleDelegate {
                 lastSeenName = deviceName == null ? "unnamed" : deviceName;
                 lastSeenRssi = sr.getRssi();
 
-                // API v2 gives Car and Gate distinct service UUIDs. Prefer the
-                // service UUID because Garmin does not expose the scan-response
-                // device name consistently. Keep the name as a compatibility
-                // fallback for Car firmware that advertises it without the
-                // service UUID in the packet Garmin reports.
+                var matchesAddress = false;
+                try {
+                    matchesAddress = sr.hasAddress(CarKeyProfile.TARGET_ADDRESS);
+                } catch (e) {
+                    System.println("Address match error: " + e.getErrorMessage());
+                }
                 var matchesService = false;
                 var uuidsIterator = sr.getServiceUuids();
                 if (uuidsIterator != null) {
@@ -681,17 +685,18 @@ class BleHandler extends Ble.BleDelegate {
                         }
                     }
                 }
-                var matchesProfile = matchesService ||
-                    (deviceName != null && deviceName.equals("BLE-Device"));
+                var matchesProfile = matchesAddress || matchesService ||
+                    (deviceName != null && deviceName.equals("centurion-d5-evo"));
 
                 if (matchesProfile) {
-                    System.println("Matched car BLE device: " +
+                    System.println("Matched gate BLE device: " +
                         (deviceName == null ? "<unnamed>" : deviceName) +
+                        ", address=" + (matchesAddress ? "yes" : "no") +
                         ", service=" + (matchesService ? "yes" : "no") +
                         ", RSSI " + sr.getRssi());
                     stopScan();
                     _state = STATE_CONNECTING;
-                    _statusText = "Connecting...";
+                    _statusText = matchesAddress ? "Address found; connecting" : "Gate found; connecting";
                     WatchUi.requestUpdate();
 
                     try {
@@ -727,6 +732,33 @@ class BleHandler extends Ble.BleDelegate {
         }
     }
 
+    function readStatus() as Void {
+        if (_device == null || !_device.isConnected()) {
+            _state = STATE_IDLE;
+            _statusText = "Disconnected";
+            WatchUi.requestUpdate();
+            return;
+        }
+        var service = _device.getService(CarKeyProfile.SERVICE_UUID);
+        var statusChar = service == null ? null : service.getCharacteristic(CarKeyProfile.STATUS_CHAR_UUID);
+        if (statusChar == null) {
+            _state = STATE_CONNECTED;
+            _statusText = "No status";
+            vibrateFailure();
+            WatchUi.requestUpdate();
+            return;
+        }
+        try {
+            statusChar.requestRead();
+            _timer.start(method(:onStatusTimeout), 2000, false);
+        } catch (e) {
+            _state = STATE_CONNECTED;
+            _statusText = "Status read failed";
+            vibrateFailure();
+            WatchUi.requestUpdate();
+        }
+    }
+
     function onConnectedStateChanged(device, state) {
         if (state == Ble.CONNECTION_STATE_CONNECTED) {
             // Ignore a late connection callback after the connection window
@@ -755,10 +787,10 @@ class BleHandler extends Ble.BleDelegate {
             }
             WatchUi.requestUpdate();
 
-            // Enable notifications on status characteristic.
-            // If there's a pending unlock, it will execute from
-            // onDescriptorWrite once the CCCD write completes.
-            enableStatusNotifications();
+            // The five-client ESPHome server exposes connection-specific
+            // challenge/status values through reads. Broadcast notifications
+            // cannot safely carry a different nonce for every connection.
+            finishNotificationSetup(true);
 
         } else {
             var wasConnected = _connectionFeedbackState;
@@ -790,7 +822,7 @@ class BleHandler extends Ble.BleDelegate {
         if (status != Ble.STATUS_SUCCESS) {
             cancelOperationTimeout();
             _statusText = "Command failed";
-            System.println("Remote button press failed: challenge read status " + status);
+            System.println("Remote button press failed: characteristic read status " + status);
             _state = STATE_CONNECTED;
             vibrateFailure();
             WatchUi.requestUpdate();
@@ -801,6 +833,9 @@ class BleHandler extends Ble.BleDelegate {
             // Got the nonce, now compute HMAC and send command
             cancelOperationTimeout();
             sendCommand(value);
+        } else if (char.getUuid().equals(CarKeyProfile.STATUS_CHAR_UUID)) {
+            _timer.stop();
+            handleStatusValue(value as Lang.ByteArray);
         }
     }
 
@@ -842,9 +877,9 @@ class BleHandler extends Ble.BleDelegate {
             cancelOperationTimeout();
             if (status == Ble.STATUS_SUCCESS) {
                 _state = STATE_WAITING_STATUS;
-                _statusText = "Sent, waiting...";
+                _statusText = "Sent, checking...";
                 _timer.stop();
-                _timer.start(method(:onStatusTimeout), 2000, false);
+                _timer.start(method(:readStatus), 100, false);
             } else {
                 _statusText = "Command failed";
                 System.println("Remote button press failed: part 2 write status " + status);
@@ -888,7 +923,7 @@ class BleHandler extends Ble.BleDelegate {
                 vibrateFailure();
                 _state = STATE_CONNECTED; // recoverable, not an error state
             } else if (statusStr.find("ERR:AUTH") != null) {
-                _statusText = "Auth failed";
+                _statusText = "Command failed";
                 System.println("Remote button press failed: authentication");
                 vibrateFailure();
                 _state = STATE_CONNECTED; // recoverable — user can retry
@@ -905,6 +940,36 @@ class BleHandler extends Ble.BleDelegate {
             }
             WatchUi.requestUpdate();
         }
+    }
+
+    private function handleStatusValue(value as Lang.ByteArray) {
+        var statusStr = byteArrayToString(value);
+        if (statusStr.find("OK:PRESSED") != null) {
+            _statusText = "Pressed";
+            _state = STATE_CONNECTED;
+            System.println("Remote button pressed");
+            vibrateSuccess();
+        } else if (statusStr.find("OK:AUTH") != null) {
+            _statusText = "Authenticated";
+            _state = STATE_CONNECTED;
+        } else if (statusStr.find("ERR:BUSY") != null) {
+            _statusText = "Command failed";
+            vibrateFailure();
+            _state = STATE_CONNECTED;
+        } else if (statusStr.find("ERR:AUTH") != null) {
+            _statusText = "Auth failed";
+            vibrateFailure();
+            _state = STATE_CONNECTED;
+        } else if (statusStr.find("ERR") != null) {
+            _statusText = "Command failed";
+            System.println("Remote button press failed: " + statusStr);
+            _state = STATE_ERROR;
+            vibrateFailure();
+        } else {
+            _statusText = statusStr;
+            _state = STATE_CONNECTED;
+        }
+        WatchUi.requestUpdate();
     }
 
     function onDescriptorWrite(desc, status) {

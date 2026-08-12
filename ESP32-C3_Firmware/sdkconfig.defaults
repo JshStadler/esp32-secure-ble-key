@@ -37,11 +37,10 @@ CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP=y
 # Requires flash to support suspend/resume — most do.
 CONFIG_ESP_SLEEP_FLASH_LEAKAGE_WORKAROUND=y
 
-# ---- Wi-Fi: fully disabled ----
-# We don't use Wi-Fi at all. Disabling it at the config level
-# strips the Wi-Fi stack from the build entirely (~100KB flash,
-# ~40KB RAM saved vs disabling at runtime).
-CONFIG_ESP_WIFI_ENABLED=n
+# ---- Wi-Fi: unused at runtime ----
+# ESP-IDF 6 makes ESP_WIFI_ENABLED a hidden SoC option and NimBLE's controller
+# component declares an esp_wifi build dependency for coexistence helpers.
+# Firmware never initializes Wi-Fi, creates a netif, or starts its radio.
 
 # ---- Bluetooth / NimBLE ----
 CONFIG_BT_ENABLED=y
@@ -85,8 +84,19 @@ CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
 # The ROM bootloader always re-enables USB for flashing.
 CONFIG_ESP_CONSOLE_NONE=y
 
-# ---- Partition table ----
-CONFIG_PARTITION_TABLE_SINGLE_APP=y
+# ---- OTA partitioning and update safety ----
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_ota.csv"
+# CONFIG_PARTITION_TABLE_SINGLE_APP is not set
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# Verify every OTA image against our RSA signing key. Hardware Secure Boot is
+# deliberately NOT enabled, so USB recovery remains available on a prototype.
+CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT=y
+CONFIG_SECURE_SIGNED_APPS_RSA_SCHEME=y
+CONFIG_SECURE_SIGNED_ON_UPDATE_NO_SECURE_BOOT=y
+CONFIG_SECURE_BOOT_BUILD_SIGNED_BINARIES=y
+CONFIG_SECURE_BOOT_SIGNING_KEY="secure_boot_signing_key.pem"
 
 # ---- Watchdog ----
 CONFIG_ESP_TASK_WDT_EN=y

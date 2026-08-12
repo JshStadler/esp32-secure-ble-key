@@ -9,11 +9,15 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import java.nio.charset.StandardCharsets
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.security.MessageDigest
 import java.util.UUID
 
 class BleCarKeyClient(
     private val context: Context,
     private val bluetoothManager: BluetoothManager,
+    private val profile: BleDeviceProfile,
     private val listener: Listener,
 ) {
     interface Listener {
@@ -21,17 +25,15 @@ class BleCarKeyClient(
         fun onReadyChanged(ready: Boolean)
         fun onDeviceAddress(address: String)
         fun onCommandResult(success: Boolean, message: String)
+        fun onPskUpdateResult(success: Boolean, message: String)
         fun onDiagnostic(message: String)
+        fun onOtaProgress(sent: Int, total: Int)
+        fun onOtaResult(success: Boolean, message: String)
     }
 
     enum class State { DISCONNECTED, SCANNING, CONNECTING, CONNECTED }
 
     companion object {
-        val SERVICE_UUID: UUID = UUID.fromString("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
-        private val CHALLENGE_UUID = UUID.fromString("a1b2c3d4-e5f6-7890-abcd-ef1234567891")
-        private val COMMAND_UUID = UUID.fromString("a1b2c3d4-e5f6-7890-abcd-ef1234567892")
-        private val STATUS_UUID = UUID.fromString("a1b2c3d4-e5f6-7890-abcd-ef1234567893")
-        private val PSK_UPDATE_UUID = UUID.fromString("a1b2c3d4-e5f6-7890-abcd-ef1234567894")
         private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     }
 
@@ -41,6 +43,9 @@ class BleCarKeyClient(
     private var command: BluetoothGattCharacteristic? = null
     private var status: BluetoothGattCharacteristic? = null
     private var pskUpdate: BluetoothGattCharacteristic? = null
+    private var otaControl: BluetoothGattCharacteristic? = null
+    private var otaData: BluetoothGattCharacteristic? = null
+    private var otaStatus: BluetoothGattCharacteristic? = null
     private var nonce: ByteArray? = null
     private var psk = ""
     private var ready = false
@@ -56,6 +61,14 @@ class BleCarKeyClient(
     private var awaitingScanFallback = false
     private var pressInFlight = false
     private var pressGeneration = 0
+    private var pendingNewPsk: String? = null
+    private var pskUpdateInFlight = false
+    private var pskUpdateGeneration = 0
+    private var otaImage: ByteArray? = null
+    private var otaOffset = 0
+    private var otaLastChunkSize = 0
+    private var otaInFlight = false
+    private var otaWaitingForReady = false
 
     private val scanner get() = bluetoothManager.adapter?.bluetoothLeScanner
 
@@ -125,8 +138,9 @@ class BleCarKeyClient(
     @SuppressLint("MissingPermission")
     private fun matches(result: ScanResult): Boolean =
         result.device.address == reconnectAddress ||
-            result.device.name == "BLE-Device" ||
-            result.scanRecord?.serviceUuids?.any { it.uuid == SERVICE_UUID } == true
+            result.device.address == profile.defaultAddress ||
+            result.device.name == profile.advertisedName ||
+            result.scanRecord?.serviceUuids?.any { it.uuid == profile.serviceUuid } == true
 
     @SuppressLint("MissingPermission")
     private fun acceptScan(result: ScanResult) {
@@ -154,10 +168,23 @@ class BleCarKeyClient(
                 handler.postDelayed({ if (!g.requestMtu(517)) g.discoverServices() }, 300)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 val wasReady = ready
+                val wasUpdating = otaInFlight
+                val wasUpdatingPsk = pskUpdateInFlight
                 g.close()
                 if (gatt === g) clearGatt()
                 if (!wasReady && attemptingDirect) directFailures++
                 listener.onReadyChanged(false)
+                if (wasUpdating) {
+                    manuallyStopped = true
+                    listener.onOtaResult(false, "Bluetooth connection was lost during firmware update")
+                }
+                if (wasUpdatingPsk) {
+                    manuallyStopped = true
+                    listener.onPskUpdateResult(
+                        false,
+                        "Connection was lost during the PSK update; use app-only after confirming the car key",
+                    )
+                }
                 if (!manuallyStopped) {
                     if (wasReady) listener.onState(State.DISCONNECTED, "Connection lost; reconnectingâ€¦")
                     scheduleReconnect()
@@ -175,15 +202,24 @@ class BleCarKeyClient(
         override fun onServicesDiscovered(g: BluetoothGatt, result: Int) {
             listener.onDiagnostic("Service discovery completed: status=$result, services=${g.services.size}")
             if (result != BluetoothGatt.GATT_SUCCESS) return fail("Service discovery failed")
-            val service = g.getService(SERVICE_UUID) ?: return fail("Car Key service not found")
-            challenge = service.getCharacteristic(CHALLENGE_UUID)
-            command = service.getCharacteristic(COMMAND_UUID)
-            status = service.getCharacteristic(STATUS_UUID)
-            pskUpdate = service.getCharacteristic(PSK_UPDATE_UUID)
+            val service = g.getService(profile.serviceUuid) ?: return fail("${profile.displayName} service not found")
+            challenge = service.getCharacteristic(profile.challengeUuid)
+            command = service.getCharacteristic(profile.commandUuid)
+            status = service.getCharacteristic(profile.statusUuid)
+            pskUpdate = service.getCharacteristic(profile.pskUpdateUuid)
+            otaControl = service.getCharacteristic(profile.otaControlUuid)
+            otaData = service.getCharacteristic(profile.otaDataUuid)
+            otaStatus = service.getCharacteristic(profile.otaStatusUuid)
             if (challenge == null || command == null || status == null) return fail("Required BLE characteristics missing")
-            listener.onDiagnostic("Required Car Key characteristics found; enabling notifications")
-            descriptorStage = 1
-            enableNotifications(g, challenge!!)
+            if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE) {
+                listener.onDiagnostic("Required ${profile.displayName} characteristics found; using per-connection reads")
+                descriptorStage = 4
+                g.readCharacteristic(challenge)
+            } else {
+                listener.onDiagnostic("Required ${profile.displayName} characteristics found; enabling notifications")
+                descriptorStage = 1
+                enableNotifications(g, challenge!!)
+            }
         }
 
         @SuppressLint("MissingPermission")
@@ -192,8 +228,11 @@ class BleCarKeyClient(
             if (descriptorStage == 1) {
                 descriptorStage = 2
                 enableNotifications(g, status!!)
-            } else {
+            } else if (descriptorStage == 2 && otaStatus != null) {
                 descriptorStage = 3
+                enableNotifications(g, otaStatus!!)
+            } else {
+                descriptorStage = 4
                 g.readCharacteristic(challenge)
             }
         }
@@ -215,16 +254,41 @@ class BleCarKeyClient(
         override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
             handleValue(characteristic, value)
         }
+
+        @SuppressLint("MissingPermission")
+        override fun onCharacteristicWrite(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, result: Int) {
+            if (result != BluetoothGatt.GATT_SUCCESS) {
+                when (characteristic.uuid) {
+                    profile.commandUuid -> fail("Command write failed ($result)")
+                    profile.pskUpdateUuid -> finishPskUpdate(false, "Car PSK update write failed ($result)")
+                    profile.otaControlUuid, profile.otaDataUuid -> finishOta(false, "Firmware transfer write failed ($result)")
+                }
+                return
+            }
+            if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE && characteristic.uuid == profile.commandUuid) {
+                // ESPHome sends the ATT write response immediately before its
+                // YAML on_write automation runs. A short delay avoids reading
+                // the previous per-connection status value.
+                handler.postDelayed({ g.readCharacteristic(status) }, 100)
+            }
+            if (characteristic.uuid == profile.otaDataUuid && otaInFlight) {
+                otaOffset += otaLastChunkSize
+                otaLastChunkSize = 0
+                listener.onOtaProgress(otaOffset, otaImage?.size ?: otaOffset)
+                sendNextOtaChunk()
+            }
+        }
     }
 
     private fun handleValue(characteristic: BluetoothGattCharacteristic, value: ByteArray) {
         when (characteristic.uuid) {
-            CHALLENGE_UUID -> {
+            profile.challengeUuid -> {
                 nonce = value.copyOf()
-                if (!ready && !authInFlight && descriptorStage == 3) authenticate()
+                if (!ready && !authInFlight && !otaInFlight && descriptorStage == 4) authenticate()
                 listener.onReadyChanged(ready && value.isNotEmpty())
             }
-            STATUS_UUID -> handleStatus(String(value, StandardCharsets.UTF_8))
+            profile.statusUuid -> handleStatus(String(value, StandardCharsets.UTF_8))
+            profile.otaStatusUuid -> handleOtaStatus(String(value, StandardCharsets.UTF_8))
         }
     }
 
@@ -238,15 +302,26 @@ class BleCarKeyClient(
                 directFailures = 0
                 awaitingScanFallback = false
                 listener.onState(State.CONNECTED, "Authenticated")
-                listener.onReadyChanged(nonce != null)
+                if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE) readChallenge()
+                else listener.onReadyChanged(nonce != null)
             }
             value == "OK:PRESSED" && pressInFlight -> {
                 finishPress()
                 listener.onCommandResult(true, "Pressed")
+                if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE) readChallenge()
             }
             value == "OK:PRESSED" -> listener.onDiagnostic("Ignoring stale press confirmation")
-            value == "OK:PSK_UPDATED" -> listener.onCommandResult(true, "PSK updated on device")
-            value == "WARN:PSK_VOLATILE" -> listener.onCommandResult(true, "PSK updated, but not saved to flash")
+            value == "OK:PSK_UPDATED" && pskUpdateInFlight -> {
+                pendingNewPsk?.let { psk = it }
+                finishPskUpdate(true, "PSK updated on phone and car")
+                readChallenge()
+            }
+            value == "WARN:PSK_VOLATILE" && pskUpdateInFlight -> {
+                pendingNewPsk?.let { psk = it }
+                finishPskUpdate(false, "Car could not save the PSK; power-cycle the car ESP and try again")
+            }
+            value.startsWith("ERR:PSK_") && pskUpdateInFlight ->
+                finishPskUpdate(false, "Car rejected the PSK update ($value)")
             value == "ERR:AUTH" && !ready -> {
                 authInFlight = false
                 authGeneration++
@@ -256,11 +331,13 @@ class BleCarKeyClient(
                 finishPress()
                 listener.onDiagnostic("Remote button press failed: device busy")
                 listener.onCommandResult(false, "Command failed")
+                if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE) readChallenge()
             }
             value.startsWith("ERR:") && pressInFlight -> {
                 finishPress()
                 listener.onDiagnostic("Remote button press failed: $value")
                 listener.onCommandResult(false, "Command failed")
+                if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE) readChallenge()
             }
             value.startsWith("ERR:") -> listener.onDiagnostic("Ignoring status with no command in flight: $value")
         }
@@ -273,7 +350,7 @@ class BleCarKeyClient(
         val generation = ++authGeneration
         listener.onDiagnostic("Sending authentication challenge response, attempt $authAttempts")
         listener.onState(State.CONNECTING, "Authenticating…")
-        write(command ?: return, CarKeyProtocol.command(CarKeyProtocol.AUTH_COMMAND, current, psk))
+        write(command ?: return, CarKeyProtocol.command(profile, CarKeyProtocol.AUTH_COMMAND, current, psk))
         nonce = null
         handler.postDelayed({
             if (authInFlight && !ready && generation == authGeneration) {
@@ -290,7 +367,7 @@ class BleCarKeyClient(
         listener.onDiagnostic("Sending authenticated button-press command")
         pressInFlight = true
         val generation = ++pressGeneration
-        write(commandCharacteristic, CarKeyProtocol.command(CarKeyProtocol.PRESS_COMMAND, current, psk))
+        write(commandCharacteristic, CarKeyProtocol.command(profile, CarKeyProtocol.PRESS_COMMAND, current, psk))
         nonce = null
         listener.onReadyChanged(false)
         handler.postDelayed({
@@ -302,6 +379,82 @@ class BleCarKeyClient(
         }, 2_500)
     }
 
+    fun startOta(image: ByteArray) {
+        val current = nonce ?: return listener.onOtaResult(false, "No fresh challenge for firmware update")
+        val control = otaControl
+        if (control == null || otaData == null || otaStatus == null) {
+            return listener.onOtaResult(false, "Car needs the one-time USB OTA bootstrap firmware first")
+        }
+        if (image.isEmpty() || image.size > 0x1e0000) {
+            return listener.onOtaResult(false, "Firmware image size is invalid")
+        }
+        val digest = MessageDigest.getInstance("SHA-256").digest(image)
+        otaImage = image
+        otaOffset = 0
+        otaLastChunkSize = 0
+        otaInFlight = true
+        otaWaitingForReady = true
+        ready = false
+        listener.onReadyChanged(false)
+        listener.onDiagnostic("Starting authenticated BLE OTA (${image.size} bytes)")
+        write(control, CarKeyProtocol.otaStart(image.size, digest, current, psk))
+        nonce = null
+        handler.postDelayed({
+            if (otaInFlight && otaWaitingForReady) finishOta(false, "Car did not accept the firmware update")
+        }, 5_000)
+    }
+
+    private fun handleOtaStatus(value: String) {
+        listener.onDiagnostic("OTA status: $value")
+        when {
+            value == "OTA:READY" && otaInFlight -> {
+                otaWaitingForReady = false
+                listener.onOtaProgress(0, otaImage?.size ?: 0)
+                sendNextOtaChunk()
+            }
+            value == "OTA:OK" && otaInFlight -> finishOta(true, "Firmware updated; car ESP is restarting")
+            value.startsWith("ERR:OTA_") && otaInFlight -> finishOta(false, otaErrorMessage(value))
+        }
+    }
+
+    private fun otaErrorMessage(status: String): String = when (status) {
+        "ERR:OTA_AUTH" -> "Firmware update authentication failed"
+        "ERR:OTA_BUSY" -> "Another phone is already updating the car"
+        "ERR:OTA_SIZE" -> "Firmware image does not fit the OTA partition"
+        "ERR:OTA_DIGEST" -> "Firmware was corrupted during transfer"
+        "ERR:OTA_IMAGE" -> "Firmware signature or image validation failed"
+        else -> "Car rejected firmware update ($status)"
+    }
+
+    private fun sendNextOtaChunk() {
+        if (!otaInFlight || otaWaitingForReady) return
+        val image = otaImage ?: return finishOta(false, "Firmware data was lost")
+        if (otaOffset >= image.size) {
+            listener.onDiagnostic("Firmware transfer complete; requesting signed-image validation")
+            write(otaControl ?: return finishOta(false, "OTA control characteristic disappeared"), byteArrayOf(0x02))
+            return
+        }
+
+        /* 176 data bytes + 4 offset bytes fits the firmware's preferred
+         * 185-byte MTU, even when Android's 517-byte request is reduced. */
+        val count = minOf(176, image.size - otaOffset)
+        val payload = ByteBuffer.allocate(4 + count).order(ByteOrder.LITTLE_ENDIAN)
+            .putInt(otaOffset)
+            .put(image, otaOffset, count)
+            .array()
+        otaLastChunkSize = count
+        write(otaData ?: return finishOta(false, "OTA data characteristic disappeared"), payload)
+    }
+
+    private fun finishOta(success: Boolean, message: String) {
+        if (!otaInFlight) return
+        otaInFlight = false
+        otaWaitingForReady = false
+        otaImage = null
+        otaLastChunkSize = 0
+        listener.onOtaResult(success, message)
+    }
+
     private fun finishPress() {
         pressInFlight = false
         pressGeneration++
@@ -310,11 +463,27 @@ class BleCarKeyClient(
     fun updatePsk(newPsk: String): Boolean {
         val current = nonce ?: return false
         val characteristic = pskUpdate ?: return false
-        write(characteristic, CarKeyProtocol.pskUpdate(current, psk, newPsk))
+        pendingNewPsk = newPsk
+        pskUpdateInFlight = true
+        val generation = ++pskUpdateGeneration
+        listener.onDiagnostic("Sending authenticated car PSK update")
+        write(characteristic, CarKeyProtocol.pskUpdate(profile, current, psk, newPsk))
         nonce = null
-        psk = newPsk
         listener.onReadyChanged(false)
+        handler.postDelayed({
+            if (pskUpdateInFlight && generation == pskUpdateGeneration) {
+                finishPskUpdate(false, "Car PSK update timed out")
+            }
+        }, 3_500)
         return true
+    }
+
+    private fun finishPskUpdate(success: Boolean, message: String) {
+        if (!pskUpdateInFlight) return
+        pskUpdateInFlight = false
+        pskUpdateGeneration++
+        pendingNewPsk = null
+        listener.onPskUpdateResult(success, message)
     }
 
     @SuppressLint("MissingPermission")
@@ -377,11 +546,22 @@ class BleCarKeyClient(
         command = null
         status = null
         pskUpdate = null
+        otaControl = null
+        otaData = null
+        otaStatus = null
         nonce = null
         ready = false
         authAttempts = 0
         descriptorStage = 0
         authInFlight = false
         authGeneration++
+        pendingNewPsk = null
+        pskUpdateInFlight = false
+        pskUpdateGeneration++
+        otaImage = null
+        otaInFlight = false
+        otaWaitingForReady = false
+        otaOffset = 0
+        otaLastChunkSize = 0
     }
 }

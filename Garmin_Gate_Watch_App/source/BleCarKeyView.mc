@@ -25,7 +25,7 @@ class BleCarKeyView extends WatchUi.View {
 
         // Title stays within the full-width portion of round displays.
         dc.setColor(Graphics.COLOR_WHITE, Graphics.COLOR_TRANSPARENT);
-        dc.drawText(centerX, h * 0.13, Graphics.FONT_SMALL, "BLE Car Key",
+        dc.drawText(centerX, h * 0.13, Graphics.FONT_SMALL, "BLE Gate Key",
                     Graphics.TEXT_JUSTIFY_CENTER);
 
         // 2. Connection status indicator (The Dot)

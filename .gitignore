@@ -14,6 +14,11 @@ Desktop.ini
 # Build outputs
 **/build/
 **/.pio/
+ESP32-C3_Firmware/secure_boot_signing_key.pem
+garmin_developer_key.der
 Garmin_Watch_App/bin/
+Garmin_Gate_Watch_App/bin/
 ESP32-C3_Firmware/sdkconfig.*
 deployment/
+**/release-builds/
+Native_Android_Application/signing/
