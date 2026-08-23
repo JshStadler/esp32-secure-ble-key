@@ -61,7 +61,11 @@ jobs:
           CAR_KEY_STORE_PASSWORD: ${{ secrets.CAR_KEY_STORE_PASSWORD }}
           CAR_KEY_KEY_ALIAS: ${{ secrets.CAR_KEY_KEY_ALIAS }}
           CAR_KEY_KEY_PASSWORD: ${{ secrets.CAR_KEY_KEY_PASSWORD }}
+      - name: Set artifact name
+        id: artifact
+        shell: bash
+        run: echo "name=Car-Key-${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
         with:
-          name: Car-Key-${{ github.ref_name }}
+          name: ${{ steps.artifact.outputs.name }}
           path: Native_Android_Application/app/build/outputs/apk/release/app-release.apk

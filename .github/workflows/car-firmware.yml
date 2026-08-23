@@ -31,9 +31,13 @@ jobs:
       - name: Remove restored signing key
         if: always()
         run: rm -f secure_boot_signing_key.pem
+      - name: Set artifact name
+        id: artifact
+        shell: bash
+        run: echo "name=BLE-Car-Key-firmware-${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
         with:
-          name: BLE-Car-Key-firmware-${{ github.ref_name }}
+          name: ${{ steps.artifact.outputs.name }}
           path: |
             ESP32-C3_Firmware/.pio/build/esp32c3/firmware.bin
             ESP32-C3_Firmware/.pio/build/esp32c3/bootloader.bin
