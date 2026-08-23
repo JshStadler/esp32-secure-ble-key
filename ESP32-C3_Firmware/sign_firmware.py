@@ -11,6 +11,7 @@ from pathlib import Path
 import os
 import re
 import shutil
+import site
 import subprocess
 
 Import("env")  # type: ignore[name-defined]  # supplied by PlatformIO/SCons
@@ -42,6 +43,14 @@ def sign_exported_firmware(source, target, env):
     platformio_sites.extend((core_penv / "lib").glob("python*/site-packages"))
     python_paths = [esptool_dir, esptool_dir / "_contrib"]
     python_paths.extend(path for path in platformio_sites if path.is_dir())
+    # A pip-installed PlatformIO (as used by GitHub Actions) keeps pyserial in
+    # the Python environment running SCons rather than under PROJECT_CORE_DIR.
+    # Include those site directories as well so the isolated ESP-IDF Python can
+    # import all of esptool's runtime dependencies on either installation type.
+    python_paths.extend(Path(path) for path in site.getsitepackages())
+    user_site = site.getusersitepackages()
+    if user_site:
+        python_paths.append(Path(user_site))
     if process_env.get("PYTHONPATH"):
         python_paths.extend(Path(path) for path in process_env["PYTHONPATH"].split(os.pathsep) if path)
     process_env["PYTHONPATH"] = os.pathsep.join(str(path) for path in python_paths)
