@@ -848,7 +848,7 @@ class MainActivity : FragmentActivity() {
                             newName.isEmpty() -> name.error = "Name is required"
                             newAddress == null && profiles.any { it.id != profile.id && it.type == profile.type } -> configuredAddress.error = "Address is required while another device uses this firmware type"
                             newAddress != null && !newAddress.matches(Regex("[0-9A-F]{2}(:[0-9A-F]{2}){5}")) -> configuredAddress.error = "Use AA:BB:CC:DD:EE:FF"
-                            profiles.any { it.id != profile.id && it.defaultAddress == newAddress } -> configuredAddress.error = "That address is already configured"
+                            newAddress != null && profiles.any { it.id != profile.id && it.defaultAddress == newAddress } -> configuredAddress.error = "That address is already configured"
                             else -> {
                                 runtime.preferCached = cachedSwitch.isChecked
                                 store.put(profile.preferCachedStoreKey, runtime.preferCached.toString())
@@ -878,13 +878,14 @@ class MainActivity : FragmentActivity() {
     private fun showPskEditor(profile: BleDeviceProfile, recovery: Boolean, onSaved: () -> Unit = {}) {
         val runtime = runtimes.getValue(profile.id)
         val appOnly = !profile.supportsRemotePskUpdate
+        val initialSetup = runtime.psk.isEmpty()
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24), dp(8), dp(24), dp(12))
         }
         val current = if (!appOnly && !recovery && runtime.psk.isNotEmpty()) pskInput("Existing PSK") else null
-        val next = pskInput("New PSK")
-        val confirm = pskInput("Confirm new PSK")
+        val next = pskInput(if (initialSetup) "PSK" else "New PSK")
+        val confirm = if (initialSetup) null else pskInput("Confirm new PSK")
         layout.addView(text(when {
             appOnly -> "This changes only the encrypted PSK saved on this app. It does not update the ESPHome device or its secrets."
             recovery -> "This replaces only the encrypted PSK saved on this app. Use it when the ESP was changed elsewhere or the old PSK is unavailable."
@@ -894,11 +895,11 @@ class MainActivity : FragmentActivity() {
         }, 13f, false).apply { setTextColor(Color.rgb(184, 186, 198)) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
         current?.let { layout.addView(it, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) }) }
         layout.addView(next, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
-        layout.addView(confirm, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+        confirm?.let { layout.addView(it, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) }) }
         layout.addView(primaryButton("Generate secure 32-character PSK") {
             val generated = DevicePskGenerator.generate()
             next.setText(generated)
-            confirm.setText(generated)
+            confirm?.setText(generated)
             showGeneratedPsk(generated)
         }, LinearLayout.LayoutParams(-1, dp(48)))
 
@@ -918,7 +919,7 @@ class MainActivity : FragmentActivity() {
                         when {
                             current != null && current.text.toString().trim() != runtime.psk -> current.error = "Existing PSK is incorrect"
                             value.isEmpty() -> next.error = "PSK is required"
-                            value != confirm.text.toString().trim() -> confirm.error = "PSKs do not match"
+                            confirm != null && value != confirm.text.toString().trim() -> confirm.error = "PSKs do not match"
                             else -> {
                                 dialog.dismiss()
                                 if (!recovery && runtime.psk.isNotEmpty() && profile.supportsRemotePskUpdate) {
@@ -1108,7 +1109,7 @@ class MainActivity : FragmentActivity() {
         }
         AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
             .setTitle("Save this PSK now")
-            .setMessage("This is the only time BLE Key will display or offer to copy this generated PSK. It remains masked after this dialog closes. Tap Save in device settings to apply it.")
+            .setMessage("This is the only time BLE Key will display or offer to copy this generated PSK. It remains masked after this dialog closes. Return to the PSK dialog and tap Save to apply it.")
             .setView(value)
             .setNegativeButton("Done", null)
             .setPositiveButton("Copy PSK") { _, _ ->
@@ -1119,7 +1120,7 @@ class MainActivity : FragmentActivity() {
                     }
                 }
                 getSystemService(ClipboardManager::class.java).setPrimaryClip(clip)
-                Toast.makeText(this, "PSK copied. Store it securely, then tap Save.", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "PSK copied. Store it securely, then save the PSK dialog.", Toast.LENGTH_LONG).show()
             }
             .show()
     }

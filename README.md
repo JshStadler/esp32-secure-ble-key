@@ -87,7 +87,8 @@ Achieved through ESP-IDF features unavailable in the Arduino framework:
 - `CONFIG_PM_ENABLE` + `CONFIG_FREERTOS_USE_TICKLESS_IDLE`
 - Dynamic frequency scaling between 10 MHz and 80 MHz
 - Wi-Fi stack stripped from the build (saves ~100 KB flash, ~40 KB RAM)
-- USB-CDC console disabled in production
+- Application USB Serial/JTAG controller and both console routes disabled in
+  production; ROM USB recovery remains available
 - Button GPIO held in high-impedance idle (zero quiescent current)
 - Periodic restart every 3 hours when idle (state hygiene, while no device connected)
 - Hard restart after 24 hours regardless of state
@@ -137,7 +138,10 @@ Wire GPIO 5 to the **other leg** (the encoder input side).
    ```
    pio run -e esp32c3 -t upload
    ```
-5. Production builds disable the serial console for power savings. To enable logging during development, see `BUILD_NOTES.md` for the debug build steps.
+5. Production builds disable the application USB Serial/JTAG controller and
+   serial console for minor power savings while preserving ROM USB recovery.
+   To enable logging during development, see `BUILD_NOTES.md` for the debug
+   build steps.
 
 The first upgrade from the original single-app layout to signed BLE OTA needs
 four USB-flashed binaries at specific offsets while preserving NVS. See

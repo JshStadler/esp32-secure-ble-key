@@ -73,12 +73,16 @@ To enable serial logging during development:
 1. In `main.c`, uncomment `#define DEBUG`
 2. In `platformio.ini`, uncomment `build_flags = -DDEBUG`
 3. In `sdkconfig.defaults`, change:
+   - `# CONFIG_USJ_ENABLE_USB_SERIAL_JTAG is not set` →
+     `CONFIG_USJ_ENABLE_USB_SERIAL_JTAG=y`
    - `CONFIG_ESP_CONSOLE_NONE=y` → `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`
    - `CONFIG_LOG_DEFAULT_LEVEL_NONE=y` → `CONFIG_LOG_DEFAULT_LEVEL_INFO=y`
    - Remove `CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=y` and add
      `CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y`
    - `CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y` → `CONFIG_BOOTLOADER_LOG_LEVEL_INFO=y`
-4. **Delete `sdkconfig.esp32c3`** so it regenerates from defaults.
+4. **Delete `sdkconfig.esp32c3`** so it regenerates from defaults. Do not burn
+   USB/JTAG-disabling eFuses; the production setting only disables the runtime
+   controller and always preserves ROM USB recovery.
 5. Rebuild: `pio run -e esp32c3`
 
 ## NVS compatibility

@@ -74,13 +74,14 @@ static const char *TAG = "CAR_UNLOCK";
 /* ============================================================
  * Debug toggle
  * ============================================================
- * Define DEBUG to enable ESP_LOG output and keep USB console
- * active. Undefine for production (console disabled via
- * CONFIG_ESP_CONSOLE_NONE in sdkconfig.defaults).
+ * Define DEBUG to enable ESP_LOG output and a USB console. Undefine for
+ * production (both console routes and the application USB Serial/JTAG
+ * controller are disabled via sdkconfig.defaults).
  *
  * To enable: add -DDEBUG to build_flags in platformio.ini,
- * and override CONFIG_ESP_CONSOLE_NONE -> CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
- * and CONFIG_LOG_DEFAULT_LEVEL -> 3 in sdkconfig.defaults.
+ * enable CONFIG_USJ_ENABLE_USB_SERIAL_JTAG, override CONFIG_ESP_CONSOLE_NONE
+ * -> CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG, and set
+ * CONFIG_LOG_DEFAULT_LEVEL -> 3 in sdkconfig.defaults.
  */
 /* #define DEBUG */
 

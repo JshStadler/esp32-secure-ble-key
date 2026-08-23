@@ -81,9 +81,13 @@ CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=y
 CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
 
 # ---- USB Console ----
-# Disable USB-CDC console in production to save power.
-# The ROM bootloader always re-enables USB for flashing.
+# Disable both console routes and the application USB Serial/JTAG controller in
+# production. The ROM bootloader still provides USB flashing/recovery while the
+# BOOT strap is held; no USB/JTAG-disabling eFuses are burned.
 CONFIG_ESP_CONSOLE_NONE=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+# CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG is not set
+# CONFIG_USJ_ENABLE_USB_SERIAL_JTAG is not set
 
 # ---- OTA partitioning and update safety ----
 CONFIG_PARTITION_TABLE_CUSTOM=y
