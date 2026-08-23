@@ -170,7 +170,7 @@ authentication by default. Use **App Settings → Require device authentication*
 to disable the launch gate during periods of frequent use. PSK changes remain
 protected by device authentication even when the main app gate is disabled.
 
-**App Settings → Use cached device address** enables an optional lower-latency
+**Device Settings → Use cached device address** enables an optional lower-latency
 direct connection. After three failed cached attempts the app offers a persistent
 scan fallback, while continuing cached retries until that fallback is selected.
 
@@ -179,6 +179,12 @@ operation history, and optional location pins for the latest 30 foreground
 sessions. Location recording is opt-in per device, allowing the mobile car to
 record locations while leaving a fixed gate disabled, and does not affect BLE
 operation.
+
+The dashboard starts with Car and Gate cards, but cards can be renamed, removed,
+or extended with additional Standalone or ESPHome devices. Each card keeps its
+own encrypted PSK, BLE address, history filter, and location preference. The
+Gate card displays authenticated live controller state, while Standalone car
+firmware can be updated in-app using signed BLE OTA images.
 
 <img width="360" height="746" alt="image" src="https://github.com/user-attachments/assets/c017401e-025e-4bce-90b5-59f338a4a504" />
 

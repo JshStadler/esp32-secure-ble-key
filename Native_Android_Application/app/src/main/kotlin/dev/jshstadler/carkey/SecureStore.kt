@@ -48,4 +48,8 @@ class SecureStore(context: Context) {
     } catch (_: Exception) {
         null
     }
+
+    fun remove(name: String) {
+        prefs.edit().remove(name).apply()
+    }
 }

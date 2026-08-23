@@ -1,14 +1,17 @@
 package dev.jshstadler.carkey
 
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.UUID
 
 enum class BleResponseMode { NOTIFICATIONS, READ_AFTER_WRITE }
+enum class BleDeviceType { CAR, ESPHOME_ACCESS }
 
-/** BLE identity, protocol, and UI metadata for one configured key device. */
+/** BLE identity, protocol, capabilities, and user-facing metadata for one card. */
 data class BleDeviceProfile(
     val id: String,
+    val type: BleDeviceType,
     val displayName: String,
-    val actionLabel: String,
     val advertisedName: String,
     val defaultAddress: String?,
     val securityBinding: String,
@@ -22,65 +25,87 @@ data class BleDeviceProfile(
     val otaControlUuid: UUID,
     val otaDataUuid: UUID,
     val otaStatusUuid: UUID,
+    val deviceStateUuid: UUID,
 ) {
-    val pskStoreKey: String get() = "device_${id}_psk"
-    val addressStoreKey: String get() = "device_${id}_address"
-    val preferCachedStoreKey: String get() = "device_${id}_prefer_cached"
-    val recordLocationStoreKey: String get() = "device_${id}_record_location"
+    val supportsRemotePskUpdate get() = type == BleDeviceType.CAR
+    val supportsBleOta get() = type == BleDeviceType.CAR
+    val supportsLiveState get() = type == BleDeviceType.ESPHOME_ACCESS
+    val actionLabel get() = "Press"
+    val pskStoreKey get() = "device_${id}_psk"
+    val addressStoreKey get() = "device_${id}_address"
+    val preferCachedStoreKey get() = "device_${id}_prefer_cached"
+    val recordLocationStoreKey get() = "device_${id}_record_location"
 }
 
 object BleDeviceProfiles {
-    val CAR = profile(
-        id = "car",
-        displayName = "Car",
-        actionLabel = "Press Car Remote",
-        advertisedName = "BLE-Device",
-        defaultAddress = null,
-        securityBinding = "car-main",
-        responseMode = BleResponseMode.NOTIFICATIONS,
-        uuidPrefix = "a1b2c3d4",
-    )
+    val CAR = create(BleDeviceType.CAR, "car", "Car")
+    val GATE = create(BleDeviceType.ESPHOME_ACCESS, "gate", "Gate")
+    val defaults get() = listOf(CAR, GATE)
 
-    val GATE = profile(
-        id = "gate",
-        displayName = "Gate",
-        actionLabel = "Press Gate Remote",
-        advertisedName = "centurion-d5-evo",
-        defaultAddress = null,
-        securityBinding = "gate-main",
-        responseMode = BleResponseMode.READ_AFTER_WRITE,
-        uuidPrefix = "b1b2c3d4",
-    )
+    fun create(
+        type: BleDeviceType,
+        id: String = UUID.randomUUID().toString(),
+        displayName: String = if (type == BleDeviceType.CAR) "Car" else "Access Device",
+        targetAddress: String? = null,
+    ): BleDeviceProfile {
+        val car = type == BleDeviceType.CAR
+        val prefix = if (car) "a1b2c3d4" else "b1b2c3d4"
+        return BleDeviceProfile(
+            id = id,
+            type = type,
+            displayName = displayName,
+            advertisedName = if (car) "BLE-Device" else "centurion-d5-evo",
+            defaultAddress = targetAddress?.trim()?.uppercase()?.ifEmpty { null },
+            securityBinding = if (car) "car-main" else "gate-main",
+            responseMode = if (car) BleResponseMode.NOTIFICATIONS else BleResponseMode.READ_AFTER_WRITE,
+            serviceUuid = uuid(prefix, "90"),
+            challengeUuid = uuid(prefix, "91"),
+            commandUuid = uuid(prefix, "92"),
+            statusUuid = uuid(prefix, "93"),
+            pskUpdateUuid = uuid(prefix, "94"),
+            identityUuid = uuid(prefix, "97"),
+            otaControlUuid = uuid(prefix, "98"),
+            otaDataUuid = uuid(prefix, "99"),
+            otaStatusUuid = uuid(prefix, "9a"),
+            deviceStateUuid = uuid(prefix, "9b"),
+        )
+    }
 
-    val configured = listOf(CAR, GATE)
+    private fun uuid(prefix: String, suffix: String) =
+        UUID.fromString("$prefix-e5f6-7890-abcd-ef12345678$suffix")
+}
 
-    fun byId(id: String): BleDeviceProfile? = configured.firstOrNull { it.id == id }
+/** Encrypted ordered card list. PSKs remain in their own encrypted entries. */
+class DeviceProfileRepository(private val store: SecureStore) {
+    companion object { private const val KEY = "device_profiles_v1" }
 
-    private fun profile(
-        id: String,
-        displayName: String,
-        actionLabel: String,
-        advertisedName: String,
-        defaultAddress: String?,
-        securityBinding: String,
-        responseMode: BleResponseMode,
-        uuidPrefix: String,
-    ) = BleDeviceProfile(
-        id = id,
-        displayName = displayName,
-        actionLabel = actionLabel,
-        advertisedName = advertisedName,
-        defaultAddress = defaultAddress,
-        securityBinding = securityBinding,
-        responseMode = responseMode,
-        serviceUuid = UUID.fromString("$uuidPrefix-e5f6-7890-abcd-ef1234567890"),
-        challengeUuid = UUID.fromString("$uuidPrefix-e5f6-7890-abcd-ef1234567891"),
-        commandUuid = UUID.fromString("$uuidPrefix-e5f6-7890-abcd-ef1234567892"),
-        statusUuid = UUID.fromString("$uuidPrefix-e5f6-7890-abcd-ef1234567893"),
-        pskUpdateUuid = UUID.fromString("$uuidPrefix-e5f6-7890-abcd-ef1234567894"),
-        identityUuid = UUID.fromString("$uuidPrefix-e5f6-7890-abcd-ef1234567897"),
-        otaControlUuid = UUID.fromString("$uuidPrefix-e5f6-7890-abcd-ef1234567898"),
-        otaDataUuid = UUID.fromString("$uuidPrefix-e5f6-7890-abcd-ef1234567899"),
-        otaStatusUuid = UUID.fromString("$uuidPrefix-e5f6-7890-abcd-ef123456789a"),
-    )
+    fun load(): MutableList<BleDeviceProfile> {
+        val saved = store.get(KEY)
+        if (saved == null) return BleDeviceProfiles.defaults.toMutableList().also(::save)
+        return runCatching {
+            val array = JSONArray(saved)
+            MutableList(array.length()) { index ->
+                val item = array.getJSONObject(index)
+                BleDeviceProfiles.create(
+                    type = BleDeviceType.valueOf(item.getString("type")),
+                    id = item.getString("id"),
+                    displayName = item.getString("name"),
+                    targetAddress = item.optString("address").ifEmpty { null },
+                )
+            }
+        }.getOrElse { BleDeviceProfiles.defaults.toMutableList().also(::save) }
+    }
+
+    fun save(profiles: List<BleDeviceProfile>) {
+        val array = JSONArray()
+        profiles.forEach { profile ->
+            array.put(JSONObject().apply {
+                put("id", profile.id)
+                put("type", profile.type.name)
+                put("name", profile.displayName)
+                put("address", profile.defaultAddress ?: "")
+            })
+        }
+        store.put(KEY, array.toString())
+    }
 }

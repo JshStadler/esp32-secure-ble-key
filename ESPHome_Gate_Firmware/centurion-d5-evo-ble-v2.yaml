@@ -2,7 +2,7 @@ substitutions:
   name: "centurion-d5-evo"
   friendly_name: "Centurion D5 Evo"
   comment: "Control Centurion D5 Evo gate motor remotely. Including Kocom bell ringing"
-  gate_ble_build: "gate-ble-v2.6.0-5key-pulse-decoder-production"
+  gate_ble_build: "gate-ble-v2.7.0-authenticated-live-state-production"
 
   # Gate LED pulse-meter decoder tuning. pulse_meter captures rising edges
   # in its ISR path; the shared binary sensor is only used to determine the
@@ -71,6 +71,23 @@ esphome:
                 }
               }
               id(gate_ble_status).set_value("ERR:NO_SESSION");
+            });
+            id(gate_ble_device_state).on_read([](uint16_t conn_id) {
+              for (size_t slot = 0; slot < id(gate_ble_conn_ids).size(); ++slot) {
+                if (id(gate_ble_conn_ids)[slot] != conn_id) continue;
+                if (!id(gate_ble_authenticated)[slot]) {
+                  id(gate_ble_device_state).set_value("ERR:AUTH_REQUIRED");
+                  return;
+                }
+                static const std::array<const char *, 8> states{{
+                  "Unknown", "Closed", "Open", "Opening", "Closing",
+                  "Pillar override", "No mains", "Low battery"
+                }};
+                const uint8_t state = id(gate_decoder_state);
+                id(gate_ble_device_state).set_value(states[state < states.size() ? state : 0]);
+                return;
+              }
+              id(gate_ble_device_state).set_value("ERR:NO_SESSION");
             });
             ESP_LOGW("gate_ble", "BUILD ${gate_ble_build}: API v2 ready; max BLE clients = 5");
         - delay: 1s
@@ -153,6 +170,10 @@ globals:
     type: 'std::array<std::string, 5>'
     restore_value: false
     initial_value: '{"READY", "READY", "READY", "READY", "READY"}'
+  - id: gate_ble_authenticated
+    type: 'std::array<bool, 5>'
+    restore_value: false
+    initial_value: '{false, false, false, false, false}'
   - id: gate_ble_split_hmac_part1
     type: 'std::array<std::array<uint8_t, 16>, 5>'
     restore_value: false
@@ -233,6 +254,7 @@ esp32_ble_server:
           memcpy(id(gate_ble_nonces)[slot].data() + offset, &random, 4);
         }
         id(gate_ble_split_pending)[slot] = false;
+        id(gate_ble_authenticated)[slot] = false;
         id(gate_ble_statuses)[slot] = "READY";
         ESP_LOGW("gate_ble", "BLE EVENT: client %u connected in session slot %d",
                  static_cast<unsigned>(id), slot);
@@ -242,6 +264,7 @@ esp32_ble_server:
           if (id(gate_ble_conn_ids)[slot] == id) {
             id(gate_ble_conn_ids)[slot] = 65535;
             id(gate_ble_split_pending)[slot] = false;
+            id(gate_ble_authenticated)[slot] = false;
             id(gate_ble_nonces)[slot].fill(0);
             id(gate_ble_statuses)[slot] = "READY";
             ESP_LOGW("gate_ble", "BLE EVENT: client %u disconnected from session slot %u",
@@ -267,6 +290,15 @@ esp32_ble_server:
           read: true
           value:
             data: "READY"
+            type: string
+
+        # Current decoded gate state. Reads are connection-specific and return
+        # data only after that BLE session has completed API-v2 authentication.
+        - id: gate_ble_device_state
+          uuid: b1b2c3d4-e5f6-7890-abcd-ef123456789b
+          read: true
+          value:
+            data: "ERR:AUTH_REQUIRED"
             type: string
 
         # Android path: command byte followed by a 32-byte HMAC-SHA256.
@@ -368,11 +400,14 @@ esp32_ble_server:
                     ESP_LOGW("gate_ble", "Android authentication failed for client %u",
                              static_cast<unsigned>(id));
                     id(gate_ble_statuses)[slot] = "ERR:AUTH";
+                    id(gate_ble_authenticated)[slot] = false;
                   } else if (command == 0x01) {
+                    id(gate_ble_authenticated)[slot] = true;
                     ESP_LOGI("gate_ble", "Android client %u authenticated as %s",
                              static_cast<unsigned>(id), key_names[matched_key].c_str());
                     id(gate_ble_statuses)[slot] = "OK:AUTH";
                   } else {
+                    id(gate_ble_authenticated)[slot] = true;
                     const uint32_t current_ms = millis();
                     if (id(gate_ble_has_pressed) &&
                         current_ms - id(gate_ble_last_press_ms) < 1000) {
@@ -529,11 +564,14 @@ esp32_ble_server:
                     ESP_LOGW("gate_ble", "Garmin authentication failed for client %u",
                              static_cast<unsigned>(id));
                     id(gate_ble_statuses)[slot] = "ERR:AUTH";
+                    id(gate_ble_authenticated)[slot] = false;
                   } else if (command == 0x01) {
+                    id(gate_ble_authenticated)[slot] = true;
                     ESP_LOGI("gate_ble", "Garmin client %u authenticated as %s",
                              static_cast<unsigned>(id), key_names[matched_key].c_str());
                     id(gate_ble_statuses)[slot] = "OK:AUTH";
                   } else {
+                    id(gate_ble_authenticated)[slot] = true;
                     const uint32_t current_ms = millis();
                     if (id(gate_ble_has_pressed) &&
                         current_ms - id(gate_ble_last_press_ms) < 1000) {
@@ -557,7 +595,7 @@ esp32_ble_server:
           uuid: b1b2c3d4-e5f6-7890-abcd-ef1234567897
           read: true
           value:
-            data: "blekey|2|gate-main|gate|press"
+            data: "blekey|2|gate-main|gate|press,state"
             type: string
 
 event:

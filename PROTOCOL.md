@@ -36,3 +36,10 @@ Current service families:
 
 - Car API v2: `a1b2c3d4-e5f6-7890-abcd-ef1234567890`
 - Gate API v2: `b1b2c3d4-e5f6-7890-abcd-ef1234567890`
+
+Gate API v2 also exposes the decoded controller state on read-only
+characteristic `b1b2c3d4-e5f6-7890-abcd-ef123456789b`. It returns
+`ERR:AUTH_REQUIRED` until command `0x01` or `0x02` has authenticated that BLE
+connection. State is therefore not broadcast publicly; an authenticated app
+may poll it while connected. Current values are `Unknown`, `Closed`, `Open`,
+`Opening`, `Closing`, `Pillar override`, `No mains`, and `Low battery`.

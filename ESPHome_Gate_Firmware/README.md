@@ -13,8 +13,8 @@ BLEKEY-V2 || 0x00 || gate-main || 0x00 || command || nonce
 ```
 
 The command and stable `gate-main` identity are therefore covered by the HMAC.
-The Android BLE Key app is hybrid: Gate uses v2 while Car remains on v1 until
-its ESP32-C3 firmware is upgraded. Garmin uses separate Car-v1 and Gate-v2 apps.
+The Android BLE Key app and current car firmware both use API v2. Garmin uses
+separate Car and Gate apps so each watch app keeps one clear target and PSK.
 
 ## Current limitations
 
@@ -60,7 +60,7 @@ The production configuration preserves the installed controller identity
 spare-board BLE indicator on GPIO2 has been removed, so the YAML is a drop-in
 replacement for the existing gate controller wiring.
 
-After boot, logs must show `gate-ble-v2.6.0-5key-pulse-decoder-production` and
+After boot, logs must show `gate-ble-v2.7.0-authenticated-live-state-production` and
 `max BLE clients = 5`. The same build string is exposed as the diagnostic
 `BLE Firmware Build` text sensor. If either still says one client, clean the
 ESPHome build files before installing again.
@@ -76,6 +76,12 @@ Open/Closed state. Opening and Closing require consecutive samples, and the
 more specific No Mains and Low Battery sequences are evaluated before the
 broader motion/pillar ranges. Decoder thresholds are substitutions at the top
 of the YAML so they can be tuned from real diagnostic pulse-rate logs.
+
+The same decoded state is available to the Android app through read-only API-v2
+characteristic `b1b2c3d4-e5f6-7890-abcd-ef123456789b`. It is not placed in the
+public advertisement: each BLE session must first authenticate successfully.
+The app reads it while connected and shows Open, Closed, Opening, Closing, or
+the relevant controller warning on that device card.
 
 ## Legacy v1 rollback files
 

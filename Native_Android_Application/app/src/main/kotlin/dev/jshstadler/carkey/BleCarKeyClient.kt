@@ -24,6 +24,7 @@ class BleCarKeyClient(
         fun onState(state: State, message: String)
         fun onReadyChanged(ready: Boolean)
         fun onDeviceAddress(address: String)
+        fun onDeviceState(state: String)
         fun onCommandResult(success: Boolean, message: String)
         fun onPskUpdateResult(success: Boolean, message: String)
         fun onDiagnostic(message: String)
@@ -46,6 +47,7 @@ class BleCarKeyClient(
     private var otaControl: BluetoothGattCharacteristic? = null
     private var otaData: BluetoothGattCharacteristic? = null
     private var otaStatus: BluetoothGattCharacteristic? = null
+    private var deviceState: BluetoothGattCharacteristic? = null
     private var nonce: ByteArray? = null
     private var psk = ""
     private var ready = false
@@ -69,8 +71,37 @@ class BleCarKeyClient(
     private var otaLastChunkSize = 0
     private var otaInFlight = false
     private var otaWaitingForReady = false
+    private var otaStartWritePending = false
+    private var otaStartWriteComplete = false
+    private var otaFinishing = false
+    private var negotiatedMtu = 23
+    private var stateReadInFlight = false
 
     private val scanner get() = bluetoothManager.adapter?.bluetoothLeScanner
+
+    private val statePoll = object : Runnable {
+        @SuppressLint("MissingPermission")
+        override fun run() {
+            if (ready && !authInFlight && !pressInFlight && !pskUpdateInFlight && !otaInFlight) {
+                deviceState?.let {
+                    stateReadInFlight = true
+                    if (gatt?.readCharacteristic(it) != true) stateReadInFlight = false
+                    else handler.postDelayed({ stateReadInFlight = false }, 600)
+                }
+            }
+            if (!manuallyStopped && deviceState != null) handler.postDelayed(this, 1_500)
+        }
+    }
+
+    private val otaWriteTimeout = Runnable {
+        if (!otaInFlight) return@Runnable
+        val message = if (otaFinishing) {
+            "Firmware validation response timed out"
+        } else {
+            "Firmware transfer stalled at byte $otaOffset"
+        }
+        finishOta(false, message)
+    }
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) = acceptScan(result)
@@ -83,7 +114,9 @@ class BleCarKeyClient(
     @SuppressLint("MissingPermission")
     fun start(key: String, cachedAddress: String?, useCachedAddress: Boolean) {
         psk = key
-        reconnectAddress = cachedAddress
+        // A user-configured profile address is always a hard target. A learned
+        // address is used only while the per-device cached-address setting is on.
+        reconnectAddress = if (useCachedAddress) cachedAddress else profile.defaultAddress
         preferDirect = useCachedAddress
         manuallyStopped = false
         if (!useCachedAddress) {
@@ -136,11 +169,12 @@ class BleCarKeyClient(
     }
 
     @SuppressLint("MissingPermission")
-    private fun matches(result: ScanResult): Boolean =
-        result.device.address == reconnectAddress ||
-            result.device.address == profile.defaultAddress ||
-            result.device.name == profile.advertisedName ||
+    private fun matches(result: ScanResult): Boolean {
+        val targetAddress = reconnectAddress ?: profile.defaultAddress
+        if (targetAddress != null) return result.device.address.equals(targetAddress, ignoreCase = true)
+        return result.device.name == profile.advertisedName ||
             result.scanRecord?.serviceUuids?.any { it.uuid == profile.serviceUuid } == true
+    }
 
     @SuppressLint("MissingPermission")
     private fun acceptScan(result: ScanResult) {
@@ -186,7 +220,7 @@ class BleCarKeyClient(
                     )
                 }
                 if (!manuallyStopped) {
-                    if (wasReady) listener.onState(State.DISCONNECTED, "Connection lost; reconnectingâ€¦")
+                    if (wasReady) listener.onState(State.DISCONNECTED, "Connection lost; reconnecting…")
                     scheduleReconnect()
                 }
             }
@@ -195,6 +229,7 @@ class BleCarKeyClient(
         @SuppressLint("MissingPermission")
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, statusCode: Int) {
             listener.onDiagnostic("MTU negotiation: mtu=$mtu, status=$statusCode")
+            if (statusCode == BluetoothGatt.GATT_SUCCESS) negotiatedMtu = mtu
             g.discoverServices()
         }
 
@@ -210,6 +245,7 @@ class BleCarKeyClient(
             otaControl = service.getCharacteristic(profile.otaControlUuid)
             otaData = service.getCharacteristic(profile.otaDataUuid)
             otaStatus = service.getCharacteristic(profile.otaStatusUuid)
+            deviceState = service.getCharacteristic(profile.deviceStateUuid)
             if (challenge == null || command == null || status == null) return fail("Required BLE characteristics missing")
             if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE) {
                 listener.onDiagnostic("Required ${profile.displayName} characteristics found; using per-connection reads")
@@ -239,10 +275,12 @@ class BleCarKeyClient(
 
         @Deprecated("Deprecated in API 33")
         override fun onCharacteristicRead(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, result: Int) {
+            if (characteristic.uuid == profile.deviceStateUuid) stateReadInFlight = false
             if (result == BluetoothGatt.GATT_SUCCESS) handleValue(characteristic, characteristic.value ?: byteArrayOf())
         }
 
         override fun onCharacteristicRead(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray, result: Int) {
+            if (characteristic.uuid == profile.deviceStateUuid) stateReadInFlight = false
             if (result == BluetoothGatt.GATT_SUCCESS) handleValue(characteristic, value)
         }
 
@@ -265,6 +303,11 @@ class BleCarKeyClient(
                 }
                 return
             }
+            if (characteristic.uuid == profile.otaControlUuid && otaInFlight && otaStartWritePending) {
+                otaStartWritePending = false
+                otaStartWriteComplete = true
+                maybeStartOtaData()
+            }
             if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE && characteristic.uuid == profile.commandUuid) {
                 // ESPHome sends the ATT write response immediately before its
                 // YAML on_write automation runs. A short delay avoids reading
@@ -272,6 +315,7 @@ class BleCarKeyClient(
                 handler.postDelayed({ g.readCharacteristic(status) }, 100)
             }
             if (characteristic.uuid == profile.otaDataUuid && otaInFlight) {
+                handler.removeCallbacks(otaWriteTimeout)
                 otaOffset += otaLastChunkSize
                 otaLastChunkSize = 0
                 listener.onOtaProgress(otaOffset, otaImage?.size ?: otaOffset)
@@ -289,6 +333,10 @@ class BleCarKeyClient(
             }
             profile.statusUuid -> handleStatus(String(value, StandardCharsets.UTF_8))
             profile.otaStatusUuid -> handleOtaStatus(String(value, StandardCharsets.UTF_8))
+            profile.deviceStateUuid -> {
+                val state = String(value, StandardCharsets.UTF_8)
+                if (!state.startsWith("ERR:")) listener.onDeviceState(state)
+            }
         }
     }
 
@@ -302,8 +350,16 @@ class BleCarKeyClient(
                 directFailures = 0
                 awaitingScanFallback = false
                 listener.onState(State.CONNECTED, "Authenticated")
-                if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE) readChallenge()
-                else listener.onReadyChanged(nonce != null)
+                listener.onReadyChanged(profile.responseMode != BleResponseMode.READ_AFTER_WRITE && nonce != null)
+                if (deviceState != null) {
+                    handler.removeCallbacks(statePoll)
+                    handler.post(statePoll)
+                    if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE) {
+                        handler.postDelayed({ readChallenge() }, 250)
+                    }
+                } else if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE) {
+                    readChallenge()
+                }
             }
             value == "OK:PRESSED" && pressInFlight -> {
                 finishPress()
@@ -362,6 +418,11 @@ class BleCarKeyClient(
     }
 
     fun press() {
+        handler.removeCallbacks(statePoll)
+        if (stateReadInFlight) {
+            handler.postDelayed({ press() }, 120)
+            return
+        }
         val current = nonce ?: return listener.onCommandResult(false, "Command failed")
         val commandCharacteristic = command ?: return listener.onCommandResult(false, "Command failed")
         listener.onDiagnostic("Sending authenticated button-press command")
@@ -379,6 +440,7 @@ class BleCarKeyClient(
         }, 2_500)
     }
 
+    @SuppressLint("MissingPermission")
     fun startOta(image: ByteArray) {
         val current = nonce ?: return listener.onOtaResult(false, "No fresh challenge for firmware update")
         val control = otaControl
@@ -394,14 +456,44 @@ class BleCarKeyClient(
         otaLastChunkSize = 0
         otaInFlight = true
         otaWaitingForReady = true
+        otaStartWritePending = true
+        otaStartWriteComplete = false
+        otaFinishing = false
         ready = false
         listener.onReadyChanged(false)
         listener.onDiagnostic("Starting authenticated BLE OTA (${image.size} bytes)")
-        write(control, CarKeyProtocol.otaStart(image.size, digest, current, psk))
+        val startPayload = CarKeyProtocol.otaStart(image.size, digest, current, psk)
+        val highPriorityRequested = gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) == true
+        listener.onDiagnostic("Requested high-throughput BLE connection for OTA: $highPriorityRequested")
         nonce = null
         handler.postDelayed({
-            if (otaInFlight && otaWaitingForReady) finishOta(false, "Car did not accept the firmware update")
-        }, 5_000)
+            if (!otaInFlight) return@postDelayed
+            if (!write(control, startPayload)) {
+                finishOta(false, "Android could not queue the firmware start request")
+                return@postDelayed
+            }
+            handler.postDelayed({
+                if (otaInFlight && (otaWaitingForReady || otaStartWritePending)) {
+                    finishOta(false, "ESP did not complete the firmware start request")
+                }
+            }, 5_000)
+        }, if (highPriorityRequested) 750L else 0L)
+    }
+
+    /**
+     * Re-read the per-connection challenge when the Activity and GATT ready
+     * states have drifted apart. Reading while unauthenticated naturally
+     * restarts authentication; reading while authenticated supplies the fresh
+     * nonce required by OTA:START.
+     */
+    @SuppressLint("MissingPermission")
+    fun requestFreshChallenge(): Boolean {
+        val g = gatt ?: return false
+        val c = challenge ?: return false
+        listener.onDiagnostic("Requesting a fresh challenge for firmware update")
+        nonce = null
+        listener.onReadyChanged(false)
+        return g.readCharacteristic(c)
     }
 
     private fun handleOtaStatus(value: String) {
@@ -410,7 +502,7 @@ class BleCarKeyClient(
             value == "OTA:READY" && otaInFlight -> {
                 otaWaitingForReady = false
                 listener.onOtaProgress(0, otaImage?.size ?: 0)
-                sendNextOtaChunk()
+                maybeStartOtaData()
             }
             value == "OTA:OK" && otaInFlight -> finishOta(true, "Firmware updated; car ESP is restarting")
             value.startsWith("ERR:OTA_") && otaInFlight -> finishOta(false, otaErrorMessage(value))
@@ -431,25 +523,51 @@ class BleCarKeyClient(
         val image = otaImage ?: return finishOta(false, "Firmware data was lost")
         if (otaOffset >= image.size) {
             listener.onDiagnostic("Firmware transfer complete; requesting signed-image validation")
-            write(otaControl ?: return finishOta(false, "OTA control characteristic disappeared"), byteArrayOf(0x02))
+            otaFinishing = true
+            if (!write(otaControl ?: return finishOta(false, "OTA control characteristic disappeared"), byteArrayOf(0x02))) {
+                finishOta(false, "Android could not queue firmware validation")
+                return
+            }
+            handler.removeCallbacks(otaWriteTimeout)
+            handler.postDelayed(otaWriteTimeout, 10_000)
             return
         }
 
-        /* 176 data bytes + 4 offset bytes fits the firmware's preferred
-         * 185-byte MTU, even when Android's 517-byte request is reduced. */
-        val count = minOf(176, image.size - otaOffset)
+        /* ATT writes carry MTU-3 bytes. Leave two bytes of headroom, then
+         * reserve four bytes for the firmware offset. The current 185 MTU
+         * sends 176-byte chunks; upgraded firmware can negotiate 517 and
+         * accept 508-byte chunks. */
+        val mtuDataCapacity = (negotiatedMtu - 9).coerceAtLeast(14)
+        val count = minOf(508, mtuDataCapacity, image.size - otaOffset)
         val payload = ByteBuffer.allocate(4 + count).order(ByteOrder.LITTLE_ENDIAN)
             .putInt(otaOffset)
             .put(image, otaOffset, count)
             .array()
         otaLastChunkSize = count
-        write(otaData ?: return finishOta(false, "OTA data characteristic disappeared"), payload)
+        if (!write(otaData ?: return finishOta(false, "OTA data characteristic disappeared"), payload)) {
+            otaLastChunkSize = 0
+            finishOta(false, "Android could not queue firmware data at byte $otaOffset")
+            return
+        }
+        handler.removeCallbacks(otaWriteTimeout)
+        handler.postDelayed(otaWriteTimeout, 5_000)
     }
 
+    private fun maybeStartOtaData() {
+        if (!otaInFlight || otaWaitingForReady || !otaStartWriteComplete) return
+        if (otaOffset == 0 && otaLastChunkSize == 0 && !otaFinishing) sendNextOtaChunk()
+    }
+
+    @SuppressLint("MissingPermission")
     private fun finishOta(success: Boolean, message: String) {
         if (!otaInFlight) return
         otaInFlight = false
+        gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
         otaWaitingForReady = false
+        otaStartWritePending = false
+        otaStartWriteComplete = false
+        otaFinishing = false
+        handler.removeCallbacks(otaWriteTimeout)
         otaImage = null
         otaLastChunkSize = 0
         listener.onOtaResult(success, message)
@@ -458,6 +576,7 @@ class BleCarKeyClient(
     private fun finishPress() {
         pressInFlight = false
         pressGeneration++
+        if (deviceState != null && !manuallyStopped) handler.postDelayed(statePoll, 500)
     }
 
     fun updatePsk(newPsk: String): Boolean {
@@ -507,10 +626,11 @@ class BleCarKeyClient(
     }
 
     @SuppressLint("MissingPermission")
-    private fun write(c: BluetoothGattCharacteristic, value: ByteArray) {
-        val g = gatt ?: return
-        if (Build.VERSION.SDK_INT >= 33) g.writeCharacteristic(c, value, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-        else {
+    private fun write(c: BluetoothGattCharacteristic, value: ByteArray): Boolean {
+        val g = gatt ?: return false
+        return if (Build.VERSION.SDK_INT >= 33) {
+            g.writeCharacteristic(c, value, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
+        } else {
             @Suppress("DEPRECATION")
             run {
                 c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
@@ -549,6 +669,9 @@ class BleCarKeyClient(
         otaControl = null
         otaData = null
         otaStatus = null
+        deviceState = null
+        stateReadInFlight = false
+        handler.removeCallbacks(statePoll)
         nonce = null
         ready = false
         authAttempts = 0
@@ -561,7 +684,12 @@ class BleCarKeyClient(
         otaImage = null
         otaInFlight = false
         otaWaitingForReady = false
+        otaStartWritePending = false
+        otaStartWriteComplete = false
+        otaFinishing = false
+        handler.removeCallbacks(otaWriteTimeout)
         otaOffset = 0
         otaLastChunkSize = 0
+        negotiatedMtu = 23
     }
 }

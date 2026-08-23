@@ -57,6 +57,7 @@ class MainActivity : FragmentActivity() {
         var state: BleCarKeyClient.State = BleCarKeyClient.State.DISCONNECTED,
         var message: String = "Idle",
         var ready: Boolean = false,
+        var deviceState: String? = null,
     )
 
     private data class DeviceViews(
@@ -66,11 +67,13 @@ class MainActivity : FragmentActivity() {
     )
 
     private val store by lazy { SecureStore(this) }
+    private val profileRepository by lazy { DeviceProfileRepository(store) }
     private val bluetoothManager by lazy { getSystemService(BluetoothManager::class.java) }
     private val mainHandler = Handler(Looper.getMainLooper())
     private val runtimes = mutableMapOf<String, DeviceRuntime>()
     private val deviceViews = mutableMapOf<String, DeviceViews>()
     private val clients = mutableMapOf<String, BleCarKeyClient>()
+    private val profiles = mutableListOf<BleDeviceProfile>()
 
     private var appForeground = false
     private var pendingPressId: String? = null
@@ -79,6 +82,8 @@ class MainActivity : FragmentActivity() {
     private var pendingPskOnSaved: (() -> Unit)? = null
     private var pendingOtaImage: ByteArray? = null
     private var pendingLocationDeviceId: String? = null
+    private var pendingFirmwareProfileId: String? = null
+    private var firmwarePickerActive = false
     private var operationGeneration = 0
     private var operationSession = UUID.randomUUID().toString()
     private var requireAuthentication = true
@@ -106,7 +111,7 @@ class MainActivity : FragmentActivity() {
     ) { result ->
         val granted = result[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
             result[Manifest.permission.ACCESS_COARSE_LOCATION] == true
-        val profile = pendingLocationDeviceId?.let(BleDeviceProfiles::byId)
+        val profile = pendingLocationDeviceId?.let { id -> profiles.firstOrNull { it.id == id } }
         pendingLocationDeviceId = null
         profile?.let {
             runtimes.getValue(it.id).recordLocation = granted
@@ -121,17 +126,27 @@ class MainActivity : FragmentActivity() {
     private val firmwareFileLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocument(),
     ) { uri ->
+        firmwarePickerActive = false
+        val profileId = pendingFirmwareProfileId
+        pendingFirmwareProfileId = null
         if (uri == null) return@registerForActivityResult
         val image = runCatching { contentResolver.openInputStream(uri)?.use { it.readBytes() } }.getOrNull()
         when {
             image == null -> toast("Could not read firmware file")
             image.isEmpty() || image.size > 0x1e0000 -> toast("Firmware must be 1 byte to 1,966,080 bytes")
-            else -> AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
-                .setTitle("Update car firmware?")
+            else -> {
+                val profile = profileId?.let { id -> profiles.firstOrNull { it.id == id } }
+                if (profile == null) {
+                    toast("Device is no longer configured")
+                    return@registerForActivityResult
+                }
+                AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+                .setTitle("Update ${profile.displayName} firmware?")
                 .setMessage("Transfer ${(image.size + 1023) / 1024} KiB over BLE. Keep the phone near the car and do not remove car power. Only signed firmware from this project is accepted.")
                 .setNegativeButton("Cancel", null)
-                .setPositiveButton("Update") { _, _ -> requestCarOta(image) }
+                .setPositiveButton("Update") { _, _ -> requestCarOta(profile, image) }
                 .show()
+            }
         }
     }
 
@@ -143,6 +158,7 @@ class MainActivity : FragmentActivity() {
         window.navigationBarColor = Color.BLACK
 
         requireAuthentication = store.get("require_auth") != "false"
+        profiles.addAll(profileRepository.load())
         loadDeviceSettings()
         setContentView(buildUi())
         requestPermissionsAndStart()
@@ -176,9 +192,9 @@ class MainActivity : FragmentActivity() {
 
     override fun onStop() {
         appForeground = false
-        // Do not interrupt a firmware transfer if Android briefly backgrounds
-        // the activity. Ordinary foreground connections are released here.
-        if (pendingOtaImage == null) stopAllClients()
+        // Keep the selected device connected while Android's document picker is
+        // in front, and never interrupt a transfer already in progress.
+        if (pendingOtaImage == null && !firmwarePickerActive) stopAllClients()
         super.onStop()
     }
 
@@ -188,16 +204,17 @@ class MainActivity : FragmentActivity() {
         val legacyPreferCached = store.get("prefer_cached") == "true"
         val legacyRecordLocation = store.get("record_location") == "true"
 
-        BleDeviceProfiles.configured.forEach { profile ->
+        profiles.forEach { profile ->
             val runtime = DeviceRuntime(
                 psk = store.get(profile.pskStoreKey) ?: legacyPsk,
                 cachedAddress = store.get(profile.addressStoreKey)
-                    ?: if (profile.id == BleDeviceProfiles.CAR.id) legacyAddress else profile.defaultAddress,
+                    ?: if (profile.id == "car") legacyAddress else profile.defaultAddress,
                 preferCached = store.get(profile.preferCachedStoreKey)?.toBooleanStrictOrNull()
-                    ?: if (profile.id == BleDeviceProfiles.CAR.id) legacyPreferCached else profile.defaultAddress != null,
+                    ?: if (profile.id == "car") legacyPreferCached else profile.defaultAddress != null,
                 recordLocation = store.get(profile.recordLocationStoreKey)?.toBooleanStrictOrNull()
-                    ?: (profile.id == BleDeviceProfiles.CAR.id && legacyRecordLocation),
+                    ?: (profile.id == "car" && legacyRecordLocation),
             )
+            if (runtime.psk.isEmpty()) runtime.message = "PSK required"
             runtimes[profile.id] = runtime
             if (runtime.psk.isNotEmpty()) store.put(profile.pskStoreKey, runtime.psk)
             runtime.cachedAddress?.let { store.put(profile.addressStoreKey, it) }
@@ -207,6 +224,7 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun buildUi(): View {
+        deviceViews.clear()
         val background = Color.BLACK
         val surface = Color.rgb(31, 34, 48)
         val root = FrameLayout(this).apply { setBackgroundColor(background) }
@@ -240,9 +258,16 @@ class MainActivity : FragmentActivity() {
         page.addView(bar, LinearLayout.LayoutParams(-1, dp(72)))
 
         page.addView(sectionLabel("Devices").apply { setPadding(0, dp(8), 0, dp(8)) })
-        BleDeviceProfiles.configured.forEach { profile ->
+        profiles.forEach { profile ->
             page.addView(buildDeviceCard(profile, surface), LinearLayout.LayoutParams(-1, dp(108)).apply {
                 bottomMargin = dp(12)
+            })
+        }
+        if (profiles.isEmpty()) {
+            page.addView(text("No devices configured. Open Settings to add one.", 14f, false).apply {
+                setTextColor(Color.rgb(184, 186, 198))
+                gravity = Gravity.CENTER
+                setPadding(dp(12), dp(24), dp(12), dp(32))
             })
         }
 
@@ -286,7 +311,7 @@ class MainActivity : FragmentActivity() {
             elevation = dp(2).toFloat()
         }
         val statusIcon = ImageButton(this).apply {
-            setImageResource(if (profile.id == "gate") R.drawable.ic_gate else R.drawable.ic_car)
+            setImageResource(if (profile.type == BleDeviceType.ESPHOME_ACCESS) R.drawable.ic_gate else R.drawable.ic_car)
             contentDescription = "${profile.displayName} settings"
             imageTintList = ColorStateList.valueOf(Color.rgb(132, 136, 153))
             setPadding(dp(7), dp(7), dp(7), dp(7))
@@ -319,8 +344,7 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun startOrConfigure() {
-        if (runtimes.values.all { it.psk.isEmpty() }) showInitialPskDialog()
-        else startForegroundClients()
+        startForegroundClients()
     }
 
     private fun requestPress(profile: BleDeviceProfile) {
@@ -373,7 +397,7 @@ class MainActivity : FragmentActivity() {
 
     private fun listenerFor(profile: BleDeviceProfile) = object : BleCarKeyClient.Listener {
         override fun onState(state: BleCarKeyClient.State, message: String) = runOnUiThread {
-            EventLog.add(this@MainActivity, EventLog.Kind.DIAGNOSTIC, "${profile.displayName} ${state.name}: $message")
+            EventLog.add(this@MainActivity, EventLog.Kind.DIAGNOSTIC, "${profile.displayName} ${state.name}: $message", deviceId = profile.id, deviceName = profile.displayName)
             val runtime = runtimes.getValue(profile.id)
             runtime.state = state
             runtime.message = when {
@@ -388,7 +412,7 @@ class MainActivity : FragmentActivity() {
         }
 
         override fun onDiagnostic(message: String) {
-            EventLog.add(this@MainActivity, EventLog.Kind.DIAGNOSTIC, "${profile.displayName}: $message")
+            EventLog.add(this@MainActivity, EventLog.Kind.DIAGNOSTIC, "${profile.displayName}: $message", deviceId = profile.id, deviceName = profile.displayName)
         }
 
         override fun onReadyChanged(ready: Boolean) = runOnUiThread {
@@ -400,7 +424,7 @@ class MainActivity : FragmentActivity() {
                 pressDispatched = true
                 runtime.message = when {
                     pendingOtaImage != null -> "Preparing firmware update..."
-                    pendingPskValue != null -> "Updating car PSK..."
+                    pendingPskValue != null -> "Updating ESP PSK..."
                     else -> "Sending command..."
                 }
                 updateDeviceView(profile.id)
@@ -408,7 +432,7 @@ class MainActivity : FragmentActivity() {
                     pendingOtaImage != null -> clients[profile.id]?.startOta(pendingOtaImage!!)
                     pendingPskValue != null -> {
                         if (clients[profile.id]?.updatePsk(pendingPskValue!!) != true) {
-                            finishPskUpdate(profile, false, "Car firmware does not support PSK updates")
+                            finishPskUpdate(profile, false, "ESP firmware does not support PSK updates")
                         }
                     }
                     else -> clients[profile.id]?.press()
@@ -420,6 +444,12 @@ class MainActivity : FragmentActivity() {
             val runtime = runtimes.getValue(profile.id)
             runtime.cachedAddress = address
             store.put(profile.addressStoreKey, address)
+        }
+
+        override fun onDeviceState(state: String) = runOnUiThread {
+            val normalized = state.trim().lowercase().replaceFirstChar { it.uppercase() }
+            runtimes.getValue(profile.id).deviceState = normalized
+            updateDeviceView(profile.id)
         }
 
         override fun onCommandResult(success: Boolean, message: String) = runOnUiThread {
@@ -455,9 +485,11 @@ class MainActivity : FragmentActivity() {
             this,
             EventLog.Kind.DIAGNOSTIC,
             if (success) "${profile.displayName} command completed" else "${profile.displayName} command failed: $message",
+            deviceId = profile.id,
+            deviceName = profile.displayName,
         )
         if (success && message == "Pressed") {
-            EventLog.addSessionPress(this, "${profile.displayName} remote button pressed", operationSession)
+            EventLog.addSessionPress(this, "${profile.displayName} remote button pressed", operationSession, profile.id, profile.displayName)
             captureOperationLocation(profile)
             vibrateSuccess()
         } else if (!success) {
@@ -472,8 +504,7 @@ class MainActivity : FragmentActivity() {
         }, 1_500)
     }
 
-    private fun requestCarPskUpdate(newPsk: String, onSaved: () -> Unit) {
-        val profile = BleDeviceProfiles.CAR
+    private fun requestCarPskUpdate(profile: BleDeviceProfile, newPsk: String, onSaved: () -> Unit) {
         if (!hasPermissions()) {
             toast("Bluetooth permission is required")
             return
@@ -492,13 +523,13 @@ class MainActivity : FragmentActivity() {
         pendingOtaImage = null
         pressDispatched = false
         setAllActionsEnabled(false)
-        runtime.message = if (runtime.ready) "Updating car PSK..." else "Connecting to update car PSK..."
+        runtime.message = if (runtime.ready) "Updating device PSK..." else "Connecting to update device PSK..."
         updateDeviceView(profile.id)
 
         if (runtime.ready) {
             pressDispatched = true
             if (clients[profile.id]?.updatePsk(newPsk) != true) {
-                finishPskUpdate(profile, false, "Car firmware does not support PSK updates")
+                finishPskUpdate(profile, false, "This firmware does not support PSK updates")
                 return
             }
         } else {
@@ -507,7 +538,7 @@ class MainActivity : FragmentActivity() {
 
         mainHandler.postDelayed({
             if (generation == operationGeneration && pendingPskValue != null) {
-                finishPskUpdate(profile, false, "Car PSK update timed out")
+                finishPskUpdate(profile, false, "PSK update timed out")
             }
         }, 18_000)
     }
@@ -527,10 +558,10 @@ class MainActivity : FragmentActivity() {
         runtime.message = message
         updateDeviceView(profile.id)
         setAllActionsEnabled(true)
-        EventLog.add(this, EventLog.Kind.DIAGNOSTIC, message)
+        EventLog.add(this, EventLog.Kind.DIAGNOSTIC, message, deviceId = profile.id, deviceName = profile.displayName)
         if (success) {
             vibrateSuccess()
-            toast("Car and phone PSK updated")
+            toast("${profile.displayName} and phone PSK updated")
             onSaved?.invoke()
         } else {
             vibrateFailure()
@@ -538,15 +569,14 @@ class MainActivity : FragmentActivity() {
         }
     }
 
-    private fun requestCarOta(image: ByteArray) {
-        val profile = BleDeviceProfiles.CAR
+    private fun requestCarOta(profile: BleDeviceProfile, image: ByteArray) {
         if (!hasPermissions()) {
             toast("Bluetooth permission is required")
             return
         }
         val runtime = runtimes.getValue(profile.id)
         if (runtime.psk.isEmpty()) {
-            showDevicePskDialog(profile) { requestCarOta(image) }
+            showDevicePskDialog(profile) { requestCarOta(profile, image) }
             return
         }
         if (pendingPressId != null) {
@@ -565,13 +595,35 @@ class MainActivity : FragmentActivity() {
         runtime.state = BleCarKeyClient.State.CONNECTING
         runtime.message = "Connecting for firmware update..."
         updateDeviceView(profile.id)
-        ensureClient(profile)
+        val client = clients[profile.id]
+        if (runtime.ready && client != null) {
+            pressDispatched = true
+            runtime.message = "Preparing firmware update..."
+            updateDeviceView(profile.id)
+            EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "${profile.displayName}: OTA dispatched on ready connection", deviceId = profile.id, deviceName = profile.displayName)
+            client.startOta(image)
+        } else if (client?.requestFreshChallenge() == true) {
+            runtime.message = "Preparing secure firmware connection..."
+            updateDeviceView(profile.id)
+        } else {
+            if (client != null) stopClient(profile.id)
+            ensureClient(profile)
+        }
+
+        mainHandler.postDelayed({
+            if (generation == operationGeneration && pendingOtaImage != null && !pressDispatched) {
+                finishOtaOperation(profile, false, "Could not prepare the BLE firmware connection")
+            }
+        }, 20_000L)
 
         mainHandler.postDelayed({
             if (generation == operationGeneration && pendingOtaImage != null) {
                 finishOtaOperation(profile, false, "Firmware update timed out")
             }
-        }, 7 * 60 * 1000L)
+            // Per-chunk and validation watchdogs detect a genuinely stalled link.
+            // Keep this only as a generous whole-operation failsafe so an active,
+            // low-throughput transfer is never aborted at an arbitrary percentage.
+        }, 30 * 60 * 1000L)
     }
 
     private fun finishOtaOperation(profile: BleDeviceProfile, success: Boolean, message: String) {
@@ -584,7 +636,7 @@ class MainActivity : FragmentActivity() {
         runtime.message = message
         updateDeviceView(profile.id)
         setAllActionsEnabled(true)
-        EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Car firmware update ${if (success) "completed" else "failed"}: $message")
+        EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "ESP firmware update ${if (success) "completed" else "failed"}: $message", deviceId = profile.id, deviceName = profile.displayName)
         if (success) vibrateSuccess() else vibrateFailure()
         mainHandler.postDelayed({
             stopClient(profile.id)
@@ -594,7 +646,7 @@ class MainActivity : FragmentActivity() {
 
     private fun startForegroundClients() {
         if (!appForeground || !authenticated || !hasPermissions()) return
-        BleDeviceProfiles.configured.forEach { profile ->
+        profiles.forEach { profile ->
             if (runtimes.getValue(profile.id).psk.isNotEmpty()) ensureClient(profile)
         }
     }
@@ -625,12 +677,16 @@ class MainActivity : FragmentActivity() {
         clients.keys.toList().forEach(::stopClient)
     }
 
-    private fun updateAllDeviceViews() = BleDeviceProfiles.configured.forEach { updateDeviceView(it.id) }
+    private fun updateAllDeviceViews() = profiles.forEach { updateDeviceView(it.id) }
 
     private fun updateDeviceView(deviceId: String) {
         val runtime = runtimes[deviceId] ?: return
         val views = deviceViews[deviceId] ?: return
-        views.statusText.text = runtime.message
+        views.statusText.text = when {
+            runtime.ready && runtime.deviceState != null -> "${runtime.deviceState} • Connected"
+            runtime.deviceState != null -> "${runtime.message}\nLast state: ${runtime.deviceState}"
+            else -> runtime.message
+        }
         views.statusIcon.imageTintList = ColorStateList.valueOf(
             when {
                 runtime.ready -> Color.rgb(38, 196, 104)
@@ -652,31 +708,11 @@ class MainActivity : FragmentActivity() {
         }
     }
 
-    private fun showInitialPskDialog() {
-        val input = pskInput("Pre-shared key")
-        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
-            .setTitle("Welcome to BLE Key")
-            .setMessage("Enter the shared PSK. Car and Gate both use API v2; their saved keys can be changed independently later.")
-            .setView(input)
-            .setCancelable(false)
-            .setPositiveButton("Save", null)
-            .create().also { dialog ->
-                dialog.setOnShowListener {
-                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                        val value = input.text.toString().trim()
-                        if (value.isEmpty()) input.error = "PSK is required"
-                        else {
-                            BleDeviceProfiles.configured.forEach { savePsk(it, value) }
-                            dialog.dismiss()
-                            startForegroundClients()
-                        }
-                    }
-                }
-                dialog.show()
-            }
-    }
-
     private fun showDeviceSettingsAuthenticated(profile: BleDeviceProfile) {
+        if (pendingPressId != null) {
+            toast(if (pendingOtaImage != null) "Finish the firmware update before changing settings" else "Finish the current BLE action first")
+            return
+        }
         authenticate("Authenticate to edit ${profile.displayName} settings") { ok ->
             if (ok) showDeviceSettings(profile)
         }
@@ -684,25 +720,34 @@ class MainActivity : FragmentActivity() {
 
     private fun showDevicePskDialog(profile: BleDeviceProfile, onSaved: () -> Unit = {}) {
         authenticate("Authenticate to edit ${profile.displayName} PSK") { ok ->
-            if (ok) showDeviceSettings(profile, onSaved)
+            if (ok) showPskEditor(
+                profile,
+                recovery = profile.supportsRemotePskUpdate && runtimes.getValue(profile.id).psk.isNotEmpty(),
+                onSaved,
+            )
         }
     }
 
     private fun showDeviceSettings(profile: BleDeviceProfile, onSaved: () -> Unit = {}) {
         val runtime = runtimes.getValue(profile.id)
+        lateinit var settingsDialog: AlertDialog
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24), dp(8), dp(24), dp(12))
         }
-        val isGate = profile.id == BleDeviceProfiles.GATE.id
-        val first = pskInput(if (isGate) "App copy of gate PSK" else "New PSK")
-        val confirm = if (isGate) null else pskInput("Confirm new PSK")
-        val updateCarEspSwitch = if (isGate) null else Switch(this).apply {
-            text = "Also change the PSK on the car ESP"
+        val name = EditText(this).apply {
+            hint = "Device name"
+            setText(profile.displayName)
             setTextColor(Color.WHITE)
-            isChecked = runtime.psk.isNotEmpty()
-            isEnabled = runtime.psk.isNotEmpty()
-            setPadding(0, dp(8), 0, dp(8))
+            setHintTextColor(Color.GRAY)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        }
+        val configuredAddress = EditText(this).apply {
+            hint = "BLE address (optional)"
+            setText(profile.defaultAddress ?: runtime.cachedAddress.orEmpty())
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
         }
         val cachedSwitch = Switch(this).apply {
             text = "Use cached device address"
@@ -721,47 +766,35 @@ class MainActivity : FragmentActivity() {
             setTextColor(Color.rgb(184, 186, 198))
             setPadding(0, dp(2), 0, dp(8))
         }
-        layout.addView(text(
-            if (isGate) {
-                "The ESPHome build controls the gate PSK. This only changes the matching key saved by the app."
-            } else if (runtime.psk.isEmpty()) {
-                "Enter the PSK already installed on the car to pair this phone. Future changes can update both."
-            } else {
-                "Keep the switch enabled to update the car ESP first and then save the confirmed key on this phone. Disable it for an app-only correction."
-            },
-            13f,
-            false,
-        ).apply {
-            setTextColor(Color.rgb(184, 186, 198))
-        }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
-        layout.addView(sectionLabel(if (isGate) "App key" else "New PSK"), LinearLayout.LayoutParams(-1, -2))
-        layout.addView(first, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
-        confirm?.let {
-            layout.addView(it, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+        layout.addView(sectionLabel("Device"))
+        layout.addView(name, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(6) })
+        layout.addView(configuredAddress, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+        layout.addView(sectionLabel("Security"))
+        val pskActionLabel = when {
+            runtime.psk.isEmpty() -> "Set PSK on app"
+            profile.supportsRemotePskUpdate -> "Change PSK on ESP and app"
+            else -> "Change PSK saved on app"
         }
-        layout.addView(primaryButton("Generate secure 32-character PSK") {
-            val generated = DevicePskGenerator.generate()
-            first.setText(generated)
-            first.setSelection(generated.length)
-            confirm?.apply {
-                setText(generated)
-                setSelection(generated.length)
-            }
-            showGeneratedPsk(generated)
+        layout.addView(primaryButton(pskActionLabel) {
+            showPskEditor(profile, recovery = false, onSaved)
         }, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dp(8) })
-        updateCarEspSwitch?.let {
-            layout.addView(it, LinearLayout.LayoutParams(-1, -2))
+        if (runtime.psk.isNotEmpty() && profile.supportsRemotePskUpdate) {
+            layout.addView(primaryButton("Change PSK saved on app") {
+                authenticate("Authenticate for PSK recovery") { ok ->
+                    if (ok) showPskEditor(profile, recovery = true, onSaved)
+                }
+            }, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dp(8) })
             layout.addView(text(
-                if (runtime.psk.isEmpty()) {
-                    "Save the car's current PSK on this phone first; changing both becomes available afterward."
-                } else {
-                    "On: changes the PSK on both the car ESP and this phone. Off: changes this phone only."
-                },
+                "The ESP-and-app change requires the existing PSK. The app-only option replaces this phone's saved copy and does not change the ESP.",
                 12f,
                 false,
-            ).apply {
-                setTextColor(Color.rgb(184, 186, 198))
-            }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+            ).apply { setTextColor(Color.rgb(184, 186, 198)) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+        } else if (!profile.supportsRemotePskUpdate) {
+            layout.addView(text(
+                "PSK changes here affect only this app. Update the matching ESPHome secret and firmware separately.",
+                12f,
+                false,
+            ).apply { setTextColor(Color.rgb(184, 186, 198)) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
         }
         layout.addView(sectionLabel("Connection"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
         layout.addView(cachedSwitch, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(4) })
@@ -775,12 +808,26 @@ class MainActivity : FragmentActivity() {
         ).apply {
             setTextColor(Color.rgb(184, 186, 198))
         }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
-        if (profile.id == BleDeviceProfiles.CAR.id) {
+        if (profile.supportsBleOta) {
             layout.addView(sectionLabel("Firmware"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
-            layout.addView(primaryButton("Update car firmware (.bin)") {
+            layout.addView(primaryButton("Update ESP firmware (.bin)") {
+                pendingFirmwareProfileId = profile.id
+                firmwarePickerActive = true
+                // Saving device settings rebuilds the UI and BLE clients. Close
+                // this dialog before OTA so its Save action cannot interrupt
+                // firmware preparation or an active transfer.
+                settingsDialog.dismiss()
                 firmwareFileLauncher.launch(arrayOf("application/octet-stream", "*/*"))
             }, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(4) })
         }
+        layout.addView(primaryButton("Remove device") {
+            AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+                .setTitle("Remove ${profile.displayName}?")
+                .setMessage("This removes its card, saved PSK, address, and per-device settings from this phone. It does not change the ESP.")
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Remove") { _, _ -> removeDevice(profile) }
+                .show()
+        }, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(20) })
         val scroll = ScrollView(this).apply {
             isFillViewport = true
             addView(layout, FrameLayout.LayoutParams(-1, -2))
@@ -792,11 +839,16 @@ class MainActivity : FragmentActivity() {
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Save", null)
             .create().also { dialog ->
+                settingsDialog = dialog
                 dialog.setOnShowListener {
                     dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                        val value = first.text.toString().trim()
+                        val newName = name.text.toString().trim()
+                        val newAddress = configuredAddress.text.toString().trim().uppercase().ifEmpty { null }
                         when {
-                            confirm != null && value.isNotEmpty() && value != confirm.text.toString().trim() -> confirm.error = "PSKs do not match"
+                            newName.isEmpty() -> name.error = "Name is required"
+                            newAddress == null && profiles.any { it.id != profile.id && it.type == profile.type } -> configuredAddress.error = "Address is required while another device uses this firmware type"
+                            newAddress != null && !newAddress.matches(Regex("[0-9A-F]{2}(:[0-9A-F]{2}){5}")) -> configuredAddress.error = "Use AA:BB:CC:DD:EE:FF"
+                            profiles.any { it.id != profile.id && it.defaultAddress == newAddress } -> configuredAddress.error = "That address is already configured"
                             else -> {
                                 runtime.preferCached = cachedSwitch.isChecked
                                 store.put(profile.preferCachedStoreKey, runtime.preferCached.toString())
@@ -805,6 +857,7 @@ class MainActivity : FragmentActivity() {
                                 store.put(profile.recordLocationStoreKey, runtime.recordLocation.toString())
                                 if (requestLocationPermission) pendingLocationDeviceId = profile.id
                                 dialog.dismiss()
+                                updateProfile(profile, newName, newAddress)
                                 if (requestLocationPermission) {
                                     locationPermissionLauncher.launch(
                                         arrayOf(
@@ -813,13 +866,67 @@ class MainActivity : FragmentActivity() {
                                         ),
                                     )
                                 }
-                                when {
-                                    value.isEmpty() || value == runtime.psk -> onSaved()
-                                    updateCarEspSwitch?.isChecked == true -> requestCarPskUpdate(value, onSaved)
-                                    else -> {
-                                        savePsk(profile, value)
-                                        onSaved()
-                                    }
+                                onSaved()
+                            }
+                        }
+                    }
+                }
+                dialog.show()
+            }
+    }
+
+    private fun showPskEditor(profile: BleDeviceProfile, recovery: Boolean, onSaved: () -> Unit = {}) {
+        val runtime = runtimes.getValue(profile.id)
+        val appOnly = !profile.supportsRemotePskUpdate
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(8), dp(24), dp(12))
+        }
+        val current = if (!appOnly && !recovery && runtime.psk.isNotEmpty()) pskInput("Existing PSK") else null
+        val next = pskInput("New PSK")
+        val confirm = pskInput("Confirm new PSK")
+        layout.addView(text(when {
+            appOnly -> "This changes only the encrypted PSK saved on this app. It does not update the ESPHome device or its secrets."
+            recovery -> "This replaces only the encrypted PSK saved on this app. Use it when the ESP was changed elsewhere or the old PSK is unavailable."
+            runtime.psk.isEmpty() -> "Enter the PSK already installed on this device."
+            profile.supportsRemotePskUpdate -> "The existing PSK is verified locally, then the authenticated car and this phone are updated together."
+            else -> "First update ESPHome, then enter the existing and new PSKs here to update this phone's matching copy."
+        }, 13f, false).apply { setTextColor(Color.rgb(184, 186, 198)) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+        current?.let { layout.addView(it, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) }) }
+        layout.addView(next, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+        layout.addView(confirm, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+        layout.addView(primaryButton("Generate secure 32-character PSK") {
+            val generated = DevicePskGenerator.generate()
+            next.setText(generated)
+            confirm.setText(generated)
+            showGeneratedPsk(generated)
+        }, LinearLayout.LayoutParams(-1, dp(48)))
+
+        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+            .setTitle(when {
+                appOnly -> "PSK saved on app"
+                recovery -> "PSK saved on app"
+                else -> "${profile.displayName} PSK"
+            })
+            .setView(layout)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Save", null)
+            .create().also { dialog ->
+                dialog.setOnShowListener {
+                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                        val value = next.text.toString().trim()
+                        when {
+                            current != null && current.text.toString().trim() != runtime.psk -> current.error = "Existing PSK is incorrect"
+                            value.isEmpty() -> next.error = "PSK is required"
+                            value != confirm.text.toString().trim() -> confirm.error = "PSKs do not match"
+                            else -> {
+                                dialog.dismiss()
+                                if (!recovery && runtime.psk.isNotEmpty() && profile.supportsRemotePskUpdate) {
+                                    requestCarPskUpdate(profile, value, onSaved)
+                                } else {
+                                    savePsk(profile, value)
+                                    toast("Saved PSK updated on this phone")
+                                    onSaved()
                                 }
                             }
                         }
@@ -829,7 +936,138 @@ class MainActivity : FragmentActivity() {
             }
     }
 
+    private fun showAddDevice() {
+        authenticate("Authenticate to add a BLE device") { ok ->
+            if (!ok) return@authenticate
+            val labels = arrayOf("ESPHome device", "Standalone device")
+            AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+                .setTitle("Add device")
+                .setItems(labels) { _, which ->
+                    showAddDeviceDetails(if (which == 0) BleDeviceType.ESPHOME_ACCESS else BleDeviceType.CAR)
+                }
+                .show()
+        }
+    }
+
+    private fun showAddDeviceDetails(type: BleDeviceType) {
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(8), dp(24), dp(12))
+        }
+        val name = EditText(this).apply {
+            hint = "Name"
+            setText(if (type == BleDeviceType.CAR) "Car" else "Access Device")
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+        }
+        val address = EditText(this).apply {
+            hint = "BLE address (optional)"
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+        }
+        layout.addView(text(
+            "The name is your own label and does not need to match the ESP's Bluetooth name. The BLE address uniquely identifies the physical ESP. It is optional for the first device of this type, but required when two devices use the same firmware profile.",
+            13f,
+            false,
+        ).apply { setTextColor(Color.rgb(184, 186, 198)) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+        layout.addView(name, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+        layout.addView(address)
+
+        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+            .setTitle(if (type == BleDeviceType.CAR) "Add standalone device" else "Add ESPHome device")
+            .setView(layout)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Add", null)
+            .create().also { dialog ->
+                dialog.setOnShowListener {
+                    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                        val deviceName = name.text.toString().trim()
+                        val targetAddress = address.text.toString().trim().uppercase().ifEmpty { null }
+                        when {
+                            deviceName.isEmpty() -> name.error = "Name is required"
+                            targetAddress == null && profiles.any { it.type == type } -> address.error = "Address is required for another device of this type"
+                            profiles.filter { it.type == type }.any {
+                                it.defaultAddress == null && runtimes[it.id]?.cachedAddress == null
+                            } -> address.error = "Connect the existing device once so its address can be learned"
+                            targetAddress != null && !targetAddress.matches(Regex("[0-9A-F]{2}(:[0-9A-F]{2}){5}")) -> address.error = "Use AA:BB:CC:DD:EE:FF"
+                            profiles.any { it.defaultAddress != null && it.defaultAddress == targetAddress } -> address.error = "That address is already configured"
+                            else -> {
+                                // Once two cards share one firmware/service UUID,
+                                // pin every card of that type to a learned address.
+                                profiles.filter { it.type == type }.forEach { existing ->
+                                    val learned = existing.defaultAddress ?: runtimes[existing.id]?.cachedAddress
+                                    if (learned != null) {
+                                        val existingIndex = profiles.indexOfFirst { it.id == existing.id }
+                                        profiles[existingIndex] = existing.copy(defaultAddress = learned)
+                                        runtimes.getValue(existing.id).preferCached = true
+                                        store.put(existing.preferCachedStoreKey, "true")
+                                    }
+                                }
+                                val profile = BleDeviceProfiles.create(type, displayName = deviceName, targetAddress = targetAddress)
+                                profiles.add(profile)
+                                runtimes[profile.id] = DeviceRuntime(
+                                    cachedAddress = targetAddress,
+                                    preferCached = targetAddress != null,
+                                    message = "PSK required",
+                                )
+                                profileRepository.save(profiles)
+                                dialog.dismiss()
+                                rebuildUi()
+                                showPskEditor(profile, recovery = false)
+                            }
+                        }
+                    }
+                }
+                dialog.show()
+            }
+    }
+
+    private fun updateProfile(profile: BleDeviceProfile, name: String, address: String?) {
+        val index = profiles.indexOfFirst { it.id == profile.id }
+        if (index < 0) return
+        val updated = profile.copy(displayName = name, defaultAddress = address)
+        profiles[index] = updated
+        runtimes.getValue(profile.id).apply {
+            if (address != null) {
+                cachedAddress = address
+                store.put(profile.addressStoreKey, address)
+            } else if (!preferCached) {
+                cachedAddress = null
+                store.remove(profile.addressStoreKey)
+            }
+        }
+        profileRepository.save(profiles)
+        rebuildUi()
+    }
+
+    private fun removeDevice(profile: BleDeviceProfile) {
+        stopClient(profile.id)
+        profiles.removeAll { it.id == profile.id }
+        runtimes.remove(profile.id)
+        listOf(
+            profile.pskStoreKey,
+            profile.addressStoreKey,
+            profile.preferCachedStoreKey,
+            profile.recordLocationStoreKey,
+        ).forEach(store::remove)
+        profileRepository.save(profiles)
+        rebuildUi()
+    }
+
+    private fun rebuildUi() {
+        stopAllClients()
+        setContentView(buildUi())
+        authOverlay.visibility = if (authenticated) View.GONE else View.VISIBLE
+        if (authenticated) startForegroundClients()
+    }
+
     private fun showAppSettings() {
+        if (pendingPressId != null) {
+            toast(if (pendingOtaImage != null) "Finish the firmware update before changing settings" else "Finish the current BLE action first")
+            return
+        }
         val options = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(14), dp(16), 0)
@@ -840,15 +1078,26 @@ class MainActivity : FragmentActivity() {
             isChecked = requireAuthentication
             setPadding(0, dp(8), 0, dp(8))
         }
+        lateinit var settingsDialog: AlertDialog
+        val persistSettings = {
+            requireAuthentication = authSwitch.isChecked
+            store.put("require_auth", requireAuthentication.toString())
+        }
         options.addView(authSwitch)
-        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        options.addView(sectionLabel("Devices"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+        options.addView(primaryButton("Add device") {
+            persistSettings()
+            settingsDialog.dismiss()
+            showAddDevice()
+        }, LinearLayout.LayoutParams(-1, dp(48)))
+        settingsDialog = AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
             .setTitle("BLE Key Settings")
             .setView(options)
             .setPositiveButton("Done") { _, _ ->
-                requireAuthentication = authSwitch.isChecked
-                store.put("require_auth", requireAuthentication.toString())
+                persistSettings()
             }
-            .show()
+            .create()
+        settingsDialog.show()
     }
 
     private fun showGeneratedPsk(generated: String) {
@@ -931,13 +1180,13 @@ class MainActivity : FragmentActivity() {
             manager.isProviderEnabled(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER
             manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER
             else -> {
-                EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Location not recorded: location services are disabled")
+                EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Location not recorded: location services are disabled", deviceId = profile.id, deviceName = profile.displayName)
                 return
             }
         }
         val save: (Location) -> Unit = { location ->
-            EventLog.addLocation(this, location.latitude, location.longitude, location.accuracy, operationSession, operationTime)
-            EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Saved operation location with +/-${location.accuracy.toInt()} m accuracy")
+            EventLog.addLocation(this, location.latitude, location.longitude, location.accuracy, operationSession, operationTime, profile.id, profile.displayName)
+            EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Saved operation location with +/-${location.accuracy.toInt()} m accuracy", deviceId = profile.id, deviceName = profile.displayName)
         }
         if (Build.VERSION.SDK_INT >= 30) {
             manager.getCurrentLocation(provider, CancellationSignal(), mainExecutor, save)

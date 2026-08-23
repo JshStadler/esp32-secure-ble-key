@@ -7,8 +7,8 @@ import org.junit.Test
 
 class BleDeviceProfileTest {
     @Test
-    fun configuredDevicesHaveUniqueIdsAndServices() {
-        val devices = BleDeviceProfiles.configured
+    fun defaultDevicesHaveUniqueIdsAndServices() {
+        val devices = BleDeviceProfiles.defaults
 
         assertEquals(devices.size, devices.map { it.id }.toSet().size)
         assertEquals(devices.size, devices.map { it.serviceUuid }.toSet().size)
@@ -27,5 +27,18 @@ class BleDeviceProfileTest {
         assertTrue(gate.challengeUuid.toString().endsWith("7891"))
         assertTrue(gate.commandUuid.toString().endsWith("7892"))
         assertTrue(gate.statusUuid.toString().endsWith("7893"))
+        assertTrue(gate.deviceStateUuid.toString().endsWith("789b"))
+        assertTrue(gate.supportsLiveState)
+        assertTrue(BleDeviceProfiles.CAR.supportsRemotePskUpdate)
+    }
+
+    @Test
+    fun additionalProfilesKeepTheirFirmwareCapabilitiesAndUniqueIds() {
+        val first = BleDeviceProfiles.create(BleDeviceType.ESPHOME_ACCESS, displayName = "Front Gate")
+        val second = BleDeviceProfiles.create(BleDeviceType.ESPHOME_ACCESS, displayName = "Front Door")
+
+        assertNotEquals(first.id, second.id)
+        assertEquals(first.serviceUuid, second.serviceUuid)
+        assertEquals("Front Door", second.displayName)
     }
 }

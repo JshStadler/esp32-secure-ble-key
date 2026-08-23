@@ -83,8 +83,8 @@ The device requires at least 4 MiB of flash. Offsets and sizes come from
 
 ## Later BLE updates
 
-Build normally, then select `.pio/build/esp32c3/firmware.bin` from **Car
-Settings > Update car firmware (.bin)** in BLE Key. The app authenticates the
+Build normally, then select `.pio/build/esp32c3/firmware.bin` from the device's
+**Settings > Update ESP firmware (.bin)** action in BLE Key. The app authenticates the
 manifest, transfers sequential chunks, and the ESP verifies SHA-256 plus the
 embedded RSA signature before changing boot slots. A failed or interrupted
 transfer leaves the currently running slot intact.
@@ -92,6 +92,19 @@ transfer leaves the currently running slot intact.
 The release copy intended for subsequent BLE OTA is
 `release-builds/BLE-Car-Key-APIv2-signed-ota.bin`. Do not use the bootloader,
 partition-table, or OTA-metadata binaries in the mobile OTA picker.
+
+Reinstalling the same signed application image is supported and is a useful
+end-to-end OTA test. It is written to the inactive OTA slot, verified, selected
+for boot, and marked valid by the application after restart. Keep stable power
+and the phone close for the entire transfer.
+
+Recent builds negotiate up to a 517-byte ATT MTU and request a 7.5-15 ms,
+zero-latency connection while an OTA session is active. The Android client also
+requests its high-throughput connection priority before sending `OTA:START` and
+sizes chunks to the negotiated MTU. The first update from older firmware still
+uses that firmware's 185-byte MTU, but benefits from the phone-side priority
+request; later updates use both optimizations. Acknowledged writes remain in use
+so a dropped or rejected chunk is detected rather than silently skipped.
 
 If the signing key is lost, future BLE updates will be rejected. Because
 hardware Secure Boot is not enabled, installing a new full USB bootstrap with

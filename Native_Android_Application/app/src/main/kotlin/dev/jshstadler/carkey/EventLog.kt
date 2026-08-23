@@ -6,22 +6,43 @@ import org.json.JSONObject
 
 object EventLog {
     enum class Kind(val key: String) { DIAGNOSTIC("diagnostic"), PRESS("presses") }
-    data class Entry(val timestamp: Long, val message: String, val session: String? = null)
-    data class LocationEntry(val timestamp: Long, val latitude: Double, val longitude: Double, val accuracy: Float, val session: String? = null)
+    data class Entry(
+        val timestamp: Long,
+        val message: String,
+        val session: String? = null,
+        val deviceId: String? = null,
+        val deviceName: String? = null,
+    )
+    data class LocationEntry(
+        val timestamp: Long,
+        val latitude: Double,
+        val longitude: Double,
+        val accuracy: Float,
+        val session: String? = null,
+        val deviceId: String? = null,
+        val deviceName: String? = null,
+    )
 
     private const val PREFS = "car_key_logs"
     private const val LOCATIONS_KEY = "locations"
 
     @Synchronized
-    fun add(context: Context, kind: Kind, message: String, timestamp: Long = System.currentTimeMillis()) {
+    fun add(
+        context: Context,
+        kind: Kind,
+        message: String,
+        timestamp: Long = System.currentTimeMillis(),
+        deviceId: String? = null,
+        deviceName: String? = null,
+    ) {
         val entries = read(context, kind).toMutableList()
-        entries += Entry(timestamp, message)
+        entries += Entry(timestamp, message, deviceId = deviceId, deviceName = deviceName)
         write(context, kind, entries)
     }
 
     @Synchronized
-    fun addSessionPress(context: Context, message: String, session: String) {
-        val replacement = Entry(System.currentTimeMillis(), message, session)
+    fun addSessionPress(context: Context, message: String, session: String, deviceId: String, deviceName: String) {
+        val replacement = Entry(System.currentTimeMillis(), message, session, deviceId, deviceName)
         val entries = AppPolicies.replaceSession(read(context, Kind.PRESS), session, Entry::session, replacement)
         write(context, Kind.PRESS, entries)
     }
@@ -37,7 +58,13 @@ object EventLog {
             for (index in 0 until array.length()) {
                 val item = array.getJSONObject(index)
                 val timestamp = item.optLong("time")
-                if (timestamp >= cutoff) result += Entry(timestamp, item.optString("message"), item.optString("session").ifEmpty { null })
+                if (timestamp >= cutoff) result += Entry(
+                    timestamp,
+                    item.optString("message"),
+                    item.optString("session").ifEmpty { null },
+                    item.optString("device_id").ifEmpty { null },
+                    item.optString("device_name").ifEmpty { null },
+                )
             }
         } catch (_: Exception) {
             // A corrupt log should never prevent the car key from operating.
@@ -47,15 +74,28 @@ object EventLog {
     }
 
     @Synchronized
-    fun clear(context: Context, kind: Kind) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(kind.key).apply()
+    fun clear(context: Context, kind: Kind, deviceId: String? = null) {
+        if (deviceId == null) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(kind.key).apply()
+        } else {
+            write(context, kind, read(context, kind).filterNot { it.deviceId == deviceId })
+        }
     }
 
     @Synchronized
-    fun addLocation(context: Context, latitude: Double, longitude: Double, accuracy: Float, session: String, operationTime: Long) {
+    fun addLocation(
+        context: Context,
+        latitude: Double,
+        longitude: Double,
+        accuracy: Float,
+        session: String,
+        operationTime: Long,
+        deviceId: String,
+        deviceName: String,
+    ) {
         val current = readLocations(context)
         if (current.any { it.session == session && it.timestamp > operationTime }) return
-        val replacement = LocationEntry(operationTime, latitude, longitude, accuracy, session)
+        val replacement = LocationEntry(operationTime, latitude, longitude, accuracy, session, deviceId, deviceName)
         val entries = AppPolicies.replaceSession(current, session, LocationEntry::session, replacement).sortedByDescending { it.timestamp }
         writeLocations(context, entries.take(30))
     }
@@ -67,7 +107,15 @@ object EventLog {
             val array = JSONArray(raw)
             (0 until array.length()).map { index ->
                 val item = array.getJSONObject(index)
-                LocationEntry(item.getLong("time"), item.getDouble("lat"), item.getDouble("lon"), item.optDouble("accuracy").toFloat(), item.optString("session").ifEmpty { null })
+                LocationEntry(
+                    item.getLong("time"),
+                    item.getDouble("lat"),
+                    item.getDouble("lon"),
+                    item.optDouble("accuracy").toFloat(),
+                    item.optString("session").ifEmpty { null },
+                    item.optString("device_id").ifEmpty { null },
+                    item.optString("device_name").ifEmpty { null },
+                )
             }.take(30)
         } catch (_: Exception) {
             emptyList()
@@ -75,8 +123,12 @@ object EventLog {
     }
 
     @Synchronized
-    fun clearLocations(context: Context) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(LOCATIONS_KEY).apply()
+    fun clearLocations(context: Context, deviceId: String? = null) {
+        if (deviceId == null) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(LOCATIONS_KEY).apply()
+        } else {
+            writeLocations(context, readLocations(context).filterNot { it.deviceId == deviceId })
+        }
     }
 
     private fun write(context: Context, kind: Kind, entries: List<Entry>) {
@@ -84,6 +136,8 @@ object EventLog {
         entries.takeLast(2_000).forEach { entry ->
             array.put(JSONObject().put("time", entry.timestamp).put("message", entry.message).apply {
                 entry.session?.let { put("session", it) }
+                entry.deviceId?.let { put("device_id", it) }
+                entry.deviceName?.let { put("device_name", it) }
             })
         }
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(kind.key, array.toString()).apply()
@@ -94,6 +148,8 @@ object EventLog {
         entries.forEach { entry ->
             array.put(JSONObject().put("time", entry.timestamp).put("lat", entry.latitude).put("lon", entry.longitude).put("accuracy", entry.accuracy.toDouble()).apply {
                 entry.session?.let { put("session", it) }
+                entry.deviceId?.let { put("device_id", it) }
+                entry.deviceName?.let { put("device_name", it) }
             })
         }
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(LOCATIONS_KEY, array.toString()).apply()

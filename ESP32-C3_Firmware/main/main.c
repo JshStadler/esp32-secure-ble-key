@@ -750,6 +750,24 @@ static void mark_ble_activity(void) {
     fast_adv_until_ms = now_ms() + ((int64_t)FAST_ADV_WINDOW_SEC * 1000);
 }
 
+static void request_ota_connection_params(uint16_t conn_handle) {
+    /* OTA is powered from the car and benefits from a short interval with no
+     * slave latency. Normal low-power parameters return after the OTA reboot. */
+    struct ble_gap_upd_params params = {
+        .itvl_min            = 6,    /* 7.5ms */
+        .itvl_max            = 12,   /* 15ms */
+        .latency             = 0,
+        .supervision_timeout = 800,  /* 8s */
+        .min_ce_len          = 0,
+        .max_ce_len          = 0,
+    };
+    int rc = ble_gap_update_params(conn_handle, &params);
+    if (rc != 0) {
+        LOG_W(TAG, "OTA connection parameter request failed handle=%d rc=%d",
+              conn_handle, rc);
+    }
+}
+
 /**
  * Verify HMAC payload against current nonce and PSK.
  * Always rotates the nonce afterwards (even on failure) to prevent replay.
@@ -1123,6 +1141,7 @@ static int chr_access_ota_control(uint16_t conn_handle, uint16_t attr_handle,
             return 0;
         }
         ota_session.hash_started = true;
+        request_ota_connection_params(conn_handle);
         mark_ble_activity();
         set_ota_status(conn_handle, "OTA:READY");
         return 0;
@@ -1520,7 +1539,7 @@ static void ble_on_sync(void) {
     assert(rc == 0);
 
     /* Set preferred MTU */
-    rc = ble_att_set_preferred_mtu(185);
+    rc = ble_att_set_preferred_mtu(517);
     if (rc != 0) {
         LOG_W(TAG, "Failed to set preferred MTU: %d", rc);
     }

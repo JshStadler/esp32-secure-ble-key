@@ -3,7 +3,7 @@ name: Car firmware
 on:
   workflow_dispatch:
   push:
-    tags: ['firmware-v*']
+    tags: ['v*', 'firmware-v*']
 
 permissions:
   contents: read

@@ -19,10 +19,13 @@ import java.util.Locale
 
 class LogActivity : FragmentActivity() {
     private enum class Mode { DIAGNOSTIC, PRESSES, LOCATIONS }
+    private data class DeviceFilter(val id: String?, val label: String)
     private lateinit var content: LinearLayout
     private lateinit var diagnosticButton: Button
     private lateinit var pressesButton: Button
     private lateinit var locationsButton: Button
+    private lateinit var deviceFilters: List<DeviceFilter>
+    private var selectedDeviceId: String? = null
     private var selected = Mode.LOCATIONS
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -79,13 +82,52 @@ class LogActivity : FragmentActivity() {
         tabs.addView(locationsButton, LinearLayout.LayoutParams(0, dp(48), 1f))
         page.addView(tabs)
 
+        deviceFilters = buildDeviceFilters()
+        val filterSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@LogActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                deviceFilters.map { it.label },
+            )
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            contentDescription = "Filter logs by device"
+        }
+        page.addView(filterSpinner, LinearLayout.LayoutParams(-1, dp(52)).apply { topMargin = dp(8) })
+
         content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(12), 0, dp(12))
         }
         page.addView(ScrollView(this).apply { addView(content) }, LinearLayout.LayoutParams(-1, 0, 1f))
+        filterSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                selectedDeviceId = deviceFilters[position].id
+                show(selected)
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
         root.addView(page, FrameLayout.LayoutParams(-1, -1))
         return root
+    }
+
+    private fun buildDeviceFilters(): List<DeviceFilter> {
+        val devices = linkedMapOf<String, String>()
+        runCatching { DeviceProfileRepository(SecureStore(this)).load() }.getOrDefault(emptyList()).forEach {
+            devices[it.id] = it.displayName
+        }
+        val logged = EventLog.read(this, EventLog.Kind.DIAGNOSTIC) + EventLog.read(this, EventLog.Kind.PRESS)
+        logged.forEach { entry ->
+            if (entry.deviceId != null && !devices.containsKey(entry.deviceId)) {
+                devices[entry.deviceId] = entry.deviceName ?: "Removed device"
+            }
+        }
+        EventLog.readLocations(this).forEach { entry ->
+            if (entry.deviceId != null && !devices.containsKey(entry.deviceId)) {
+                devices[entry.deviceId] = entry.deviceName ?: "Removed device"
+            }
+        }
+        return listOf(DeviceFilter(null, "All devices")) +
+            devices.map { (id, name) -> DeviceFilter(id, name) }
     }
 
     private fun show(mode: Mode) {
@@ -99,7 +141,7 @@ class LogActivity : FragmentActivity() {
             return
         }
         val kind = if (mode == Mode.DIAGNOSTIC) EventLog.Kind.DIAGNOSTIC else EventLog.Kind.PRESS
-        val entries = EventLog.read(this, kind)
+        val entries = EventLog.read(this, kind).filter { selectedDeviceId == null || it.deviceId == selectedDeviceId }
         if (entries.isEmpty()) {
             content.addView(label(if (kind == EventLog.Kind.DIAGNOSTIC) "No diagnostic events in the last 24 hours." else "No successful operations in the last 7 days.", 14f, false).apply {
                 setTextColor(Color.GRAY)
@@ -128,9 +170,9 @@ class LogActivity : FragmentActivity() {
     }
 
     private fun showLocations() {
-        val entries = EventLog.readLocations(this)
+        val entries = EventLog.readLocations(this).filter { selectedDeviceId == null || it.deviceId == selectedDeviceId }
         if (entries.isEmpty()) {
-            content.addView(label("No saved operation locations. Enable location recording in App Settings.", 14f, false).apply {
+            content.addView(label("No saved operation locations. Enable location recording in Device Settings.", 14f, false).apply {
                 setTextColor(Color.GRAY)
                 setPadding(dp(8), dp(24), dp(8), dp(24))
             })
@@ -149,7 +191,8 @@ class LogActivity : FragmentActivity() {
                 gravity = Gravity.CENTER_VERTICAL
                 setPadding(dp(8), dp(8), dp(4), dp(8))
             }
-            row.addView(label("${timeFormat.format(Date(entry.timestamp))}\n${"%.6f".format(entry.latitude)}, ${"%.6f".format(entry.longitude)}  (±${entry.accuracy.toInt()} m)", 14f, false).apply {
+            val devicePrefix = if (selectedDeviceId == null && entry.deviceName != null) "${entry.deviceName} • " else ""
+            row.addView(label("$devicePrefix${timeFormat.format(Date(entry.timestamp))}\n${"%.6f".format(entry.latitude)}, ${"%.6f".format(entry.longitude)}  (±${entry.accuracy.toInt()} m)", 14f, false).apply {
                 setTextColor(Color.rgb(142, 180, 255))
             }, LinearLayout.LayoutParams(0, -2, 1f))
             row.addView(ImageButton(this).apply {
@@ -179,15 +222,16 @@ class LogActivity : FragmentActivity() {
             Mode.PRESSES -> "operation history"
             Mode.LOCATIONS -> "saved locations"
         }
+        val filterName = deviceFilters.firstOrNull { it.id == selectedDeviceId }?.label ?: "All devices"
         AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
-            .setTitle("Clear $name?")
+            .setTitle("Clear $name for $filterName?")
             .setMessage("This cannot be undone.")
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Clear") { _, _ ->
                 when (selected) {
-                    Mode.DIAGNOSTIC -> EventLog.clear(this, EventLog.Kind.DIAGNOSTIC)
-                    Mode.PRESSES -> EventLog.clear(this, EventLog.Kind.PRESS)
-                    Mode.LOCATIONS -> EventLog.clearLocations(this)
+                    Mode.DIAGNOSTIC -> EventLog.clear(this, EventLog.Kind.DIAGNOSTIC, selectedDeviceId)
+                    Mode.PRESSES -> EventLog.clear(this, EventLog.Kind.PRESS, selectedDeviceId)
+                    Mode.LOCATIONS -> EventLog.clearLocations(this, selectedDeviceId)
                 }
                 show(selected)
             }
@@ -211,19 +255,20 @@ class LogActivity : FragmentActivity() {
         val format = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
         return buildString {
             appendLine("Car Key ${selected.name.lowercase()} exported ${format.format(Date())}")
+            appendLine("Device filter: ${deviceFilters.firstOrNull { it.id == selectedDeviceId }?.label ?: "All devices"}")
             appendLine()
             when (selected) {
                 Mode.DIAGNOSTIC -> {
                     appendLine("=== DIAGNOSTICS — LAST 24 HOURS ===")
-                    EventLog.read(this@LogActivity, EventLog.Kind.DIAGNOSTIC).reversed().forEach { appendLine("${format.format(Date(it.timestamp))}  ${it.message}") }
+                    EventLog.read(this@LogActivity, EventLog.Kind.DIAGNOSTIC).filter { selectedDeviceId == null || it.deviceId == selectedDeviceId }.reversed().forEach { appendLine("${format.format(Date(it.timestamp))}  ${it.message}") }
                 }
                 Mode.PRESSES -> {
                     appendLine("=== SUCCESSFUL OPERATIONS — LAST 7 DAYS ===")
-                    EventLog.read(this@LogActivity, EventLog.Kind.PRESS).reversed().forEach { appendLine("${format.format(Date(it.timestamp))}  ${it.message}") }
+                    EventLog.read(this@LogActivity, EventLog.Kind.PRESS).filter { selectedDeviceId == null || it.deviceId == selectedDeviceId }.reversed().forEach { appendLine("${format.format(Date(it.timestamp))}  ${it.message}") }
                 }
                 Mode.LOCATIONS -> {
                     appendLine("=== SAVED LOCATIONS — LATEST 30 ===")
-                    EventLog.readLocations(this@LogActivity).reversed().forEach { appendLine("${format.format(Date(it.timestamp))}  ${it.latitude},${it.longitude} accuracy=${it.accuracy}m") }
+                    EventLog.readLocations(this@LogActivity).filter { selectedDeviceId == null || it.deviceId == selectedDeviceId }.reversed().forEach { appendLine("${format.format(Date(it.timestamp))}  ${it.latitude},${it.longitude} accuracy=${it.accuracy}m") }
                 }
             }
         }
