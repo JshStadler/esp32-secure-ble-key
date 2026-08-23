@@ -34,9 +34,17 @@ def sign_exported_firmware(source, target, env):
     idf_python = Path(match.group(1).strip())
     core_dir = Path(env.subst("$PROJECT_CORE_DIR"))
     process_env = os.environ.copy()
-    process_env["PYTHONPATH"] = os.pathsep.join(
-        [str(esptool_dir), str(esptool_dir / "_contrib"), str(core_dir / "penv" / "Lib" / "site-packages")]
-    )
+    # espsecure imports pyserial from PlatformIO's main environment. Its site
+    # directory is ``Lib`` on Windows and ``lib/pythonX.Y`` on Linux/macOS.
+    # Discover both layouts instead of embedding one host-specific path.
+    core_penv = core_dir / "penv"
+    platformio_sites = [core_penv / "Lib" / "site-packages"]
+    platformio_sites.extend((core_penv / "lib").glob("python*/site-packages"))
+    python_paths = [esptool_dir, esptool_dir / "_contrib"]
+    python_paths.extend(path for path in platformio_sites if path.is_dir())
+    if process_env.get("PYTHONPATH"):
+        python_paths.extend(Path(path) for path in process_env["PYTHONPATH"].split(os.pathsep) if path)
+    process_env["PYTHONPATH"] = os.pathsep.join(str(path) for path in python_paths)
 
     subprocess.run(
         [
