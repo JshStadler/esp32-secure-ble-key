@@ -94,7 +94,11 @@ erase the flash.
 
 ## Flash erasing
 
-If you hit NVS corruption or want a clean start:
+Erasing deletes the device PSK. A generic release image cannot authenticate
+after erasure. Only erase for intentional reprovisioning, with a private custom
+`DEFAULT_PSK` build and a backed-up key ready. OTA updates do not require erasure.
+The firmware now stops on NVS initialization errors and never erases credentials
+automatically.
 
 ```bash
 pio run -e esp32c3 -t erase
@@ -165,9 +169,9 @@ pio run -e esp32c3 -t upload
 
 7. **NVS error handling on PSK save**: `save_psk()` now checks return
    values from `nvs_open`, `nvs_set_str`, and `nvs_commit`. On failure,
-   the in-memory PSK is still updated (current session works), but the
-   status characteristic reports `WARN:PSK_VOLATILE` instead of
-   `OK:PSK_UPDATED` so the client knows the change won't survive a reboot.
+   previous in-memory PSK remains active. PSK2 returns an authenticated
+   failure receipt; the client must retain the old key. Successful writes
+   update memory only after `nvs_commit` succeeds.
 
 8. **Empty PSK detection in `load_psk`**: Fixed the length check from
    `len > 0` to `len > 1`. `nvs_get_str` includes the null terminator
@@ -186,4 +190,4 @@ pio run -e esp32c3 -t upload
 | Status              | Meaning                                            |
 |---------------------|----------------------------------------------------|
 | `ERR:BUSY`          | Button press rejected — previous press still active |
-| `WARN:PSK_VOLATILE` | PSK updated in memory but NVS write failed          |
+| `PSK2:FAIL:<tag>`  | PSK save failed; previous key remains active       |

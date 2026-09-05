@@ -66,9 +66,14 @@ Additional protections include optional device-authentication gating on the phon
 ESP32 (stored in NVS). The app gate can be disabled for faster frequent use;
 changing the PSK always requires device authentication.
 
-The PSK can be updated over BLE from the phone app after initial setup — the update itself is authenticated against the existing PSK, so only an already-authorised client can change it.
+The PSK can be updated over BLE from the phone app after initial setup. Version
+2.6.0 encrypts and authenticates the replacement and verifies a signed storage
+receipt before saving it on the phone. See [PROTOCOL.md](PROTOCOL.md).
 
-> **Important:** The firmware ships with a placeholder PSK (`CHANGE_ME_before_flashing_32chars!`). You **must** change this before deploying.
+> **Provisioning:** The public placeholder PSK is disabled. Release OTA images
+> require an existing key in NVS. For a fresh device, customize `DEFAULT_PSK`
+> privately before building and flashing; never commit that key. Preserve NVS
+> when updating an existing device.
 
 ## ⚡ Power Efficiency (ESP32-C3)
 
@@ -213,7 +218,9 @@ have separate identities and can be installed together.
 - **BACK** — exit app (preserves BLE pairing for fast reconnect on next launch)
 - **MENU** (long-press UP) — force unpair, useful after firmware updates that change the GATT service table
 
-The watch persists its BLE pairing across app sessions, so subsequent launches reconnect in 1-2 seconds instead of repeating the full GATT service discovery.
+The watch retains healthy pairings across app sessions and discards stalled
+connections automatically. Each launch authenticates before showing ready;
+actual connection time depends on the watch and radio environment.
 
 <img width="360" height="539" alt="image" src="https://github.com/user-attachments/assets/28264123-9bf5-41ac-bad2-cb6732b7731b" />
 
@@ -224,7 +231,7 @@ The watch persists its BLE pairing across app sessions, so subsequent launches r
 | Challenge | `...7891` | Read, Notify | 16-byte random nonce |
 | Command | `...7892` | Write, WriteNR | 1-byte command + 32-byte HMAC (single write) |
 | Status | `...7893` | Read, Notify | Result of last operation |
-| PSK Update | `...7894` | Write | Change PSK (requires HMAC of current PSK) |
+| PSK Update | `...7894` | Write | Encrypted and authenticated PSK2 key change |
 | Command Pt1 | `...7895` | Write, WriteNR | Split write path: 1-byte cmd + first 16 HMAC bytes |
 | Command Pt2 | `...7896` | Write, WriteNR | Split write path: last 16 HMAC bytes |
 
@@ -250,8 +257,8 @@ The split Pt1/Pt2 path exists because Garmin Connect IQ doesn't expose MTU negot
 | `READY`             | Device booted, awaiting commands                   |
 | `OK:AUTH`           | Authentication succeeded (no action)               |
 | `OK:PRESSED`        | Button press triggered                             |
-| `OK:PSK_UPDATED`    | PSK changed and persisted to NVS                   |
-| `WARN:PSK_VOLATILE` | PSK changed in memory but NVS write failed         |
+| `PSK2:OK:<tag>`     | Authenticated receipt: new PSK persisted          |
+| `PSK2:FAIL:<tag>`   | Authenticated receipt: previous PSK remains active |
 | `ERR:AUTH`          | HMAC verification failed                           |
 | `ERR:BUSY`          | Button press rejected — previous press still active |
 | `ERR:UNKNOWN_CMD`   | Unrecognised command byte                          |
@@ -276,10 +283,10 @@ Key constants in `main/main.c`:
 | `ADV_IDLE_INTERVAL_MIN` | `320` | Idle advertising minimum (200 ms) |
 | `ADV_IDLE_INTERVAL_MAX` | `640` | Idle advertising maximum (400 ms) |
 | `MAX_CONNECTIONS` | `3` | Simultaneous BLE connections |
-| `UNAUTH_TIMEOUT_SEC` | `15` | Auto-disconnect for unauthenticated clients |
-| `AUTH_TIMEOUT_SEC` | `300` | Auto-disconnect for authenticated clients |
+| `UNAUTH_TIMEOUT_SEC` | `20` | Absolute deadline to authenticate |
+| `AUTH_TIMEOUT_SEC` | `1800` | Authenticated inactivity timeout |
 | `RESTART_INTERVAL_SEC` | `10800` | Soft restart when idle (3 hours) |
-| `HARD_RESTART_SEC` | `86400` | Hard restart regardless of state (24 hours) |
+| `HARD_RESTART_SEC` | `86400` | Restart after 24 hours, deferred during OTA/button pulse |
 | `PM_MAX_FREQ_MHZ` | `80` | DFS max CPU frequency |
 | `PM_MIN_FREQ_MHZ` | `10` | DFS min CPU frequency |
 
