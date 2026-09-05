@@ -21,13 +21,19 @@ The Android workflow restores its keystore only on the ephemeral runner. The
 Car firmware workflow does the same for the ESP signing key. Both workflows can
 be started manually; version tags also create signed builds.
 
-The Garmin workflow restores `GARMIN_DEVELOPER_KEY_BASE64` immediately before
-building both watch apps and removes it in a `finally` block. It uses an
-ephemeral Windows runner labeled `blekey-garmin-release` with the licensed
-Connect IQ SDK and the five supported device definitions installed. Register
-that trusted runner for each release; never run pull requests on it. The SDK
-path comes from the user's Garmin `current-sdk.cfg`; Java 17 is installed at
-`C:/dev/jdk-17`. Artifacts contain only signed PRG and IQ packages.
+The Garmin workflow runs on GitHub-hosted Ubuntu. Compile both IQ packages
+locally with Connect IQ SDK 9.1.0 and the installed device definitions, using
+the existing developer key. Archive them as `garmin-build-inputs.zip`, upload
+to a draft release, and dispatch the workflow with its release name and the
+reviewed archive SHA256. Garmin requires account access to download device
+definitions, so compilation is local; final signing happens in GitHub.
+
+The workflow verifies the input package signatures against the GitHub secret,
+removes and regenerates every PRG signature with Garmin's SDK, and regenerates
+both manifest signatures. It requires identical program bytes after signing
+to preserve the compiler's manifest hashes and checks the final IQ packages.
+The decoded key is removed on exit. Artifacts contain only signed PRG and IQ
+packages. Remove the compiler-input asset before publishing the release.
 
 GitHub secrets cannot be read back after creation. Keep an additional encrypted
 offline backup of every private key and its passwords. Never add decoded keys,

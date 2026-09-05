@@ -1,40 +1,48 @@
 name: Garmin signed release
 on:
   workflow_dispatch:
-  push:
-    tags: ['v*']
+    inputs:
+      input_release:
+        description: Draft release containing garmin-build-inputs.zip
+        required: true
+      input_sha256:
+        description: Reviewed SHA256 of garmin-build-inputs.zip
+        required: true
 permissions:
   contents: read
 jobs:
   signed-watch:
-    # Ephemeral trusted runner with the licensed Garmin SDK/devices installed.
-    # Never use this runner for pull requests or untrusted branches.
-    if: github.repository == 'JshStadler/esp32-secure-ble-key' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v'))
-    runs-on: [self-hosted, Windows, X64, blekey-garmin-release]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Build all supported watches with the repository signing key
-        shell: powershell
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Download Garmin SDK signing tools
+        run: |
+          curl --fail --location --retry 3 https://developer.garmin.com/downloads/connect-iq/sdks/connectiq-sdk-lin-9.1.0-2026-03-09-6a872a80b.zip -o "$RUNNER_TEMP/sdk.zip"
+          unzip -q "$RUNNER_TEMP/sdk.zip" -d "$RUNNER_TEMP/garmin-sdk"
+      - name: Fetch reviewed compiler output
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RELEASE: ${{ inputs.input_release }}
+          INPUT_SHA256: ${{ inputs.input_sha256 }}
+        run: |
+          gh release download "$INPUT_RELEASE" --pattern garmin-build-inputs.zip --dir "$RUNNER_TEMP"
+          printf '%s  %s\n' "$INPUT_SHA256" "$RUNNER_TEMP/garmin-build-inputs.zip" | sha256sum --check
+          unzip -q "$RUNNER_TEMP/garmin-build-inputs.zip" -d "$RUNNER_TEMP/garmin-input"
+      - name: Re-sign and verify both watch packages with repository secret
         env:
           GARMIN_DEVELOPER_KEY_BASE64: ${{ secrets.GARMIN_DEVELOPER_KEY_BASE64 }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $sdk = (Get-Content "$env:APPDATA/Garmin/ConnectIQ/current-sdk.cfg").Trim()
-          $java = 'C:/dev/jdk-17/bin/java.exe'
-          $key = Join-Path $env:RUNNER_TEMP 'garmin-release.der'
-          try {
-            [IO.File]::WriteAllBytes($key, [Convert]::FromBase64String($env:GARMIN_DEVELOPER_KEY_BASE64))
-            New-Item -ItemType Directory -Force release | Out-Null
-            foreach ($kind in @('Car', 'Gate')) {
-              $project = if ($kind -eq 'Car') { 'Garmin_Watch_App' } else { 'Garmin_Gate_Watch_App' }
-              foreach ($device in @('fr165', 'fr165m', 'fr265', 'fr265s', 'fr965')) {
-                & $java '-Xms256m' '-Dfile.encoding=UTF-8' -cp "$sdk/bin/monkeybrains.jar" com.garmin.monkeybrains.Monkeybrains -f "$project/monkey.jungle" -d $device -o "release/BLE-$kind-Key-$device.prg" -y $key -r -w
-                if ($LASTEXITCODE -ne 0) { throw "Build failed: $kind $device" }
-              }
-              & $java '-Xms256m' '-Dfile.encoding=UTF-8' -cp "$sdk/bin/monkeybrains.jar" com.garmin.monkeybrains.Monkeybrains -f "$project/monkey.jungle" -e -o "release/BLE-$kind-Key.iq" -y $key -r -w
-              if ($LASTEXITCODE -ne 0) { throw "Package failed: $kind" }
-            }
-          } finally { Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue }
+          key="$RUNNER_TEMP/garmin-release.der"
+          trap 'rm -f "$key"' EXIT
+          printf '%s' "$GARMIN_DEVELOPER_KEY_BASE64" | base64 --decode > "$key"
+          jar=$(find "$RUNNER_TEMP/garmin-sdk" -name monkeybrains.jar -print -quit)
+          for kind in Car Gate; do
+            java -cp "$jar" tools/SignGarmin.java "$key" "$RUNNER_TEMP/garmin-input/BLE-$kind-Key.iq" release
+          done
       - uses: actions/upload-artifact@v7
         with:
           name: Garmin-signed-release
