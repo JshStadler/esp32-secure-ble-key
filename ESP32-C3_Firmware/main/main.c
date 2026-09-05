@@ -57,6 +57,7 @@
 
 /* PSA Crypto for HMAC-SHA256 (ESP-IDF 6 / mbedTLS 4 public API) */
 #include "psa/crypto.h"
+#include "psk_update.h"
 
 /* BLE TX power control (NimBLE on C3) */
 #include "esp_bt.h"
@@ -265,8 +266,6 @@ static uint16_t challenge_val_handle;
 static uint16_t status_val_handle;
 static uint16_t ota_status_val_handle;
 
-/* Status string (persists between reads) */
-static char status_str[32] = "READY";
 static char ota_status_str[32] = "OTA:IDLE";
 
 #define OTA_OP_START 0x01
@@ -295,7 +294,11 @@ typedef struct {
     uint16_t conn_handle;
     bool     in_use;
     bool     authenticated;
+    bool     closing;
     uint8_t  nonce[NONCE_LEN];
+    int64_t  connected_at;
+    uint8_t  auth_failures;
+    char     status[PSK2_RECEIPT_SIZE];
     int64_t  last_activity_at;  /* milliseconds from now_ms() */
 } client_state_t;
 
@@ -340,6 +343,7 @@ static struct os_mbuf *om_from_buf(const void *buf, uint16_t len);
 static int  gap_event_handler(struct ble_gap_event *event, void *arg);
 static void ble_health_event_callback(struct ble_npl_event *event);
 static void ota_abort_session(void);
+static void maintain_ble_state(void);
 
 /* ============================================================
  * Utility: time helpers
@@ -439,7 +443,7 @@ static void load_psk(void) {
     nvs_handle_t handle;
     esp_err_t err = nvs_open("car_unlock", NVS_READONLY, &handle);
     if (err == ESP_OK) {
-        size_t len = MAX_PSK_LEN;
+        size_t len = sizeof(current_psk);
         err = nvs_get_str(handle, "psk", current_psk, &len);
         nvs_close(handle);
         /* len includes null terminator, so len > 1 means non-empty */
@@ -449,10 +453,16 @@ static void load_psk(void) {
         }
     }
 
-    /* Fall back to default PSK */
-    strncpy(current_psk, DEFAULT_PSK, MAX_PSK_LEN);
-    current_psk[MAX_PSK_LEN] = '\0';
-    LOG_W(TAG, "Using default PSK");
+    /* Only a genuinely unprovisioned device may use an explicitly customized
+     * compile-time key. Never restore a public placeholder on storage errors. */
+    current_psk[0] = '\0';
+    if ((err == ESP_ERR_NVS_NOT_FOUND) &&
+        strcmp(DEFAULT_PSK, "CHANGE_ME_before_flashing_32chars!") != 0) {
+        strncpy(current_psk, DEFAULT_PSK, MAX_PSK_LEN);
+        current_psk[MAX_PSK_LEN] = '\0';
+    } else {
+        LOG_E(TAG, "No valid provisioned PSK; remote commands disabled");
+    }
 }
 
 static bool save_psk(const char *new_psk) {
@@ -473,9 +483,10 @@ static bool save_psk(const char *new_psk) {
         LOG_E(TAG, "NVS PSK write failed: %s", esp_err_to_name(err));
     }
 
-    /* Always update in-memory PSK so current session works */
-    strncpy(current_psk, new_psk, MAX_PSK_LEN);
-    current_psk[MAX_PSK_LEN] = '\0';
+    if (persisted) {
+        strncpy(current_psk, new_psk, MAX_PSK_LEN);
+        current_psk[MAX_PSK_LEN] = '\0';
+    }
     return persisted;
 }
 
@@ -534,6 +545,7 @@ static bool compute_hmac(const uint8_t *nonce, size_t nonce_len,
 
 static void ble_health_event_callback(struct ble_npl_event *event) {
     (void)event;
+    maintain_ble_state();
     ble_heartbeat_ack_count++;
 }
 
@@ -557,7 +569,7 @@ static int find_client_by_handle(uint16_t conn_handle) {
 
 static int ensure_client_slot(uint16_t conn_handle) {
     int slot = find_client_by_handle(conn_handle);
-    if (slot >= 0) return slot;
+    if (slot >= 0) return clients[slot].closing ? -1 : slot;
 
     struct ble_gap_conn_desc desc;
     if (ble_gap_conn_find(conn_handle, &desc) != 0) return -1;
@@ -565,7 +577,10 @@ static int ensure_client_slot(uint16_t conn_handle) {
     slot = find_client_slot();
     if (slot < 0) return -1;
 
+    memset(&clients[slot], 0, sizeof(clients[slot]));
     clients[slot].in_use        = true;
+    clients[slot].connected_at = now_ms();
+    strcpy(clients[slot].status, "READY");
     clients[slot].authenticated = false;
     clients[slot].last_activity_at = now_ms();
     clients[slot].conn_handle   = conn_handle;
@@ -585,6 +600,7 @@ static void mark_authenticated(uint16_t conn_handle) {
     int slot = find_client_by_handle(conn_handle);
     if (slot >= 0) {
         clients[slot].authenticated = true;
+        clients[slot].auth_failures = 0;
         clients[slot].last_activity_at = now_ms();
     }
 }
@@ -658,8 +674,11 @@ static struct os_mbuf *om_from_buf(const void *buf, uint16_t len) {
 }
 
 static void set_status(uint16_t conn_handle, const char *msg) {
-    strncpy(status_str, msg, sizeof(status_str) - 1);
-    status_str[sizeof(status_str) - 1] = '\0';
+    int slot = find_client_by_handle(conn_handle);
+    if (slot < 0) return;
+    char *status_str = clients[slot].status;
+    strncpy(status_str, msg, sizeof(clients[slot].status) - 1);
+    status_str[sizeof(clients[slot].status) - 1] = '\0';
 
     /* A command result belongs only to its initiating client. Broadcasting it
      * makes another connected phone/watch report a command it did not send. */
@@ -781,6 +800,7 @@ static bool verify_auth(uint16_t conn_handle, uint8_t command,
         return false;
     }
 
+    if (!current_psk[0] || clients[slot].auth_failures >= 5) return false;
     if (len != HMAC_LEN) {
         LOG_W(TAG, "Auth failed: bad HMAC len handle=%d len=%d",
               conn_handle, (int)len);
@@ -817,6 +837,13 @@ static bool verify_auth(uint16_t conn_handle, uint8_t command,
 
     generate_nonce_for_slot(slot, true);  /* rotate unconditionally */
     bool ok = (diff == 0);
+    if (!ok) {
+        clients[slot].auth_failures++;
+        if (clients[slot].auth_failures >= 5) {
+            clients[slot].closing = true;
+            ble_gap_terminate(conn_handle, BLE_ERR_CONN_TERM_LOCAL);
+        }
+    }
     LOG_I(TAG, "Auth %s handle=%d slot=%d", ok ? "OK" : "FAIL", conn_handle, slot);
     return ok;
 }
@@ -833,7 +860,7 @@ static int chr_access_challenge(uint16_t conn_handle, uint16_t attr_handle,
         if (slot < 0) return BLE_ATT_ERR_UNLIKELY;
 
         LOG_I(TAG, "Challenge read handle=%d slot=%d", conn_handle, slot);
-        clients[slot].last_activity_at = now_ms();
+        if (clients[slot].authenticated) clients[slot].last_activity_at = now_ms();
         int rc = os_mbuf_append(ctxt->om, clients[slot].nonce, NONCE_LEN);
         return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
@@ -844,7 +871,9 @@ static int chr_access_challenge(uint16_t conn_handle, uint16_t attr_handle,
 static int chr_access_status(uint16_t conn_handle, uint16_t attr_handle,
                              struct ble_gatt_access_ctxt *ctxt, void *arg) {
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-        int rc = os_mbuf_append(ctxt->om, status_str, strlen(status_str));
+        int slot = ensure_client_slot(conn_handle);
+        if (slot < 0) return BLE_ATT_ERR_UNLIKELY;
+        int rc = os_mbuf_append(ctxt->om, clients[slot].status, strlen(clients[slot].status));
         return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
     return BLE_ATT_ERR_UNLIKELY;
@@ -1008,56 +1037,68 @@ static int chr_access_command_pt2(uint16_t conn_handle, uint16_t attr_handle,
     return 0;
 }
 
-/* API-v2 PSK update: [HMAC(v2 transcript, command=0x03)] [0x00] [newPSK] */
+/* PSK2 rejects the old plaintext update format. The ordinary API-v2
+ * command and Garmin characteristic table remain unchanged. */
 static int chr_access_psk_update(uint16_t conn_handle, uint16_t attr_handle,
                                  struct ble_gatt_access_ctxt *ctxt, void *arg) {
-    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
-        return BLE_ATT_ERR_UNLIKELY;
-    }
-
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
+    int slot = ensure_client_slot(conn_handle);
+    if (slot < 0) return BLE_ATT_ERR_UNLIKELY;
     uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
-    if (len > HMAC_LEN + 1 + MAX_PSK_LEN) {
+    if (len < 30 || len > PSK2_MAX_PACKET) {
         set_status(conn_handle, "ERR:PSK_FORMAT");
         return 0;
     }
-
-    uint8_t buf[HMAC_LEN + 1 + MAX_PSK_LEN];
-    os_mbuf_copydata(ctxt->om, 0, len, buf);
-
-    /* The separator must be at exactly position HMAC_LEN (byte 32).
-     * Bytes 0..31 are the HMAC (which can legitimately contain 0x00),
-     * byte 32 must be 0x00, and the rest is the new PSK. */
-    if (len < HMAC_LEN + 2 || buf[HMAC_LEN] != 0x00) {
-        set_status(conn_handle, "ERR:PSK_FORMAT");
-        return 0;
-    }
-
-    int sep_idx = HMAC_LEN;
-
-    if (!verify_auth(conn_handle, CMD_PSK_UPDATE, buf, sep_idx)) {
+    uint8_t packet[PSK2_MAX_PACKET], receipt_key[32];
+    char replacement[PSK2_MAX_KEY + 1], receipt[PSK2_RECEIPT_SIZE];
+    if (os_mbuf_copydata(ctxt->om, 0, len, packet) != 0) return BLE_ATT_ERR_UNLIKELY;
+    bool valid = clients[slot].authenticated && !clients[slot].closing &&
+        psk2_decrypt(current_psk, COMMAND_DEVICE_BINDING, clients[slot].nonce,
+                     packet, len, replacement, receipt_key);
+    generate_nonce_for_slot(slot, true);
+    if (!valid) {
+        psk2_zero(replacement, sizeof(replacement));
+        psk2_zero(receipt_key, sizeof(receipt_key));
         set_status(conn_handle, "ERR:PSK_AUTH");
+        if (++clients[slot].auth_failures >= 5) {
+            clients[slot].closing = true;
+            ble_gap_terminate(conn_handle, BLE_ERR_CONN_TERM_LOCAL);
+        }
         return 0;
     }
-
-    size_t new_psk_len = len - sep_idx - 1;
-    if (new_psk_len == 0 || new_psk_len > MAX_PSK_LEN) {
-        set_status(conn_handle, "ERR:PSK_LENGTH");
+    /* Prepare both authenticated outcomes BEFORE committing. Crypto failure
+     * cannot change the key without a receipt we can return. */
+    char failure_receipt[PSK2_RECEIPT_SIZE];
+    bool receipts_ok = psk2_receipt(receipt_key, packet, len, true, receipt) &&
+        psk2_receipt(receipt_key, packet, len, false, failure_receipt);
+    psk2_zero(receipt_key, sizeof(receipt_key));
+    if (!receipts_ok) {
+        psk2_zero(replacement, sizeof(replacement));
+        set_status(conn_handle, "ERR:PSK_CRYPTO");
         return 0;
     }
-
-    char new_psk[MAX_PSK_LEN + 1];
-    memcpy(new_psk, buf + sep_idx + 1, new_psk_len);
-    new_psk[new_psk_len] = '\0';
-
-    bool persisted = save_psk(new_psk);
+    bool persisted = save_psk(replacement);
+    psk2_zero(replacement, sizeof(replacement));
     mark_authenticated(conn_handle);
-    set_status(conn_handle, persisted ? "OK:PSK_UPDATED" : "WARN:PSK_VOLATILE");
+    set_status(conn_handle, persisted ? receipt : failure_receipt);
+    if (persisted) {
+        /* Revoke other sessions authorized with the old key. */
+        for (int i = 0; i < MAX_CONNECTIONS; ++i) {
+            if (i != slot && clients[i].in_use) {
+                clients[i].closing = true;
+                clients[i].authenticated = false;
+                invalidate_split_cmd_for(clients[i].conn_handle);
+                if (ota_session.active && ota_session.conn_handle == clients[i].conn_handle) ota_abort_session();
+                ble_gap_terminate(clients[i].conn_handle, BLE_ERR_CONN_TERM_LOCAL);
+            }
+        }
+    }
     return 0;
 }
 
 static int chr_access_identity(uint16_t conn_handle, uint16_t attr_handle,
                                struct ble_gatt_access_ctxt *ctxt, void *arg) {
-    static const char identity[] = "blekey|2|car-main|car|press,ota1";
+    static const char identity[] = "blekey|2|car-main|car|press,ota1,psk2";
     if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
     return os_mbuf_append(ctxt->om, identity, sizeof(identity) - 1) == 0
         ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
@@ -1228,6 +1269,7 @@ static int chr_access_ota_data(uint16_t conn_handle, uint16_t attr_handle,
         return 0;
     }
     ota_session.received += chunk_len;
+    mark_authenticated(conn_handle);
     mark_ble_activity();
     return 0;
 }
@@ -1335,7 +1377,10 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
 
         int slot = find_client_slot();
         if (slot >= 0) {
+            memset(&clients[slot], 0, sizeof(clients[slot]));
             clients[slot].in_use        = true;
+            clients[slot].connected_at = now_ms();
+            strcpy(clients[slot].status, "READY");
             clients[slot].authenticated = false;
             clients[slot].last_activity_at = now_ms();
             clients[slot].conn_handle   = conn_handle;
@@ -1570,47 +1615,10 @@ static void nimble_host_task(void *param) {
  * Main loop task: ghost reaper, timeouts, periodic restart
  * ============================================================ */
 
-static void main_loop_task(void *param) {
-    /* Subscribe this task to the task watchdog */
-    bool subscribed_to_wdt = false;
-    if (task_wdt_enabled) {
-        esp_err_t wdt_ret = esp_task_wdt_add(NULL);
-        if (wdt_ret == ESP_OK) {
-            subscribed_to_wdt = true;
-            LOG_I(TAG, "Main loop started, WDT subscribed");
-        } else {
-            LOG_E(TAG, "Failed to subscribe main loop to TWDT: %s",
-                  esp_err_to_name(wdt_ret));
-        }
-    }
-
-    uint32_t last_ble_heartbeat_ack = ble_heartbeat_ack_count;
-    uint8_t missed_ble_heartbeats = 0;
-
-    while (1) {
-        if (subscribed_to_wdt) {
-            esp_task_wdt_reset();
-        }
-        int64_t now = now_ms();
-
-        /* ---- NimBLE host event-loop watchdog ----
-         * This event can only be acknowledged by the NimBLE host task. If the
-         * queue stops progressing, the normal task watchdog may still be fed
-         * by this maintenance task, so detect that failure independently. */
-        if (!ble_npl_event_is_queued(&ble_health_event)) {
-            ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &ble_health_event);
-        }
-        uint32_t heartbeat_ack = ble_heartbeat_ack_count;
-        if (heartbeat_ack == last_ble_heartbeat_ack) {
-            if (++missed_ble_heartbeats >= BLE_HEALTH_MAX_MISSED_HEARTBEATS) {
-                LOG_E(TAG, "NimBLE host heartbeat stalled, restarting");
-                esp_restart();
-            }
-        } else {
-            last_ble_heartbeat_ack = heartbeat_ack;
-            missed_ble_heartbeats = 0;
-        }
-
+/* Called only on the NimBLE event queue: client slots, advertising, and
+ * OTA handles now have one owner. The independent task only watches its heartbeat. */
+static void maintain_ble_state(void) {
+    int64_t now = now_ms();
         /* ---- Ghost slot reaper ----
          * If we have more in_use slots than NimBLE has active connections,
          * at least one slot is orphaned. Find and free them. */
@@ -1671,18 +1679,20 @@ static void main_loop_task(void *param) {
         for (int i = 0; i < MAX_CONNECTIONS; i++) {
             if (!clients[i].in_use) continue;
 
-            int64_t elapsed = now - clients[i].last_activity_at;
+            int64_t elapsed = now - (clients[i].authenticated
+                ? clients[i].last_activity_at : clients[i].connected_at);
             int64_t timeout = clients[i].authenticated
                 ? (int64_t)AUTH_TIMEOUT_SEC * 1000
                 : (int64_t)UNAUTH_TIMEOUT_SEC * 1000;
 
-            if (elapsed > timeout) {
+            if (clients[i].closing || elapsed > timeout) {
                 LOG_I(TAG, "Timeout slot %d (handle %d, auth=%d)",
                       i, clients[i].conn_handle, clients[i].authenticated);
 
-                /* Force-free slot BEFORE disconnect */
+                /* Reserve the slot until NimBLE confirms teardown. A late
+                 * packet must not repair it into a new unauthenticated session. */
                 uint16_t handle = clients[i].conn_handle;
-                clients[i].in_use = false;
+                clients[i].closing = true;
                 clients[i].authenticated = false;
                 invalidate_split_cmd_for(handle);
                 if (ota_session.active && ota_session.conn_handle == handle) {
@@ -1698,15 +1708,54 @@ static void main_loop_task(void *param) {
         /* ---- Periodic restart (only when idle) ---- */
         if (now > (int64_t)RESTART_INTERVAL_SEC * 1000 && count_active_slots() == 0) {
             LOG_I(TAG, "Periodic restart (no active connections)");
-            vTaskDelay(pdMS_TO_TICKS(50));  /* allow log flush */
             esp_restart();
         }
 
         /* ---- Hard restart (unconditional, guards against long-running drift) ---- */
-        if (now > (int64_t)HARD_RESTART_SEC * 1000) {
+        if (now > (int64_t)HARD_RESTART_SEC * 1000 && !ota_session.active && !button_busy) {
             LOG_E(TAG, "Hard restart after %d hours", HARD_RESTART_SEC / 3600);
-            vTaskDelay(pdMS_TO_TICKS(50));
             esp_restart();
+        }
+
+}
+
+static void main_loop_task(void *param) {
+    /* Subscribe this task to the task watchdog */
+    bool subscribed_to_wdt = false;
+    if (task_wdt_enabled) {
+        esp_err_t wdt_ret = esp_task_wdt_add(NULL);
+        if (wdt_ret == ESP_OK) {
+            subscribed_to_wdt = true;
+            LOG_I(TAG, "Main loop started, WDT subscribed");
+        } else {
+            LOG_E(TAG, "Failed to subscribe main loop to TWDT: %s",
+                  esp_err_to_name(wdt_ret));
+        }
+    }
+
+    uint32_t last_ble_heartbeat_ack = ble_heartbeat_ack_count;
+    uint8_t missed_ble_heartbeats = 0;
+
+    while (1) {
+        if (subscribed_to_wdt) {
+            esp_task_wdt_reset();
+        }
+        /* ---- NimBLE host event-loop watchdog ----
+         * This event can only be acknowledged by the NimBLE host task. If the
+         * queue stops progressing, the normal task watchdog may still be fed
+         * by this maintenance task, so detect that failure independently. */
+        if (!ble_npl_event_is_queued(&ble_health_event)) {
+            ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &ble_health_event);
+        }
+        uint32_t heartbeat_ack = ble_heartbeat_ack_count;
+        if (heartbeat_ack == last_ble_heartbeat_ack) {
+            if (++missed_ble_heartbeats >= BLE_HEALTH_MAX_MISSED_HEARTBEATS) {
+                LOG_E(TAG, "NimBLE host heartbeat stalled, restarting");
+                esp_restart();
+            }
+        } else {
+            last_ble_heartbeat_ack = heartbeat_ack;
+            missed_ble_heartbeats = 0;
         }
 
         vTaskDelay(pdMS_TO_TICKS(LOOP_INTERVAL_MS));
@@ -1755,10 +1804,7 @@ void app_main(void) {
 
     /* ---- NVS init ---- */
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        nvs_flash_init();
-    }
+    ESP_ERROR_CHECK(ret); /* Preserve credentials on all storage failures. */
 
     /* ---- Init PSA Crypto for HMAC ---- */
     psa_status_t psa_status = psa_crypto_init();

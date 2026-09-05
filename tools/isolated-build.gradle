@@ -1,0 +1,5 @@
+// Optional local verification output, independent of stale IDE/OneDrive files.
+allprojects {
+    def output = System.getenv('BLEKEY_BUILD_DIR')
+    layout.buildDirectory.set(output ? new File(output, project.name) : new File(rootProject.projectDir, '.review-build/' + project.name))
+}

@@ -6,10 +6,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class CarKeyProtocolTest {
-    @Test fun pskUpdateContainsHmacSeparatorAndUtf8Key() {
-        val result = CarKeyProtocol.pskUpdate(BleDeviceProfiles.CAR, byteArrayOf(1, 2, 3), "old", "new-key")
-        assertEquals(0, result[32].toInt())
-        assertArrayEquals("new-key".toByteArray(), result.copyOfRange(33, result.size))
+    @Test(expected = IllegalArgumentException::class) fun rejectsMalformedNonce() {
+        CarKeyProtocol.command(BleDeviceProfiles.CAR, CarKeyProtocol.PRESS_COMMAND, byteArrayOf(1, 2, 3), "secret")
     }
 
     @Test fun v2BindsProtocolDeviceCommandAndChallenge() {
