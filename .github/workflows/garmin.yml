@@ -12,6 +12,9 @@ permissions:
   contents: read
 jobs:
   signed-watch:
+    # GitHub requires write access even to read an unpublished draft release.
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
