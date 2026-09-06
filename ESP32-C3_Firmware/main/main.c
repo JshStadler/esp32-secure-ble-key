@@ -14,12 +14,11 @@
  * Power optimisations (ESP-IDF):
  *   - Wi-Fi is never initialized; only the BLE radio is active at runtime
  *   - DFS: CPU scales 80 MHz <-> 10 MHz automatically via PM framework
- *   - Auto light sleep: CPU enters light sleep during FreeRTOS tickless
- *     idle (~2-5 mA idle vs ~15-20 mA with Arduino framework)
- *   - NimBLE modem sleep cooperates with PM light sleep
+ *   - Automatic light sleep requested; actual savings depend on radio locks
+ *   - BLE modem sleep remains disabled for connection reliability
  *   - USB-CDC console disabled in production (CONFIG_ESP_CONSOLE_NONE)
  *   - Button GPIO held in high-impedance (INPUT) at idle
- *   - Conservative advertising interval (1s)
+ *   - Advertising: 50-100ms fast window, 200-400ms afterwards
  *   - Periodic restart every 3 hours (when idle)
  *
  * BLE GATT Service:
@@ -36,6 +35,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <inttypes.h>
 
 /* FreeRTOS */
 #include "freertos/FreeRTOS.h"
@@ -50,6 +50,11 @@
 #include "esp_sleep.h"
 #include "esp_task_wdt.h"
 #include "esp_ota_ops.h"
+#include "esp_app_desc.h"
+#include "esp_attr.h"
+#include "ota_health.h"
+#include "device_health.h"
+#include "radio_config.h"
 #include "esp_partition.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -134,13 +139,10 @@ static const char *TAG = "CAR_UNLOCK";
  * Fast mode improves Garmin discovery after boot/disconnect/activity.
  * Idle mode stays responsive enough for short Garmin scan windows while
  * remaining substantially less active than the reconnect burst. */
-#define ADV_FAST_INTERVAL_MIN 80    /* 50ms */
-#define ADV_FAST_INTERVAL_MAX 160   /* 100ms */
-#define ADV_SLOW_INTERVAL_MIN 320   /* 200ms */
-#define ADV_SLOW_INTERVAL_MAX 640   /* 400ms */
-
-/* Keep fast advertising active briefly after events where a reconnect is likely. */
-#define FAST_ADV_WINDOW_SEC 60
+/* Defaults remain 50-100ms recent, 200-400ms idle, with a 60-second window.
+ * Authenticated app settings may override them; see radio_config.h. */
+static radio_config_t radio_config = RADIO_DEFAULTS;
+static bool radio_config_persisted = false;
 
 /* Max simultaneous BLE connections */
 #define MAX_CONNECTIONS 3
@@ -148,6 +150,7 @@ static const char *TAG = "CAR_UNLOCK";
 /* Auto-disconnect timeouts (seconds) */
 #define UNAUTH_TIMEOUT_SEC 20
 #define AUTH_TIMEOUT_SEC   1800
+#define MAX_AUTH_FAILURES 5
 
 /* Periodic restart interval (seconds). 3 hours = 10800s. */
 #define RESTART_INTERVAL_SEC 10800
@@ -321,9 +324,31 @@ static uint8_t adv_failure_count = 0;
 static bool adv_using_fast_interval = false;
 static int64_t fast_adv_until_ms = 0;
 static bool task_wdt_enabled = false;
+static volatile bool task_wdt_monitored = false;
 static struct ble_npl_event ble_health_event;
+static struct ble_npl_callout slow_adv_callout;
 static volatile uint32_t ble_heartbeat_ack_count = 0;
 static uint8_t adv_health_failure_count = 0;
+static bool ble_synced = false;
+static bool ota_pending_verify = false;
+static ota_health_t ota_health;
+static uint32_t adv_recoveries = 0;
+static uint32_t ghost_reaps = 0;
+
+/* Retain a small reason code over software restarts without wearing NVS.
+ * Ignore RTC contents after power loss, brownout, or a different reset type. */
+enum reboot_cause { REBOOT_OTHER, REBOOT_OTA, REBOOT_PERIODIC, REBOOT_DAILY,
+    REBOOT_BLE_RESET, REBOOT_BLE_EXIT, REBOOT_BLE_STALL, REBOOT_ADVERTISING,
+    REBOOT_TASK, REBOOT_OTA_HEALTH };
+static RTC_NOINIT_ATTR uint32_t reboot_magic;
+static RTC_NOINIT_ATTR uint32_t reboot_cause;
+static uint32_t previous_reboot_cause;
+
+static void restart_with_reason(enum reboot_cause cause) {
+    reboot_cause = cause;
+    reboot_magic = 0x424c4831;
+    esp_restart();
+}
 
 /* Non-blocking button press: one-shot timer releases the GPIO */
 static esp_timer_handle_t button_timer = NULL;
@@ -723,7 +748,7 @@ static void ota_abort_session(void) {
 
 static void ota_reboot_callback(void *arg) {
     (void)arg;
-    esp_restart();
+    restart_with_reason(REBOOT_OTA);
 }
 
 static bool ota_client_is_authenticated(uint16_t conn_handle) {
@@ -757,17 +782,76 @@ static bool ota_verify_start_auth(uint16_t conn_handle, uint32_t image_size,
     return valid;
 }
 
-static void confirm_running_ota_image(void) {
+static void init_ota_health(void) {
     const esp_partition_t *running = esp_ota_get_running_partition();
     esp_ota_img_states_t state;
     if (esp_ota_get_state_partition(running, &state) == ESP_OK &&
         state == ESP_OTA_IMG_PENDING_VERIFY) {
-        ESP_ERROR_CHECK(esp_ota_mark_app_valid_cancel_rollback());
+        ota_pending_verify = true;
+    }
+}
+
+static void load_radio_config(void) {
+    radio_config_persisted = false;
+    nvs_handle_t handle;
+    if (nvs_open("car_unlock", NVS_READONLY, &handle) != ESP_OK) return;
+    uint8_t data[1 + RADIO_CONFIG_SIZE];
+    size_t length = sizeof(data);
+    esp_err_t err = nvs_get_blob(handle, "radio1", data, &length);
+    nvs_close(handle);
+    radio_config_t loaded;
+    if (err == ESP_OK && length == sizeof(data) && data[0] == 1 &&
+        radio_config_decode(&loaded, data + 1)) {
+        radio_config = loaded;
+        radio_config_persisted = true;
+    }
+}
+
+static bool save_radio_config(const radio_config_t *config) {
+    if (!radio_config_valid(config)) return false;
+    uint8_t data[1 + RADIO_CONFIG_SIZE] = {1}, current[RADIO_CONFIG_SIZE];
+    radio_config_encode(data + 1, config);
+    radio_config_encode(current, &radio_config);
+    if (radio_config_persisted && memcmp(data + 1, current, sizeof(current)) == 0) return true;
+    nvs_handle_t handle;
+    if (nvs_open("car_unlock", NVS_READWRITE, &handle) != ESP_OK) return false;
+    esp_err_t err = nvs_set_blob(handle, "radio1", data, sizeof(data));
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    if (err != ESP_OK) return false;
+    radio_config = *config;
+    radio_config_persisted = true;
+    return true;
+}
+
+static void check_running_ota_image(bool healthy) {
+    if (!ota_pending_verify) return;
+    switch (ota_health_check(&ota_health, now_ms(), healthy)) {
+        case OTA_HEALTH_CONFIRM:
+            ESP_ERROR_CHECK(esp_ota_mark_app_valid_cancel_rollback());
+            ota_pending_verify = false;
+            break;
+        case OTA_HEALTH_ROLLBACK:
+            reboot_cause = REBOOT_OTA_HEALTH;
+            reboot_magic = 0x424c4831;
+            esp_ota_mark_app_invalid_rollback_and_reboot();
+            /* If there is no rollback candidate, leave the image unconfirmed. */
+            restart_with_reason(REBOOT_OTA_HEALTH);
+            break;
+        case OTA_HEALTH_WAIT: break;
     }
 }
 
 static void mark_ble_activity(void) {
-    fast_adv_until_ms = now_ms() + ((int64_t)FAST_ADV_WINDOW_SEC * 1000);
+    fast_adv_until_ms = now_ms() + ((int64_t)radio_config.idle_seconds * 1000);
+    ble_npl_callout_reset(&slow_adv_callout,
+        ble_npl_time_ms_to_ticks32((uint32_t)radio_config.idle_seconds * 1000));
+    if (ble_synced && adv_active && !adv_using_fast_interval) start_advertising();
+}
+
+static void slow_adv_callback(struct ble_npl_event *event) {
+    (void)event;
+    if (adv_active && now_ms() >= fast_adv_until_ms) start_advertising();
 }
 
 static void request_ota_connection_params(uint16_t conn_handle) {
@@ -1096,11 +1180,73 @@ static int chr_access_psk_update(uint16_t conn_handle, uint16_t attr_handle,
     return 0;
 }
 
+static const char *health_reset_reason(void) {
+    if (esp_reset_reason() == ESP_RST_SW) {
+        switch (previous_reboot_cause) {
+            case REBOOT_OTA: return "ota_update";
+            case REBOOT_PERIODIC: return "scheduled_idle";
+            case REBOOT_DAILY: return "scheduled_daily";
+            case REBOOT_BLE_RESET: return "ble_host_reset";
+            case REBOOT_BLE_EXIT: return "ble_host_exit";
+            case REBOOT_BLE_STALL: return "ble_host_stall";
+            case REBOOT_ADVERTISING: return "advertising_failure";
+            case REBOOT_TASK: return "task_start_failure";
+            case REBOOT_OTA_HEALTH: return "ota_health_failure";
+            default: return "software";
+        }
+    }
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON: return "power_on";
+        case ESP_RST_EXT: return "external";
+        case ESP_RST_PANIC: return "panic";
+        case ESP_RST_INT_WDT: return "interrupt_watchdog";
+        case ESP_RST_TASK_WDT: return "task_watchdog";
+        case ESP_RST_WDT: return "watchdog";
+        case ESP_RST_DEEPSLEEP: return "deep_sleep";
+        case ESP_RST_BROWNOUT: return "brownout";
+        case ESP_RST_SDIO: return "sdio";
+        default: return "unknown";
+    }
+}
+
 static int chr_access_identity(uint16_t conn_handle, uint16_t attr_handle,
                                struct ble_gatt_access_ctxt *ctxt, void *arg) {
-    static const char identity[] = "blekey|2|car-main|car|press,ota1,psk2";
     if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
-    return os_mbuf_append(ctxt->om, identity, sizeof(identity) - 1) == 0
+    int slot = find_client_by_handle(conn_handle);
+    if (slot < 0 || !clients[slot].authenticated || clients[slot].closing) {
+        return os_mbuf_append(ctxt->om, CAR_IDENTITY, sizeof(CAR_IDENTITY) - 1) == 0
+            ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    const esp_app_desc_t *app = esp_app_get_description();
+    char build[13];
+    for (int i = 0; i < 6; ++i) snprintf(build + i * 2, 3, "%02x", app->app_elf_sha256[i]);
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    const char *ota = "unknown";
+    esp_err_t state_result = esp_ota_get_state_partition(running, &state);
+    if (state_result == ESP_OK) {
+        switch (state) {
+            case ESP_OTA_IMG_PENDING_VERIFY: ota = "pending"; break;
+            case ESP_OTA_IMG_VALID: ota = "valid"; break;
+            case ESP_OTA_IMG_UNDEFINED: ota = "initial"; break;
+            default: break;
+        }
+    } else if (state_result == ESP_ERR_NOT_FOUND || running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY) ota = "initial";
+    device_health_t health = {
+        .version = app->version, .build = build, .idf = app->idf_ver,
+        .reset = health_reset_reason(), .ota = ota,
+        .uptime_s = (uint64_t)(now_ms() / 1000),
+        .free_heap = esp_get_free_heap_size(), .min_heap = esp_get_minimum_free_heap_size(),
+        .connections = count_active_slots(), .adv_recoveries = adv_recoveries,
+        .ghost_reaps = ghost_reaps,
+        .radio = radio_config,
+        .adv_mode = !ble_gap_adv_active() ? "off" : adv_using_fast_interval ? "recent" : "inactive",
+    };
+    char response[512];
+    int length = device_health_format(response, sizeof(response), &health);
+    if (length < 0 || (size_t)length >= sizeof(response)) return BLE_ATT_ERR_INSUFFICIENT_RES;
+    clients[slot].last_activity_at = now_ms();
+    return os_mbuf_append(ctxt->om, response, length) == 0
         ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
 
@@ -1122,6 +1268,46 @@ static int chr_access_ota_control(uint16_t conn_handle, uint16_t attr_handle,
         return 0;
     }
     os_mbuf_copydata(ctxt->om, 0, len, payload);
+
+    if (payload[0] == 0x04) {
+        int slot = find_client_by_handle(conn_handle);
+        if (len != RADIO_PACKET_SIZE || slot < 0 || !clients[slot].authenticated || clients[slot].closing) {
+            set_ota_status(conn_handle, "ERR:RADIO_AUTH");
+            return 0;
+        }
+        uint8_t transcript[RADIO_TRANSCRIPT_SIZE], expected[HMAC_LEN];
+        radio_transcript(transcript, clients[slot].nonce, payload + 1);
+        bool valid = compute_hmac(transcript, sizeof(transcript), current_psk, expected) &&
+            constant_time_equal(expected, payload + 1 + RADIO_CONFIG_SIZE, HMAC_LEN);
+        generate_nonce_for_slot(slot, true);
+        if (!valid) {
+            set_ota_status(conn_handle, "ERR:RADIO_AUTH");
+            if (++clients[slot].auth_failures >= MAX_AUTH_FAILURES) {
+                clients[slot].closing = true;
+                clients[slot].authenticated = false;
+                ble_gap_terminate(conn_handle, BLE_ERR_CONN_TERM_LOCAL);
+            }
+            return 0;
+        }
+        if (ota_session.active || ota_pending_verify) {
+            set_ota_status(conn_handle, "ERR:RADIO_BUSY");
+            return 0;
+        }
+        radio_config_t requested;
+        if (!radio_config_decode(&requested, payload + 1)) {
+            set_ota_status(conn_handle, "ERR:RADIO_RANGE");
+            return 0;
+        }
+        if (!save_radio_config(&requested)) {
+            set_ota_status(conn_handle, "ERR:RADIO_SAVE");
+            return 0;
+        }
+        mark_authenticated(conn_handle);
+        mark_ble_activity();
+        if (count_active_slots() < MAX_CONNECTIONS) force_restart_advertising();
+        set_ota_status(conn_handle, "RADIO:OK");
+        return 0;
+    }
 
     if (payload[0] == OTA_OP_ABORT) {
         if (ota_session.active && ota_session.conn_handle == conn_handle) {
@@ -1147,6 +1333,10 @@ static int chr_access_ota_control(uint16_t conn_handle, uint16_t attr_handle,
         if (!ota_client_is_authenticated(conn_handle) ||
             !ota_verify_start_auth(conn_handle, image_size, payload + 5, payload + 37)) {
             set_ota_status(conn_handle, "ERR:OTA_AUTH");
+            return 0;
+        }
+        if (ota_pending_verify) {
+            set_ota_status(conn_handle, "ERR:OTA_PROBATION");
             return 0;
         }
         if (ota_session.active && ota_session.conn_handle != conn_handle) {
@@ -1516,7 +1706,7 @@ static void start_advertising(void) {
         LOG_E(TAG, "adv_set_fields failed: %d", rc);
         if (++adv_failure_count >= 3 && count_active_slots() == 0) {
             LOG_E(TAG, "Advertising setup failed repeatedly while idle, restarting");
-            esp_restart();
+            restart_with_reason(REBOOT_ADVERTISING);
         }
         return;
     }
@@ -1531,7 +1721,7 @@ static void start_advertising(void) {
         LOG_E(TAG, "adv_rsp_set_fields failed: %d", rc);
         if (++adv_failure_count >= 3 && count_active_slots() == 0) {
             LOG_E(TAG, "Advertising response setup failed repeatedly while idle, restarting");
-            esp_restart();
+            restart_with_reason(REBOOT_ADVERTISING);
         }
         return;
     }
@@ -1539,8 +1729,8 @@ static void start_advertising(void) {
     /* Advertising parameters */
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;  /* undirected connectable */
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;  /* general discoverable */
-    adv_params.itvl_min  = use_fast_adv ? ADV_FAST_INTERVAL_MIN : ADV_SLOW_INTERVAL_MIN;
-    adv_params.itvl_max  = use_fast_adv ? ADV_FAST_INTERVAL_MAX : ADV_SLOW_INTERVAL_MAX;
+    adv_params.itvl_min  = use_fast_adv ? radio_config.fast_min : radio_config.slow_min;
+    adv_params.itvl_max  = use_fast_adv ? radio_config.fast_max : radio_config.slow_max;
 
     rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
                            &adv_params, gap_event_handler, NULL);
@@ -1560,7 +1750,7 @@ static void start_advertising(void) {
         log_client_state("adv-start-failed");
         if (++adv_failure_count >= 3 && count_active_slots() == 0) {
             LOG_E(TAG, "Advertising failed repeatedly while idle, restarting");
-            esp_restart();
+            restart_with_reason(REBOOT_ADVERTISING);
         }
     }
 }
@@ -1580,6 +1770,7 @@ static void force_restart_advertising(void) {
  * ============================================================ */
 
 static void ble_on_sync(void) {
+    ble_synced = true;
     /* Make sure we have a public address */
     int rc = ble_hs_util_ensure_addr(0);
     assert(rc == 0);
@@ -1600,7 +1791,7 @@ static void ble_on_sync(void) {
 
 static void ble_on_reset(int reason) {
     LOG_E(TAG, "BLE host reset, reason=%d", reason);
-    esp_restart();
+    restart_with_reason(REBOOT_BLE_RESET);
 }
 
 static void nimble_host_task(void *param) {
@@ -1608,7 +1799,7 @@ static void nimble_host_task(void *param) {
     nimble_port_run();
     nimble_port_freertos_deinit();
     /* The host loop should never exit during normal operation. */
-    esp_restart();
+    restart_with_reason(REBOOT_BLE_EXIT);
 }
 
 /* ============================================================
@@ -1619,6 +1810,8 @@ static void nimble_host_task(void *param) {
  * OTA handles now have one owner. The independent task only watches its heartbeat. */
 static void maintain_ble_state(void) {
     int64_t now = now_ms();
+    uint32_t recoveries_before = adv_recoveries;
+    uint32_t ghosts_before = ghost_reaps;
         /* ---- Ghost slot reaper ----
          * If we have more in_use slots than NimBLE has active connections,
          * at least one slot is orphaned. Find and free them. */
@@ -1630,6 +1823,7 @@ static void maintain_ble_state(void) {
             struct ble_gap_conn_desc desc;
             if (ble_gap_conn_find(clients[i].conn_handle, &desc) != 0) {
                 /* Handle no longer valid in NimBLE — ghost slot */
+                ghost_reaps++;
                 LOG_I(TAG, "Reaped ghost slot %d (handle %d)",
                       i, clients[i].conn_handle);
                 invalidate_split_cmd_for(clients[i].conn_handle);
@@ -1654,11 +1848,12 @@ static void maintain_ble_state(void) {
                 adv_active = actual_adv_active;
             }
             if (!actual_adv_active) {
+                adv_recoveries++;
                 start_advertising();
                 if (!ble_gap_adv_active()) {
                     if (++adv_health_failure_count >= BLE_ADV_HEALTH_MAX_FAILURES) {
                         LOG_E(TAG, "Advertising health recovery failed, restarting");
-                        esp_restart();
+                        restart_with_reason(REBOOT_ADVERTISING);
                     }
                 } else {
                     adv_health_failure_count = 0;
@@ -1705,16 +1900,20 @@ static void maintain_ble_state(void) {
             }
         }
 
+        check_running_ota_image(ble_synced && task_wdt_monitored &&
+            recoveries_before == adv_recoveries && ghosts_before == ghost_reaps &&
+            (nimble_count >= MAX_CONNECTIONS || ble_gap_adv_active()));
+
         /* ---- Periodic restart (only when idle) ---- */
         if (now > (int64_t)RESTART_INTERVAL_SEC * 1000 && count_active_slots() == 0) {
             LOG_I(TAG, "Periodic restart (no active connections)");
-            esp_restart();
+            restart_with_reason(REBOOT_PERIODIC);
         }
 
         /* ---- Hard restart (unconditional, guards against long-running drift) ---- */
         if (now > (int64_t)HARD_RESTART_SEC * 1000 && !ota_session.active && !button_busy) {
             LOG_E(TAG, "Hard restart after %d hours", HARD_RESTART_SEC / 3600);
-            esp_restart();
+            restart_with_reason(REBOOT_DAILY);
         }
 
 }
@@ -1726,6 +1925,7 @@ static void main_loop_task(void *param) {
         esp_err_t wdt_ret = esp_task_wdt_add(NULL);
         if (wdt_ret == ESP_OK) {
             subscribed_to_wdt = true;
+            task_wdt_monitored = true;
             LOG_I(TAG, "Main loop started, WDT subscribed");
         } else {
             LOG_E(TAG, "Failed to subscribe main loop to TWDT: %s",
@@ -1751,7 +1951,7 @@ static void main_loop_task(void *param) {
         if (heartbeat_ack == last_ble_heartbeat_ack) {
             if (++missed_ble_heartbeats >= BLE_HEALTH_MAX_MISSED_HEARTBEATS) {
                 LOG_E(TAG, "NimBLE host heartbeat stalled, restarting");
-                esp_restart();
+                restart_with_reason(REBOOT_BLE_STALL);
             }
         } else {
             last_ble_heartbeat_ack = heartbeat_ack;
@@ -1767,6 +1967,10 @@ static void main_loop_task(void *param) {
  * ============================================================ */
 
 void app_main(void) {
+    previous_reboot_cause = esp_reset_reason() == ESP_RST_SW && reboot_magic == 0x424c4831
+        && reboot_cause <= REBOOT_OTA_HEALTH ? reboot_cause : REBOOT_OTHER;
+    reboot_magic = 0;
+    init_ota_health();
 #ifdef DEBUG
     esp_log_level_set(TAG, ESP_LOG_INFO);
 #endif
@@ -1815,6 +2019,7 @@ void app_main(void) {
 
     /* ---- Load PSK ---- */
     load_psk();
+    load_radio_config();
 
     /* ---- Init NimBLE ---- */
     ret = nimble_port_init();
@@ -1838,6 +2043,7 @@ void app_main(void) {
     assert(rc == 0);
 
     ble_npl_event_init(&ble_health_event, ble_health_event_callback, NULL);
+    ble_npl_callout_init(&slow_adv_callout, nimble_port_get_dflt_eventq(), slow_adv_callback, NULL);
 
     /* ---- Task watchdog ---- */
     esp_task_wdt_config_t wdt_config = {
@@ -1867,10 +2073,8 @@ void app_main(void) {
         xTaskCreate(main_loop_task, "main_loop", 4096, NULL, 5, NULL);
     if (task_created != pdPASS) {
         LOG_E(TAG, "Failed to create main maintenance task, restarting");
-        esp_restart();
+        restart_with_reason(REBOOT_TASK);
     }
 
-    /* Reaching this point proves the new image can initialize persistent
-     * storage, crypto, GPIO, BLE/GATT, timers, and its maintenance task. */
-    confirm_running_ota_image();
+    /* OTA validation runs on the BLE host only after sustained healthy service. */
 }

@@ -13,6 +13,7 @@ Desktop.ini
 
 # Build outputs
 **/build/
+**/.kotlin/
 **/.pio/
 ESP32-C3_Firmware/secure_boot_signing_key.pem
 garmin_developer_key.der
