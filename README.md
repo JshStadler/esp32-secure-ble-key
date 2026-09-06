@@ -21,7 +21,7 @@ Designed for both convenience and security:
 
 The ESP32-C3 sits inside the car, powered from the 12V system via a buck converter. A GPIO pin is wired directly across the car remote's button — no MOSFET or relay needed since both share the same 3.3V supply. When you want to unlock the car, the native Android app (or the Garmin watch app) connects over BLE, completes an HMAC-SHA256 challenge-response handshake using a pre-shared key (PSK), and sends a command. The ESP32-C3 verifies the HMAC and drives the GPIO to simulate a button press on the remote.
 
-The C3 firmware is built on ESP-IDF (no longer Arduino) so it can use FreeRTOS tickless idle, dynamic frequency scaling, and automatic light sleep — keeping the device draw very low for operation off a parked car's battery.
+The C3 firmware uses ESP-IDF, FreeRTOS tickless idle, and dynamic frequency scaling. BLE modem sleep remains disabled for link reliability; actual battery draw depends on the board, converter, remote, and radio activity.
 
 ## 🧱 Project Structure
 
@@ -61,8 +61,8 @@ response from being redirected between devices or actions. See
 [PROTOCOL.md](PROTOCOL.md) for the byte-exact definition.
 
 Additional protections include optional device-authentication gating on the phone
-(fingerprint, face, or device PIN), auto-disconnect timeouts (15s unauthenticated,
-5min authenticated), and secure storage for the PSK on both the phone/watch and
+(fingerprint, face, or device PIN), Car auto-disconnect timeouts (20s unauthenticated,
+30min authenticated inactivity), and secure storage for the PSK on both the phone/watch and
 ESP32 (stored in NVS). The app gate can be disabled for faster frequent use;
 changing the PSK always requires device authentication.
 
@@ -96,7 +96,49 @@ Achieved through ESP-IDF features unavailable in the Arduino framework:
   production; ROM USB recovery remains available
 - Button GPIO held in high-impedance idle (zero quiescent current)
 - Periodic restart every 3 hours when idle (state hygiene, while no device connected)
-- Hard restart after 24 hours regardless of state
+- Daily restart deferred during a firmware transfer or button pulse
+
+## Device health and OTA confirmation (v2.7.0)
+
+In the Android app, open a Car device's **Settings > Device health and firmware
+version**. Opening this view requests one authenticated snapshot. **Refresh**
+requests another; normal connections and background operation do not fetch
+health data. Closing the view cancels a request waiting for a connection.
+
+The view shows the **running firmware version**, build fingerprint, OTA validation
+state, uptime, last reset reason, free/minimum memory, BLE connection count, and
+advertising/stale-connection recovery counts. Requested snapshots are included
+in the diagnostic log for export. Older Car firmware shows an upgrade message.
+Gate firmware and Garmin apps remain compatible and do not need an update for
+this feature.
+
+After BLE OTA, keep power stable and allow about one minute after reboot before
+refreshing this view. Check that the expected version is running and **OTA status:
+Validated** appears. The firmware confirms a pending image only after a continuous
+minute of healthy advertising/BLE host maintenance and an active task watchdog.
+Failed health checks leave rollback enabled; validation has a two-minute limit.
+This checks firmware operation, not physical button wiring or radio range.
+
+The installed [3V31A-BUCK-REG converter](https://www.robotics.org.za/3V31A-BUCK-REG)
+feeds the ESP's 3.3V rail directly. Firmware cannot determine its input current
+or car battery voltage from that regulated supply. No battery percentage or
+estimated current is displayed, and no manual measurements are needed to use
+the health view. Advertising intervals, TX power, and BLE sleep settings are
+unchanged by default. To tune advertising, use **Advertising** in the health
+view. Set the recent and inactive intervals (a fixed value or min-max range,
+20-2000 ms) and the inactivity duration (5-3600 seconds), then **Save to ESP**.
+Values must use BLE's 0.625ms units; multiples of 5ms are easiest to enter.
+Settings persist in NVS and apply without rebooting or disconnecting existing
+clients. **Restore defaults** selects 50-100ms recent, 200-400ms inactive, and
+60 seconds; press Save to apply. Increasing intervals may slow discovery.
+
+The health snapshot reports the current advertising mode and saved intervals.
+Reading it does not extend the recent-activity window. Connection/disconnection
+events and authenticated commands do extend that window. A BLE timer switches
+to inactive mode at the chosen deadline, with maintenance as a fallback.
+Only the Android APK and Car OTA application need updating: existing OTA
+partitions, wiring, and Garmin apps are unchanged. No USB migration is needed
+on a Car already running the project's signed API-v2 BLE OTA firmware.
 
 ## 🖥️ Hardware
 

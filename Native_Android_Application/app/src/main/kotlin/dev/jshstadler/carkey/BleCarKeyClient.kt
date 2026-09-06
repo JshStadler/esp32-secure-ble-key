@@ -53,6 +53,13 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
     private var attemptingDirect = false
     private var directFailures = 0
     private var securePskSupported = false
+    private var healthSupported = false
+    private var radioSupported = false
+    private var healthCallback: ((DeviceHealth?, String?) -> Unit)? = null
+    private var radioCallback: ((Boolean, String) -> Unit)? = null
+    private var radioResponse: String? = null
+    private var radioWritePending = false
+    private var radioGeneration = 0
     private var pendingCommand: Byte? = null
     private var commandWritePending = false
     private var pendingStatus: String? = null
@@ -84,7 +91,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
     }
     private fun publishReady() {
         listener.onReadyChanged(!stopped && ready && nonce?.size == 16 && !queue.busy &&
-            pendingCommand == null && pskRequest == null && !otaInFlight)
+            pendingCommand == null && pskRequest == null && !otaInFlight && radioCallback == null)
     }
     fun start(key: String, cachedAddress: String?, useCachedAddress: Boolean) {
         teardown()
@@ -237,7 +244,13 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
             if (gatt !== g) return
         }
         service.getCharacteristic(profile.identityUuid)?.let { identity ->
-            read(identity) { securePskSupported = it.toString(Charsets.UTF_8).split('|').last().split(',').contains("psk2") }
+            // This is before authentication: firmware returns static capabilities only.
+            read(identity) {
+                val caps = it.toString(Charsets.UTF_8).split('|').last().split(',')
+                securePskSupported = "psk2" in caps
+                healthSupported = "health1" in caps
+                radioSupported = "radio1" in caps
+            }
         }
         readChallenge()
     }
@@ -274,12 +287,74 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         }
     }
     fun requestFreshChallenge(): Boolean {
-        if (stopped || gatt == null || challenge == null || pendingCommand != null || pskRequest != null || otaInFlight) return false
+        if (stopped || gatt == null || challenge == null || pendingCommand != null || pskRequest != null || otaInFlight || radioCallback != null) return false
         readChallenge()
         return true
     }
+
+    fun requestDeviceHealth(done: (DeviceHealth?, String?) -> Unit) {
+        if (stopped || !ready || queue.busy || pendingCommand != null || pskRequest != null || otaInFlight || healthCallback != null || radioCallback != null) {
+            done(null, "Connection is busy or recovering. Try Refresh when connected.")
+            return
+        }
+        val identity = gatt?.getService(profile.serviceUuid)?.getCharacteristic(profile.identityUuid)
+        if (!healthSupported || identity == null) {
+            done(null, "Device health requires Car firmware v2.7.0 or later. Update the ESP, then reconnect.")
+            return
+        }
+        healthCallback = done
+        listener.onReadyChanged(false)
+        read(identity) {
+            val callback = healthCallback
+            healthCallback = null
+            val snapshot = DeviceHealth.parse(it.toString(Charsets.UTF_8))
+            callback?.invoke(snapshot, if (snapshot == null) "Device returned incomplete health data. Try Refresh after reconnecting." else null)
+        }
+    }
+
+    fun cancelDeviceHealth() { healthCallback = null }
+
+    fun updateRadioSettings(settings: RadioSettings, done: (Boolean, String) -> Unit) {
+        val control = otaControl
+        val current = nonce
+        if (!radioSupported || control == null) { done(false, "Update the Car firmware to v2.7.0 or later first."); return }
+        if (stopped || !ready || current == null || queue.busy || pendingCommand != null || pskRequest != null ||
+            otaInFlight || radioCallback != null || healthCallback != null) {
+            done(false, "Connection is busy or recovering. Try again when connected."); return
+        }
+        if (!settings.valid() || negotiatedMtu < 46) { done(false, "Invalid settings or BLE MTU too small; reconnect and try again."); return }
+        radioCallback = done
+        radioResponse = null
+        radioWritePending = true
+        val generation = ++radioGeneration
+        nonce = null
+        listener.onReadyChanged(false)
+        write(control, settings.packet(current, psk)) {
+            radioWritePending = false
+            radioResponse?.let { handleRadioStatus(it) }
+        }
+        later(8_000) { if (radioCallback != null && generation == radioGeneration) fail("Advertising settings response timed out") }
+    }
+
+    private fun handleRadioStatus(value: String) {
+        if (radioCallback == null || !(value == "RADIO:OK" || value.startsWith("ERR:RADIO_"))) return
+        if (radioWritePending) { radioResponse = value; return }
+        val callback = radioCallback
+        radioCallback = null
+        radioResponse = null
+        radioGeneration++
+        readChallenge()
+        val message = when (value) {
+            "RADIO:OK" -> "Advertising settings saved on the ESP and applied."
+            "ERR:RADIO_BUSY" -> "Wait until the firmware update and startup health check finish, then retry."
+            "ERR:RADIO_SAVE" -> "ESP could not save settings; previous settings remain active."
+            "ERR:RADIO_RANGE" -> "ESP rejected the interval range."
+            else -> "ESP rejected settings authentication. Reconnect and retry."
+        }
+        callback?.invoke(value == "RADIO:OK", message)
+    }
     fun press() {
-        if (!ready || nonce == null || pendingCommand != null || pskRequest != null || otaInFlight) {
+        if (!ready || nonce == null || pendingCommand != null || pskRequest != null || otaInFlight || radioCallback != null) {
             listener.onCommandResult(false, "Connection is recovering; try again")
             if (ready) readChallenge()
             return
@@ -365,7 +440,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         val current = nonce ?: return false
         val c = pskUpdate ?: return false
         if (!PskUpdateProtocol.validKey(newPsk)) { listener.onPskUpdateResult(false, "PSK must be 1–128 UTF-8 bytes without NUL characters"); return true }
-        if (!ready || pendingCommand != null || pskRequest != null || otaInFlight) return false
+        if (!ready || pendingCommand != null || pskRequest != null || otaInFlight || radioCallback != null) return false
         val request = PskUpdateProtocol.create(profile.securityBinding, current, psk, newPsk)
         pskRequest = request
         pendingNewPsk = newPsk
@@ -388,7 +463,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         val control = otaControl
         if (control == null || otaData == null || otaStatus == null) return listener.onOtaResult(false, "Car needs the one-time USB OTA bootstrap firmware first")
         if (image.isEmpty() || image.size > 0x1e0000) return listener.onOtaResult(false, "Firmware image size is invalid")
-        if (pendingCommand != null || pskRequest != null || otaInFlight) return listener.onOtaResult(false, "Another BLE operation is running")
+        if (pendingCommand != null || pskRequest != null || otaInFlight || radioCallback != null) return listener.onOtaResult(false, "Another BLE operation is running")
         otaImage = image; otaOffset = 0; otaInFlight = true; otaWaitingForReady = true
         otaStartWriteComplete = false; otaFinishing = false; otaChunkPending = false; otaResponse = null
         stage = "ota"
@@ -405,6 +480,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
     }
     private fun handleOtaStatus(value: String) {
         diagnostic("OTA status: $value")
+        handleRadioStatus(value)
         if (!otaInFlight) return
         when {
             value == "OTA:READY" -> { otaWaitingForReady = false; maybeStartOtaData() }
@@ -412,6 +488,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
                 otaResponse = value
                 if (!queue.busy && otaFinishing) finishOta(true, "Firmware updated; car ESP is restarting")
             }
+            value == "ERR:OTA_PROBATION" -> fail("Car is still checking its new firmware. Wait one minute and check Device health before updating again.")
             value.startsWith("ERR:OTA_") -> fail("Car rejected firmware update ($value)")
         }
     }
@@ -465,6 +542,10 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         }
     }
     private fun teardown() {
+        val cancelledHealth = healthCallback
+        healthCallback = null
+        val cancelledRadio = radioCallback
+        radioCallback = null; radioResponse = null; radioWritePending = false; radioGeneration++
         epoch++
         handler.removeCallbacksAndMessages(null)
         queue.clear()
@@ -474,10 +555,12 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         runCatching { old?.disconnect() }; runCatching { old?.close() }
         challenge = null; command = null; status = null; pskUpdate = null
         otaControl = null; otaData = null; otaStatus = null; deviceState = null
-        nonce = null; ready = false; securePskSupported = false
+        nonce = null; ready = false; securePskSupported = false; healthSupported = false; radioSupported = false
         pendingCommand = null; commandWritePending = false; pendingStatus = null; commandGeneration++
         pskRequest?.receiptKey?.fill(0); pskRequest = null; pendingNewPsk = null
         otaImage = null; otaInFlight = false; otaChunkPending = false; otaResponse = null; otaGeneration++
         negotiatedMtu = 23; stage = "idle"
+        cancelledHealth?.invoke(null, "Connection closed before health data arrived. Tap Refresh to retry.")
+        cancelledRadio?.invoke(false, "No confirmation: settings may have changed. Reopen Device health to read the ESP's current values before retrying.")
     }
 }

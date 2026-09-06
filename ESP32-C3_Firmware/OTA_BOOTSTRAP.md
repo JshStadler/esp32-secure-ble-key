@@ -95,8 +95,14 @@ partition-table, or OTA-metadata binaries in the mobile OTA picker.
 
 Reinstalling the same signed application image is supported and is a useful
 end-to-end OTA test. It is written to the inactive OTA slot, verified, selected
-for boot, and marked valid by the application after restart. Keep stable power
-and the phone close for the entire transfer.
+for boot, and marked valid after a continuous minute of healthy BLE operation
+following restart (v2.7.0+). Keep stable power throughout the transfer and this
+validation period. Open **Settings > Device health and firmware version**, then
+refresh after one minute to confirm both the running version and **Validated**
+status. Health is fetched only on opening that view or pressing Refresh.
+If the BLE host, advertising, or maintenance watchdog fails the probation,
+rollback remains enabled; the probation deadline is two minutes. A second OTA
+transfer is refused while the current image is pending validation.
 
 Recent builds negotiate up to a 517-byte ATT MTU and request a 7.5-15 ms,
 zero-latency connection while an OTA session is active. The Android client also

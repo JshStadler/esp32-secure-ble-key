@@ -90,6 +90,11 @@ class MainActivity : FragmentActivity() {
     private var operationSession = UUID.randomUUID().toString()
     private var requireAuthentication = true
     private var authenticated = false
+    private var healthDialog: AlertDialog? = null
+    private var radioDialog: AlertDialog? = null
+    private var healthDeviceId: String? = null
+    private var healthFetch: (() -> Unit)? = null
+    private val healthRequest = OnDemandHealthRequest()
     private var credentialCallback: ((Boolean) -> Unit)? = null
     private val credentialLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         val callback = credentialCallback
@@ -184,6 +189,8 @@ class MainActivity : FragmentActivity() {
     }
 
     override fun onDestroy() {
+        radioDialog?.dismiss()
+        healthDialog?.dismiss()
         BackgroundConnectionService.finish(this, false)
         operationGeneration++
         pendingPressId = null
@@ -222,6 +229,8 @@ class MainActivity : FragmentActivity() {
 
     override fun onStop() {
         appForeground = false
+        radioDialog?.dismiss()
+        healthDialog?.dismiss()
         if (isFinishing) {
             BackgroundConnectionService.finish(this, false)
             stopAllClients()
@@ -455,6 +464,7 @@ class MainActivity : FragmentActivity() {
             runtime.ready = ready
             if (ready) runtime.message = "Ready"
             updateDeviceView(profile.id)
+            if (ready && healthDeviceId == profile.id && pendingPressId == null) healthFetch?.invoke()
             if (ready && pendingPressId == profile.id && !pressDispatched) {
                 pressDispatched = true
                 runtime.message = when {
@@ -772,6 +782,155 @@ class MainActivity : FragmentActivity() {
         }
     }
 
+    private fun showDeviceHealth(profile: BleDeviceProfile) {
+        healthDialog?.dismiss()
+        val content = text("Connecting for device health…", 15f, false).apply {
+            setPadding(dp(24), dp(16), dp(24), dp(16))
+            setTextIsSelectable(true)
+        }
+        val scroll = ScrollView(this).apply { addView(content) }
+        val dialog = AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+            .setTitle("${profile.displayName} Health")
+            .setView(scroll)
+            .setPositiveButton("Close", null)
+            .setNeutralButton("Refresh", null)
+            .setNegativeButton("Advertising", null)
+            .create()
+        healthDialog = dialog
+        healthDeviceId = profile.id
+        dialog.setOnDismissListener {
+            healthRequest.cancel()
+            clients[profile.id]?.cancelDeviceHealth()
+            healthFetch = null
+            healthDeviceId = null
+            healthDialog = null
+        }
+        dialog.show()
+        val refresh = dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
+        val tune = dialog.getButton(AlertDialog.BUTTON_NEGATIVE).apply { isEnabled = false }
+        var currentRadio: RadioSettings? = null
+        var expectedRadio: RadioSettings? = null
+        fun showResult(token: Int, snapshot: DeviceHealth?, error: String?) {
+            if (!dialog.isShowing || !healthRequest.complete(token)) return
+            content.text = snapshot?.display() ?: error ?: "Health data unavailable"
+            if (snapshot != null && expectedRadio != null && snapshot.radio != expectedRadio) {
+                content.text = "The ESP reports different advertising settings. Review the current values below.\n\n${content.text}"
+            }
+            expectedRadio = null
+            currentRadio = snapshot?.radio
+            tune.isEnabled = currentRadio != null && snapshot?.otaState != "pending"
+            refresh.isEnabled = true
+            if (snapshot != null) EventLog.add(this, EventLog.Kind.DIAGNOSTIC,
+                "Device health snapshot: ${snapshot.display()}", deviceId = profile.id, deviceName = profile.displayName)
+        }
+        healthFetch = {
+            if (appForeground && dialog.isShowing && runtimes[profile.id]?.ready == true && pendingPressId == null) {
+                val token = healthRequest.takeWhenReady()
+                if (token != null) {
+                    val client = clients[profile.id]
+                    if (client == null) showResult(token, null, "Device disconnected. Tap Refresh to retry.")
+                    else client.requestDeviceHealth { snapshot, error -> showResult(token, snapshot, error) }
+                }
+            }
+        }
+        fun request() {
+            val token = healthRequest.begin()
+            refresh.isEnabled = false
+            tune.isEnabled = false
+            content.text = "Connecting for device health…"
+            if (runtimes[profile.id]?.psk.isNullOrEmpty()) {
+                showResult(token, null, "Set this device's PSK before requesting health data.")
+                return
+            }
+            ensureClient(profile)
+            healthFetch?.invoke()
+            mainHandler.postDelayed({
+                showResult(token, null, "Could not fetch device health. Check Bluetooth and proximity, then tap Refresh.")
+            }, 25_000)
+        }
+        refresh.setOnClickListener { request() }
+        tune.setOnClickListener {
+            currentRadio?.let { settings ->
+                showRadioSettings(profile, settings) { saved ->
+                    expectedRadio = saved
+                    request() // Read back only in response to the explicit Save action.
+                }
+            }
+        }
+        request() // The only automatic fetch: opening this dialog explicitly requests it.
+    }
+
+    private fun showRadioSettings(profile: BleDeviceProfile, current: RadioSettings, onSaved: (RadioSettings) -> Unit) {
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(24), dp(12), dp(24), dp(12))
+        }
+        fun input(label: String, initial: String): EditText {
+            layout.addView(sectionLabel(label))
+            return EditText(this).apply {
+                setText(initial)
+                setTextColor(Color.WHITE)
+                inputType = InputType.TYPE_CLASS_TEXT
+                keyListener = android.text.method.DigitsKeyListener.getInstance("0123456789.-")
+                layout.addView(this, LinearLayout.LayoutParams(-1, -2))
+            }
+        }
+        val recent = input("Recent activity interval (ms)", current.recentText())
+        val inactive = input("Inactive interval (ms)", current.inactiveText())
+        val seconds = input("Inactivity before slowing (seconds)", current.idleSeconds.toString())
+        layout.addView(text("Use an interval (100) or range (50-100). Higher intervals advertise less often and can delay discovery. " +
+            "Intervals: 20-2000 ms, in multiples of 0.625 ms; multiples of 5 ms are easiest. Inactivity: 5-3600 seconds. " +
+            "Inactive intervals must be at least as long as recent-activity intervals.\n\n" +
+            "Settings apply immediately and stay saved on the ESP after restart or OTA. Connections, disconnections and authenticated commands restart the recent-activity window. " +
+            "Reading device health does not restart that window. Existing connections keep their connection timing.", 13f, false))
+        val status = text("", 14f, false).apply { setPadding(0, dp(12), 0, 0) }
+        layout.addView(status)
+        val dialog = AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+            .setTitle("${profile.displayName} Advertising")
+            .setView(ScrollView(this).apply { addView(layout) })
+            .setNegativeButton("Cancel", null)
+            .setNeutralButton("Restore defaults", null)
+            .setPositiveButton("Save to ESP", null)
+            .create()
+        radioDialog = dialog
+        dialog.setOnDismissListener { if (radioDialog === dialog) radioDialog = null }
+        dialog.show()
+        val save = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+        val defaults = dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
+        val cancel = dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
+        defaults.setOnClickListener {
+            recent.setText(RadioSettings.DEFAULT.recentText())
+            inactive.setText(RadioSettings.DEFAULT.inactiveText())
+            seconds.setText(RadioSettings.DEFAULT.idleSeconds.toString())
+            status.text = "Defaults selected. Tap Save to ESP to apply."
+        }
+        save.setOnClickListener {
+            val requested = try { RadioSettings.fromInput(recent.text.toString(), inactive.text.toString(), seconds.text.toString()) }
+            catch (e: IllegalArgumentException) { status.text = e.message; return@setOnClickListener }
+            val client = clients[profile.id]
+            if (client == null) { status.text = "Device disconnected. Close this view and reconnect first."; return@setOnClickListener }
+            save.isEnabled = false; defaults.isEnabled = false; cancel.isEnabled = false
+            recent.isEnabled = false; inactive.isEnabled = false; seconds.isEnabled = false
+            dialog.setCancelable(false)
+            status.text = "Saving to ESP…"
+            client.updateRadioSettings(requested) { success, message ->
+                EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Advertising settings: $message", deviceId = profile.id, deviceName = profile.displayName)
+                if (dialog.isShowing) {
+                    if (success) {
+                        dialog.dismiss()
+                        toast(message)
+                        onSaved(requested)
+                    } else {
+                        status.text = message
+                        save.isEnabled = true; defaults.isEnabled = true; cancel.isEnabled = true
+                        recent.isEnabled = true; inactive.isEnabled = true; seconds.isEnabled = true
+                        dialog.setCancelable(true)
+                    }
+                }
+            }
+        }
+    }
+
     private fun showDeviceSettings(profile: BleDeviceProfile, onSaved: () -> Unit = {}) {
         val runtime = runtimes.getValue(profile.id)
         lateinit var settingsDialog: AlertDialog
@@ -854,6 +1013,10 @@ class MainActivity : FragmentActivity() {
         }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         if (profile.supportsBleOta) {
             layout.addView(sectionLabel("Firmware"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+            layout.addView(primaryButton("Device health and firmware version") {
+                settingsDialog.dismiss()
+                showDeviceHealth(profile)
+            }, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(4) })
             layout.addView(primaryButton("Update ESP firmware (.bin)") {
                 pendingFirmwareProfileId = profile.id
                 firmwarePickerActive = true

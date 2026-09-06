@@ -19,7 +19,8 @@ Implemented safeguards:
 - Bind the image size and SHA-256 digest to authentication, require sequential
   chunk offsets, and support finalise/abort operations.
 - Keep the current app running while the inactive slot is written, then use
-  bootloader rollback and a quick boot self-test before marking the new app valid.
+  bootloader rollback and one minute of healthy BLE host/advertising operation
+  with an active maintenance watchdog before marking the new app valid.
 - Report update state/errors to the initiating phone, and expose the `car-main`
   API-v2 identity used by the current phone and Garmin apps.
 - Do not add Wi-Fi or ESPHome to the car image; the phone is the BLE transport.

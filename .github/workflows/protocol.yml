@@ -14,4 +14,9 @@ jobs:
       - run: python tools/psk2_vectors.py
       - run: gcc -Wall -Wextra -Werror -fsanitize=address,undefined -I. -IESP32-C3_Firmware/main ESP32-C3_Firmware/main/psk_update.c ESP32-C3_Firmware/tests/psk2_test.c -lmbedcrypto -o /tmp/psk2-test && /tmp/psk2-test
       - run: python tools/nvs_test.py
+      - run: python tools/radio_nvs_test.py
+      - run: gcc -Wall -Wextra -Werror -fsanitize=address,undefined -I. -IESP32-C3_Firmware/main ESP32-C3_Firmware/tests/radio_nvs_test.c -o /tmp/radio-nvs-test && /tmp/radio-nvs-test
+      - run: gcc -Wall -Wextra -Werror -fsanitize=address,undefined -IESP32-C3_Firmware/main ESP32-C3_Firmware/tests/radio_config_test.c -o /tmp/radio-config-test && /tmp/radio-config-test
+      - run: gcc -Wall -Wextra -Werror -fsanitize=address,undefined -IESP32-C3_Firmware/main ESP32-C3_Firmware/tests/device_health_test.c -o /tmp/device-health-test && /tmp/device-health-test
+      - run: gcc -Wall -Wextra -Werror -fsanitize=address,undefined -IESP32-C3_Firmware/main ESP32-C3_Firmware/tests/ota_health_test.c -o /tmp/ota-health-test && /tmp/ota-health-test
       - run: gcc -Wall -Wextra -Werror -fsanitize=address,undefined -I. ESP32-C3_Firmware/tests/nvs_test.c -o /tmp/nvs-test && /tmp/nvs-test
