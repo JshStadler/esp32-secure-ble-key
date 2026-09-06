@@ -195,6 +195,11 @@ own encrypted PSK, BLE address, history filter, and location preference. The
 Gate card displays authenticated live controller state, while Standalone car
 firmware can be updated in-app using signed BLE OTA images.
 
+Switching away keeps phone connections available for two minutes. Returning
+within that window reuses them; otherwise the app reconnects when opened.
+Android shows a quiet connection-service notification during the grace period.
+An active firmware update finishes before the timeout disconnects the car.
+
 <img width="360" height="746" alt="image" src="https://github.com/user-attachments/assets/c017401e-025e-4bce-90b5-59f338a4a504" />
 
 
@@ -221,6 +226,7 @@ have separate identities and can be installed together.
 The watch retains healthy pairings across app sessions and discards stalled
 connections automatically. Each launch authenticates before showing ready;
 actual connection time depends on the watch and radio environment.
+Both watch apps close and disconnect after two minutes without user input.
 
 <img width="360" height="539" alt="image" src="https://github.com/user-attachments/assets/28264123-9bf5-41ac-bad2-cb6732b7731b" />
 

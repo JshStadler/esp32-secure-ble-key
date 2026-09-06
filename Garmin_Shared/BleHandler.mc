@@ -50,10 +50,9 @@ class BleHandler extends Ble.BleDelegate {
     }
     private function show(text) { _statusText = text; WatchUi.requestUpdate(); }
     function startConnectionWindow() {
+        recordInteraction();
         if (!configured()) { _stopped = true; _state = STATE_ERROR; show("Set PSK in Connect IQ"); return; }
         _stopped = false;
-        _windowTimer.stop();
-        _windowTimer.start(method(:onWindowTimeout), 180000, false);
         if (_registered) { startScan(); } else { show("Preparing Bluetooth..."); }
     }
     function applySettings() { disconnect(); startConnectionWindow(); }
@@ -177,6 +176,10 @@ class BleHandler extends Ble.BleDelegate {
     }
     private function beginAuthentication() { _pendingCommand = CarKeyProfile.CMD_AUTH_ONLY; readChallenge(); }
     function sendPress() {
+        recordInteraction();
+        dispatchPress();
+    }
+    private function dispatchPress() {
         if (!configured()) { show("Set PSK in Connect IQ"); return; }
         if (_pendingCommand == CarKeyProfile.CMD_PRESS) { return; }
         if (_pendingCommand != null || _subscribing) { _hasPendingPress = true; show("Press queued"); return; }
@@ -274,10 +277,10 @@ class BleHandler extends Ble.BleDelegate {
         _pendingCommand = null; _part2 = null; _earlyStatus = null; _writeStage = 0;
         _state = STATE_CONNECTED;
         if (auth) {
-            _authenticated = true; _retries = 0; _windowTimer.stop();
+            _authenticated = true; _retries = 0;
             show("Authenticated");
             vibrateConnected();
-            if (_hasPendingPress) { sendPress(); }
+            if (_hasPendingPress) { dispatchPress(); }
         } else {
             show(text.equals("OK:PRESSED") ? "Pressed" : "Command failed");
             if (text.equals("OK:PRESSED")) { vibrateSuccess(); } else { vibrateFailure(); }
@@ -291,9 +294,14 @@ class BleHandler extends Ble.BleDelegate {
         if (!_stopped && (_state == STATE_SCANNING || _state == STATE_CONNECTING)) { recover("Connection timed out", true); }
     }
     function onReconnectTimer() as Void { if (!_stopped && _state == STATE_IDLE) { startScan(); } }
+    function recordInteraction() {
+        _windowTimer.stop();
+        _windowTimer.start(method(:onWindowTimeout), 120000, false);
+    }
     function onWindowTimeout() as Void {
-        if (isConnected()) { return; }
-        disconnect(); show("Press to reconnect");
+        // Only user interaction resets this deadline, never BLE callbacks.
+        disconnect();
+        System.exit();
     }
     private function recover(message, preserveQueued) {
         if (_stopped) { return; }
@@ -307,7 +315,7 @@ class BleHandler extends Ble.BleDelegate {
         _pendingCommand = null; _part2 = null; _earlyStatus = null; _writeStage = 0;
         if (!preserveQueued || uncertainPress) { _hasPendingPress = false; }
         if (uncertainPress) { vibrateFailure(); }
-        if (wasReady) { vibrateDisconnected(); _windowTimer.start(method(:onWindowTimeout), 180000, false); }
+        if (wasReady) { vibrateDisconnected(); }
         show(message);
         _retries++;
         _timer.start(method(:onReconnectTimer), _retries < 3 ? 1500 : 3000, false);

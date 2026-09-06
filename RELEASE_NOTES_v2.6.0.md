@@ -5,6 +5,13 @@ stalled setup, failed writes, and stale connection state without restarting
 the app. An unconfirmed press is never automatically repeated. Both Garmin
 apps share the same recovery logic and authenticate before showing ready.
 
+Both watch apps now close and disconnect after two minutes without user input.
+The phone keeps BLE available for two minutes after switching away, with a brief
+background-service notification. Returning within that window reuses the live
+connections; after expiry it reconnects normally. Firmware transfers are allowed
+to finish before the background connections close. Explicitly closing the phone
+app or removing its task disconnects immediately.
+
 The phone serializes GATT operations, discards callbacks from old sessions,
 and falls back to scanning after repeated cached-address failures. Diagnostic
 exports include connection stage, session number, callback errors and timeouts.

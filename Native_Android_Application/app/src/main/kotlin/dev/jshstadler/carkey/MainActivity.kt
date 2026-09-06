@@ -184,6 +184,7 @@ class MainActivity : FragmentActivity() {
     }
 
     override fun onDestroy() {
+        BackgroundConnectionService.finish(this, false)
         operationGeneration++
         pendingPressId = null
         pendingPskValue = null
@@ -194,15 +195,37 @@ class MainActivity : FragmentActivity() {
 
     override fun onStart() {
         super.onStart()
+        BackgroundConnectionService.finish(this, true)
         appForeground = true
         startForegroundClients()
     }
 
+    override fun onResume() {
+        super.onResume()
+        BackgroundConnectionService.finish(this, true)
+        startForegroundClients()
+    }
+
+    override fun onPause() {
+        // Start while still visible, before Android's background-start limits apply.
+        if (!isFinishing && authenticated && hasPermissions() && clients.isNotEmpty()) {
+            BackgroundConnectionService.begin(this, BackgroundConnectionService.Lease(
+                busy = { pendingOtaImage != null },
+                disconnect = {
+                    EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Background connection window ended")
+                    stopAllClients()
+                },
+            ))
+        }
+        super.onPause()
+    }
+
     override fun onStop() {
         appForeground = false
-        // Keep the selected device connected while Android's document picker is
-        // in front, and never interrupt a transfer already in progress.
-        if (pendingOtaImage == null && !firmwarePickerActive) stopAllClients()
+        if (isFinishing) {
+            BackgroundConnectionService.finish(this, false)
+            stopAllClients()
+        }
         super.onStop()
     }
 
