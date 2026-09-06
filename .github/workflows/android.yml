@@ -61,6 +61,9 @@ jobs:
           CAR_KEY_STORE_PASSWORD: ${{ secrets.CAR_KEY_STORE_PASSWORD }}
           CAR_KEY_KEY_ALIAS: ${{ secrets.CAR_KEY_KEY_ALIAS }}
           CAR_KEY_KEY_PASSWORD: ${{ secrets.CAR_KEY_KEY_PASSWORD }}
+      - name: Remove restored release keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/car-key-release.jks"
       - name: Set artifact name
         id: artifact
         shell: bash

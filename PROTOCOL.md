@@ -30,7 +30,7 @@ Current command values:
 
 - `0x01`: authenticate only
 - `0x02`: press/open
-- `0x03`: update the Car PSK
+- `0x03`: reserved legacy PSK command; plaintext updates are rejected
 
 Current service families:
 
@@ -43,3 +43,35 @@ characteristic `b1b2c3d4-e5f6-7890-abcd-ef123456789b`. It returns
 connection. State is therefore not broadcast publicly; an authenticated app
 may poll it while connected. Current values are `Unknown`, `Closed`, `Open`,
 `Opening`, `Closing`, `Pillar override`, `No mains`, and `Low battery`.
+
+## Car PSK2 (v2.6.0)
+
+The identity characteristic advertises `psk2`. Updating a key requires an
+authenticated connection and a fresh challenge. The old plaintext update
+format is disabled. Existing API-v2 authentication and press commands remain
+compatible with previous clients.
+
+```text
+context(domain) = UTF8(domain) || 0x00 || UTF8("car-main") || 0x00 || nonce
+encryption_key = HMAC-SHA256(old_PSK, context("BLEKEY-PSK2-ENC"))
+receipt_key    = HMAC-SHA256(old_PSK, context("BLEKEY-PSK2-ACK"))
+AAD            = context("BLEKEY-PSK2")
+packet         = 0xA2 || random_IV[12] || AES-256-GCM(encryption_key, IV, new_PSK, AAD)
+```
+
+The GCM output is ciphertext followed by its 16-byte tag. New keys must be
+1–128 UTF-8 bytes without NUL. Send the packet to the existing PSK-update
+characteristic. The nonce rotates after verification. No key change occurs
+unless GCM verification and persistent storage both succeed.
+
+The per-connection status returns `PSK2:OK:<tag>` or `PSK2:FAIL:<tag>`.
+The lowercase hex tag is HMAC-SHA256 with `receipt_key` over one byte
+(`0x01` for persisted, `0x00` for failed), followed by SHA256 of the exact
+packet. Clients update their saved key only after verifying an OK receipt.
+Missing acknowledgement leaves the result uncertain; retain both keys until
+the device key is confirmed. Other authenticated connections are revoked
+after a successful change.
+
+Clients serialize ATT requests and reconnect on missing callbacks. They never
+automatically retransmit an unconfirmed press. Car and Gate expire sessions
+that have not authenticated within 20 seconds, regardless of challenge reads.

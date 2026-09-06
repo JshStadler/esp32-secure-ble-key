@@ -8,18 +8,15 @@ import android.content.Context
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import java.nio.charset.StandardCharsets
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.MessageDigest
 import java.util.UUID
 
-class BleCarKeyClient(
-    private val context: Context,
-    private val bluetoothManager: BluetoothManager,
-    private val profile: BleDeviceProfile,
-    private val listener: Listener,
-) {
+/** All state and ATT requests are confined to the main dispatcher. */
+@SuppressLint("MissingPermission")
+class BleCarKeyClient(private val context: Context, private val bluetoothManager: BluetoothManager,
+    private val profile: BleDeviceProfile, private val listener: Listener) {
     interface Listener {
         fun onState(state: State, message: String)
         fun onReadyChanged(ready: Boolean)
@@ -31,15 +28,13 @@ class BleCarKeyClient(
         fun onOtaProgress(sent: Int, total: Int)
         fun onOtaResult(success: Boolean, message: String)
     }
-
     enum class State { DISCONNECTED, SCANNING, CONNECTING, CONNECTED }
-
-    companion object {
-        private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-    }
-
+    companion object { private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb") }
     private val handler = Handler(Looper.getMainLooper())
+    private var epoch = 0
+    private var stage = "idle"
     private var gatt: BluetoothGatt? = null
+    private var scanCallback: ScanCallback? = null
     private var challenge: BluetoothGattCharacteristic? = null
     private var command: BluetoothGattCharacteristic? = null
     private var status: BluetoothGattCharacteristic? = null
@@ -49,647 +44,440 @@ class BleCarKeyClient(
     private var otaStatus: BluetoothGattCharacteristic? = null
     private var deviceState: BluetoothGattCharacteristic? = null
     private var nonce: ByteArray? = null
+    private var readValue = byteArrayOf()
     private var psk = ""
     private var ready = false
-    private var manuallyStopped = false
-    private var authAttempts = 0
+    private var stopped = true
     private var reconnectAddress: String? = null
-    private var directFailures = 0
     private var preferDirect = false
-    private var descriptorStage = 0
-    private var authInFlight = false
-    private var authGeneration = 0
     private var attemptingDirect = false
-    private var awaitingScanFallback = false
-    private var pressInFlight = false
-    private var pressGeneration = 0
+    private var directFailures = 0
+    private var securePskSupported = false
+    private var pendingCommand: Byte? = null
+    private var commandWritePending = false
+    private var pendingStatus: String? = null
+    private var commandGeneration = 0
     private var pendingNewPsk: String? = null
-    private var pskUpdateInFlight = false
-    private var pskUpdateGeneration = 0
+    private var pskRequest: PskUpdateProtocol.Request? = null
+    private var negotiatedMtu = 23
     private var otaImage: ByteArray? = null
     private var otaOffset = 0
-    private var otaLastChunkSize = 0
     private var otaInFlight = false
     private var otaWaitingForReady = false
-    private var otaStartWritePending = false
     private var otaStartWriteComplete = false
+    private var otaChunkPending = false
     private var otaFinishing = false
-    private var negotiatedMtu = 23
-    private var stateReadInFlight = false
-
+    private var otaGeneration = 0
+    private var otaResponse: String? = null
+    private val queue = GattOperationQueue(
+        schedule = { delay, action -> val task = Runnable(action); handler.postDelayed(task, delay); { handler.removeCallbacks(task) } },
+        failed = { fail(it) }, idle = { publishReady() },
+    )
     private val scanner get() = bluetoothManager.adapter?.bluetoothLeScanner
-
-    private val statePoll = object : Runnable {
-        @SuppressLint("MissingPermission")
-        override fun run() {
-            if (ready && !authInFlight && !pressInFlight && !pskUpdateInFlight && !otaInFlight) {
-                deviceState?.let {
-                    stateReadInFlight = true
-                    if (gatt?.readCharacteristic(it) != true) stateReadInFlight = false
-                    else handler.postDelayed({ stateReadInFlight = false }, 600)
-                }
-            }
-            if (!manuallyStopped && deviceState != null) handler.postDelayed(this, 1_500)
-        }
+    private fun diagnostic(message: String) = listener.onDiagnostic("session=$epoch stage=$stage $message")
+    private fun later(delay: Long, action: () -> Unit) {
+        val generation = epoch
+        handler.postDelayed({ if (!stopped && generation == epoch) action() }, delay)
     }
-
-    private val otaWriteTimeout = Runnable {
-        if (!otaInFlight) return@Runnable
-        val message = if (otaFinishing) {
-            "Firmware validation response timed out"
-        } else {
-            "Firmware transfer stalled at byte $otaOffset"
-        }
-        finishOta(false, message)
+    private fun dispatch(g: BluetoothGatt, action: () -> Unit) {
+        handler.post { if (!stopped && gatt === g) action() }
     }
-
-    private val scanCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult) = acceptScan(result)
-        override fun onBatchScanResults(results: MutableList<ScanResult>) {
-            results.firstOrNull { matches(it) }?.let(::acceptScan)
-        }
-        override fun onScanFailed(errorCode: Int) = fail("Scan error ($errorCode)")
+    private fun publishReady() {
+        listener.onReadyChanged(!stopped && ready && nonce?.size == 16 && !queue.busy &&
+            pendingCommand == null && pskRequest == null && !otaInFlight)
     }
-
-    @SuppressLint("MissingPermission")
     fun start(key: String, cachedAddress: String?, useCachedAddress: Boolean) {
+        teardown()
+        stopped = false
         psk = key
-        // A user-configured profile address is always a hard target. A learned
-        // address is used only while the per-device cached-address setting is on.
-        reconnectAddress = if (useCachedAddress) cachedAddress else profile.defaultAddress
         preferDirect = useCachedAddress
-        manuallyStopped = false
-        if (!useCachedAddress) {
-            awaitingScanFallback = false
-            directFailures = 0
-        }
-        if (useCachedAddress && cachedAddress != null) {
-            attemptingDirect = true
+        reconnectAddress = if (useCachedAddress) cachedAddress else profile.defaultAddress
+        attemptingDirect = useCachedAddress && reconnectAddress != null
+        if (attemptingDirect) {
             listener.onState(State.CONNECTING, "Connecting to cached device…")
-            try {
-                connect(bluetoothManager.adapter.getRemoteDevice(cachedAddress))
-            } catch (_: IllegalArgumentException) {
-                scan()
-            }
-        } else {
-            attemptingDirect = false
-            scan()
-        }
+            val device = runCatching { bluetoothManager.adapter?.getRemoteDevice(reconnectAddress) }.getOrNull()
+            if (device == null) scan() else connect(device)
+        } else scan()
     }
-
-    @SuppressLint("MissingPermission")
     fun stop(manual: Boolean = true) {
-        manuallyStopped = manual
-        handler.removeCallbacksAndMessages(null)
-        scanner?.stopScan(scanCallback)
-        gatt?.disconnect()
-        gatt?.close()
-        clearGatt()
+        stopped = manual
+        teardown()
         listener.onState(State.DISCONNECTED, "Disconnected")
+        listener.onReadyChanged(false)
     }
-
     fun scanFallback() {
-        directFailures = 3
-        awaitingScanFallback = false
-        attemptingDirect = false
-        stop(false)
-        manuallyStopped = false
+        preferDirect = false
+        reconnectAddress = profile.defaultAddress
+        directFailures = 0
+        teardown()
+        stopped = false
         scan()
     }
-
-    @SuppressLint("MissingPermission")
     private fun scan() {
         attemptingDirect = false
+        stage = "scan"
         listener.onState(State.SCANNING, "Scanning…")
-        scanner?.startScan(scanCallback) ?: return fail("Bluetooth is off")
-        handler.postDelayed({
-            scanner?.stopScan(scanCallback)
-            if (gatt == null) fail("Device not found")
-        }, 10_000)
+        val generation = epoch
+        val callback = object : ScanCallback() {
+            override fun onScanResult(type: Int, result: ScanResult) {
+                handler.post { if (!stopped && generation == epoch && scanCallback === this) acceptScan(result) }
+            }
+            override fun onBatchScanResults(results: MutableList<ScanResult>) { results.forEach { onScanResult(0, it) } }
+            override fun onScanFailed(errorCode: Int) {
+                handler.post { if (!stopped && generation == epoch && scanCallback === this) fail("Scan error ($errorCode)") }
+            }
+        }
+        scanCallback = callback
+        val scan = scanner ?: return fail("Bluetooth is off")
+        try { scan.startScan(callback) } catch (_: Exception) { return fail("Android could not start scanning") }
+        later(10_000) { if (scanCallback === callback) fail("Device not found") }
     }
-
-    @SuppressLint("MissingPermission")
-    private fun matches(result: ScanResult): Boolean {
-        val targetAddress = reconnectAddress ?: profile.defaultAddress
-        if (targetAddress != null) return result.device.address.equals(targetAddress, ignoreCase = true)
-        return result.device.name == profile.advertisedName ||
-            result.scanRecord?.serviceUuids?.any { it.uuid == profile.serviceUuid } == true
-    }
-
-    @SuppressLint("MissingPermission")
     private fun acceptScan(result: ScanResult) {
-        if (!matches(result) || gatt != null) return
-        listener.onDiagnostic("Scan matched device ${result.device.address}, RSSI ${result.rssi} dBm")
-        scanner?.stopScan(scanCallback)
-        listener.onState(State.CONNECTING, "Connecting…")
+        if (gatt != null) return
+        val target = reconnectAddress ?: profile.defaultAddress
+        val matches = if (target != null) result.device.address.equals(target, true) else
+            result.device.name == profile.advertisedName || result.scanRecord?.serviceUuids?.any { it.uuid == profile.serviceUuid } == true
+        if (!matches) return
+        diagnostic("Scan matched ${result.device.address}, RSSI ${result.rssi} dBm")
+        stopScan()
         connect(result.device)
     }
-
-    @SuppressLint("MissingPermission")
-    private fun connect(device: BluetoothDevice) {
-        gatt?.close()
-        gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
+    private fun stopScan() {
+        val callback = scanCallback
+        scanCallback = null
+        if (callback != null) runCatching { scanner?.stopScan(callback) }
     }
-
+    private fun connect(device: BluetoothDevice) {
+        stage = "connect"
+        listener.onState(State.CONNECTING, "Connecting…")
+        gatt = try { device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE) } catch (_: Exception) { null }
+        if (gatt == null) return fail("Android could not create a Bluetooth connection")
+        later(18_000) { if (!ready) fail("Connection setup timed out at $stage") }
+    }
     private val callback = object : BluetoothGattCallback() {
-        @SuppressLint("MissingPermission")
-        override fun onConnectionStateChange(g: BluetoothGatt, statusCode: Int, newState: Int) {
-            listener.onDiagnostic("GATT connection callback: status=$statusCode, state=$newState, address=${g.device.address}")
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
+        override fun onConnectionStateChange(g: BluetoothGatt, code: Int, state: Int) = dispatch(g) {
+            diagnostic("GATT status=$code state=$state address=${g.device.address}")
+            if (code != BluetoothGatt.GATT_SUCCESS || state == BluetoothProfile.STATE_DISCONNECTED) fail("Bluetooth disconnected (status=$code)")
+            else if (state == BluetoothProfile.STATE_CONNECTED && stage == "connect") {
                 reconnectAddress = g.device.address
                 listener.onDeviceAddress(g.device.address)
-                listener.onState(State.CONNECTING, "Discovering services…")
-                handler.postDelayed({ if (!g.requestMtu(517)) g.discoverServices() }, 300)
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                val wasReady = ready
-                val wasUpdating = otaInFlight
-                val wasUpdatingPsk = pskUpdateInFlight
-                g.close()
-                if (gatt === g) clearGatt()
-                if (!wasReady && attemptingDirect) directFailures++
-                listener.onReadyChanged(false)
-                if (wasUpdating) {
-                    manuallyStopped = true
-                    listener.onOtaResult(false, "Bluetooth connection was lost during firmware update")
-                }
-                if (wasUpdatingPsk) {
-                    manuallyStopped = true
-                    listener.onPskUpdateResult(
-                        false,
-                        "Connection was lost during the PSK update; use app-only after confirming the car key",
-                    )
-                }
-                if (!manuallyStopped) {
-                    if (wasReady) listener.onState(State.DISCONNECTED, "Connection lost; reconnecting…")
-                    scheduleReconnect()
-                }
-            }
-        }
-
-        @SuppressLint("MissingPermission")
-        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, statusCode: Int) {
-            listener.onDiagnostic("MTU negotiation: mtu=$mtu, status=$statusCode")
-            if (statusCode == BluetoothGatt.GATT_SUCCESS) negotiatedMtu = mtu
-            g.discoverServices()
-        }
-
-        @SuppressLint("MissingPermission")
-        override fun onServicesDiscovered(g: BluetoothGatt, result: Int) {
-            listener.onDiagnostic("Service discovery completed: status=$result, services=${g.services.size}")
-            if (result != BluetoothGatt.GATT_SUCCESS) return fail("Service discovery failed")
-            val service = g.getService(profile.serviceUuid) ?: return fail("${profile.displayName} service not found")
-            challenge = service.getCharacteristic(profile.challengeUuid)
-            command = service.getCharacteristic(profile.commandUuid)
-            status = service.getCharacteristic(profile.statusUuid)
-            pskUpdate = service.getCharacteristic(profile.pskUpdateUuid)
-            otaControl = service.getCharacteristic(profile.otaControlUuid)
-            otaData = service.getCharacteristic(profile.otaDataUuid)
-            otaStatus = service.getCharacteristic(profile.otaStatusUuid)
-            deviceState = service.getCharacteristic(profile.deviceStateUuid)
-            if (challenge == null || command == null || status == null) return fail("Required BLE characteristics missing")
-            if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE) {
-                listener.onDiagnostic("Required ${profile.displayName} characteristics found; using per-connection reads")
-                descriptorStage = 4
-                g.readCharacteristic(challenge)
-            } else {
-                listener.onDiagnostic("Required ${profile.displayName} characteristics found; enabling notifications")
-                descriptorStage = 1
-                enableNotifications(g, challenge!!)
-            }
-        }
-
-        @SuppressLint("MissingPermission")
-        override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, result: Int) {
-            if (result != BluetoothGatt.GATT_SUCCESS) return fail("Could not enable notifications")
-            if (descriptorStage == 1) {
-                descriptorStage = 2
-                enableNotifications(g, status!!)
-            } else if (descriptorStage == 2 && otaStatus != null) {
-                descriptorStage = 3
-                enableNotifications(g, otaStatus!!)
-            } else {
-                descriptorStage = 4
-                g.readCharacteristic(challenge)
-            }
-        }
-
-        @Deprecated("Deprecated in API 33")
-        override fun onCharacteristicRead(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, result: Int) {
-            if (characteristic.uuid == profile.deviceStateUuid) stateReadInFlight = false
-            if (result == BluetoothGatt.GATT_SUCCESS) handleValue(characteristic, characteristic.value ?: byteArrayOf())
-        }
-
-        override fun onCharacteristicRead(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray, result: Int) {
-            if (characteristic.uuid == profile.deviceStateUuid) stateReadInFlight = false
-            if (result == BluetoothGatt.GATT_SUCCESS) handleValue(characteristic, value)
-        }
-
-        @Deprecated("Deprecated in API 33")
-        override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            handleValue(characteristic, characteristic.value ?: byteArrayOf())
-        }
-
-        override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
-            handleValue(characteristic, value)
-        }
-
-        @SuppressLint("MissingPermission")
-        override fun onCharacteristicWrite(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, result: Int) {
-            if (result != BluetoothGatt.GATT_SUCCESS) {
-                when (characteristic.uuid) {
-                    profile.commandUuid -> fail("Command write failed ($result)")
-                    profile.pskUpdateUuid -> finishPskUpdate(false, "Car PSK update write failed ($result)")
-                    profile.otaControlUuid, profile.otaDataUuid -> finishOta(false, "Firmware transfer write failed ($result)")
-                }
-                return
-            }
-            if (characteristic.uuid == profile.otaControlUuid && otaInFlight && otaStartWritePending) {
-                otaStartWritePending = false
-                otaStartWriteComplete = true
-                maybeStartOtaData()
-            }
-            if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE && characteristic.uuid == profile.commandUuid) {
-                // ESPHome sends the ATT write response immediately before its
-                // YAML on_write automation runs. A short delay avoids reading
-                // the previous per-connection status value.
-                handler.postDelayed({ g.readCharacteristic(status) }, 100)
-            }
-            if (characteristic.uuid == profile.otaDataUuid && otaInFlight) {
-                handler.removeCallbacks(otaWriteTimeout)
-                otaOffset += otaLastChunkSize
-                otaLastChunkSize = 0
-                listener.onOtaProgress(otaOffset, otaImage?.size ?: otaOffset)
-                sendNextOtaChunk()
-            }
-        }
-    }
-
-    private fun handleValue(characteristic: BluetoothGattCharacteristic, value: ByteArray) {
-        when (characteristic.uuid) {
-            profile.challengeUuid -> {
-                nonce = value.copyOf()
-                if (!ready && !authInFlight && !otaInFlight && descriptorStage == 4) authenticate()
-                listener.onReadyChanged(ready && value.isNotEmpty())
-            }
-            profile.statusUuid -> handleStatus(String(value, StandardCharsets.UTF_8))
-            profile.otaStatusUuid -> handleOtaStatus(String(value, StandardCharsets.UTF_8))
-            profile.deviceStateUuid -> {
-                val state = String(value, StandardCharsets.UTF_8)
-                if (!state.startsWith("ERR:")) listener.onDeviceState(state)
-            }
-        }
-    }
-
-    private fun handleStatus(value: String) {
-        listener.onDiagnostic("Device status: $value")
-        when {
-            value == "OK:AUTH" -> {
-                authInFlight = false
-                authGeneration++
-                ready = true
-                directFailures = 0
-                awaitingScanFallback = false
-                listener.onState(State.CONNECTED, "Authenticated")
-                listener.onReadyChanged(profile.responseMode != BleResponseMode.READ_AFTER_WRITE && nonce != null)
-                if (deviceState != null) {
-                    handler.removeCallbacks(statePoll)
-                    handler.post(statePoll)
-                    if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE) {
-                        handler.postDelayed({ readChallenge() }, 250)
+                stage = "mtu"
+                later(300) {
+                    queue.enqueue("mtu", { g.requestMtu(517) }) {
+                        if (negotiatedMtu < 36) fail("BLE MTU is too small for authenticated commands")
+                        else {
+                            stage = "services"
+                            queue.enqueue("services", { g.discoverServices() }) { configureServices(g) }
+                        }
                     }
-                } else if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE) {
-                    readChallenge()
                 }
             }
-            value == "OK:PRESSED" && pressInFlight -> {
-                finishPress()
-                listener.onCommandResult(true, "Pressed")
-                if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE) readChallenge()
-            }
-            value == "OK:PRESSED" -> listener.onDiagnostic("Ignoring stale press confirmation")
-            value == "OK:PSK_UPDATED" && pskUpdateInFlight -> {
-                pendingNewPsk?.let { psk = it }
-                finishPskUpdate(true, "PSK updated on phone and car")
-                readChallenge()
-            }
-            value == "WARN:PSK_VOLATILE" && pskUpdateInFlight -> {
-                pendingNewPsk?.let { psk = it }
-                finishPskUpdate(false, "Car could not save the PSK; power-cycle the car ESP and try again")
-            }
-            value.startsWith("ERR:PSK_") && pskUpdateInFlight ->
-                finishPskUpdate(false, "Car rejected the PSK update ($value)")
-            value == "ERR:AUTH" && !ready -> {
-                authInFlight = false
-                authGeneration++
-                if (authAttempts < 2) readChallenge() else fail("BLE authentication failed; check the PSK")
-            }
-            value == "ERR:BUSY" && pressInFlight -> {
-                finishPress()
-                listener.onDiagnostic("Remote button press failed: device busy")
-                listener.onCommandResult(false, "Command failed")
-                if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE) readChallenge()
-            }
-            value.startsWith("ERR:") && pressInFlight -> {
-                finishPress()
-                listener.onDiagnostic("Remote button press failed: $value")
-                listener.onCommandResult(false, "Command failed")
-                if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE) readChallenge()
-            }
-            value.startsWith("ERR:") -> listener.onDiagnostic("Ignoring status with no command in flight: $value")
+        }
+        override fun onMtuChanged(g: BluetoothGatt, mtu: Int, code: Int) = dispatch(g) {
+            diagnostic("MTU=$mtu status=$code")
+            if (code == BluetoothGatt.GATT_SUCCESS) negotiatedMtu = mtu
+            queue.complete("mtu", code == BluetoothGatt.GATT_SUCCESS)
+        }
+        override fun onServicesDiscovered(g: BluetoothGatt, code: Int) = dispatch(g) {
+            diagnostic("Service discovery status=$code")
+            queue.complete("services", code == BluetoothGatt.GATT_SUCCESS)
+        }
+        override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, code: Int) = dispatch(g) {
+            diagnostic("Descriptor ${d.characteristic.uuid} status=$code")
+            queue.complete("notify:${d.characteristic.uuid}", code == BluetoothGatt.GATT_SUCCESS)
+        }
+        @Deprecated("Deprecated in API 33")
+        override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, code: Int) {
+            @Suppress("DEPRECATION") val value = c.value?.copyOf() ?: byteArrayOf()
+            receiveRead(g, c, value, code)
+        }
+        override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray, code: Int) = receiveRead(g, c, value.copyOf(), code)
+        @Deprecated("Deprecated in API 33")
+        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
+            @Suppress("DEPRECATION") val value = c.value?.copyOf() ?: byteArrayOf()
+            receiveNotification(g, c, value)
+        }
+        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) = receiveNotification(g, c, value.copyOf())
+        override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, code: Int) = dispatch(g) {
+            if (c.uuid != profile.otaDataUuid) diagnostic("Write ${c.uuid} status=$code")
+            queue.complete("write:${c.uuid}", code == BluetoothGatt.GATT_SUCCESS)
         }
     }
-
-    private fun authenticate() {
-        val current = nonce ?: return
-        authAttempts++
-        authInFlight = true
-        val generation = ++authGeneration
-        listener.onDiagnostic("Sending authentication challenge response, attempt $authAttempts")
-        listener.onState(State.CONNECTING, "Authenticating…")
-        write(command ?: return, CarKeyProtocol.command(profile, CarKeyProtocol.AUTH_COMMAND, current, psk))
-        nonce = null
-        handler.postDelayed({
-            if (authInFlight && !ready && generation == authGeneration) {
-                authInFlight = false
-                listener.onDiagnostic("Authentication response timed out on attempt $authAttempts")
-                if (authAttempts < 2) readChallenge() else fail("BLE authentication timed out")
-            }
-        }, 2_500)
+    private fun receiveRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray, code: Int) = dispatch(g) {
+        readValue = value
+        diagnostic("Read ${c.uuid} status=$code bytes=${value.size}")
+        queue.complete("read:${c.uuid}", code == BluetoothGatt.GATT_SUCCESS)
     }
-
-    fun press() {
-        handler.removeCallbacks(statePoll)
-        if (stateReadInFlight) {
-            handler.postDelayed({ press() }, 120)
-            return
+    private fun receiveNotification(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) = dispatch(g) {
+        when (c.uuid) {
+            profile.challengeUuid -> { if (value.size == 16) nonce = value else fail("Invalid challenge length") }
+            profile.statusUuid -> handleStatus(value.toString(Charsets.UTF_8))
+            profile.otaStatusUuid -> handleOtaStatus(value.toString(Charsets.UTF_8))
         }
-        val current = nonce ?: return listener.onCommandResult(false, "Command failed")
-        val commandCharacteristic = command ?: return listener.onCommandResult(false, "Command failed")
-        listener.onDiagnostic("Sending authenticated button-press command")
-        pressInFlight = true
-        val generation = ++pressGeneration
-        write(commandCharacteristic, CarKeyProtocol.command(profile, CarKeyProtocol.PRESS_COMMAND, current, psk))
+        publishReady()
+    }
+    private fun configureServices(g: BluetoothGatt) {
+        val service = g.getService(profile.serviceUuid) ?: return fail("${profile.displayName} service not found")
+        challenge = service.getCharacteristic(profile.challengeUuid)
+        command = service.getCharacteristic(profile.commandUuid)
+        status = service.getCharacteristic(profile.statusUuid)
+        pskUpdate = service.getCharacteristic(profile.pskUpdateUuid)
+        otaControl = service.getCharacteristic(profile.otaControlUuid)
+        otaData = service.getCharacteristic(profile.otaDataUuid)
+        otaStatus = service.getCharacteristic(profile.otaStatusUuid)
+        deviceState = service.getCharacteristic(profile.deviceStateUuid)
+        if (challenge == null || command == null || status == null) return fail("Required BLE characteristics missing")
+        stage = "subscribe"
+        if (profile.responseMode == BleResponseMode.NOTIFICATIONS) {
+            enableNotifications(g, challenge!!)
+            if (gatt !== g) return
+            enableNotifications(g, status!!)
+            if (gatt !== g) return
+            otaStatus?.let { enableNotifications(g, it) }
+            if (gatt !== g) return
+        }
+        service.getCharacteristic(profile.identityUuid)?.let { identity ->
+            read(identity) { securePskSupported = it.toString(Charsets.UTF_8).split('|').last().split(',').contains("psk2") }
+        }
+        readChallenge()
+    }
+    private fun enableNotifications(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
+        if (stopped || gatt !== g) return
+        queue.enqueue("notify:${c.uuid}", {
+            val descriptor = c.getDescriptor(CCCD_UUID)
+            if (descriptor == null || !g.setCharacteristicNotification(c, true)) false
+            else if (Build.VERSION.SDK_INT >= 33) g.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
+            else {
+                @Suppress("DEPRECATION")
+                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                @Suppress("DEPRECATION")
+                g.writeDescriptor(descriptor)
+            }
+        })
+    }
+    private fun read(c: BluetoothGattCharacteristic, done: (ByteArray) -> Unit) {
+        val g = gatt ?: return
+        if (!stopped) queue.enqueue("read:${c.uuid}", { g.readCharacteristic(c) }) { done(readValue) }
+    }
+    private fun readChallenge() {
+        val c = challenge ?: return
+        if (queue.contains("read:${c.uuid}")) return
         nonce = null
         listener.onReadyChanged(false)
-        handler.postDelayed({
-            if (pressInFlight && generation == pressGeneration) {
-                finishPress()
-                listener.onDiagnostic("Remote button press received no confirmation")
-                listener.onCommandResult(false, "No confirmation")
+        if (!ready) stage = "challenge"
+        read(c) { value ->
+            if (value.size != 16) fail("Invalid challenge length ${value.size}")
+            else {
+                nonce = value.copyOf()
+                if (!ready && pendingCommand == null && !otaInFlight) sendCommand(CarKeyProtocol.AUTH_COMMAND)
             }
-        }, 2_500)
-    }
-
-    @SuppressLint("MissingPermission")
-    fun startOta(image: ByteArray) {
-        val current = nonce ?: return listener.onOtaResult(false, "No fresh challenge for firmware update")
-        val control = otaControl
-        if (control == null || otaData == null || otaStatus == null) {
-            return listener.onOtaResult(false, "Car needs the one-time USB OTA bootstrap firmware first")
         }
-        if (image.isEmpty() || image.size > 0x1e0000) {
-            return listener.onOtaResult(false, "Firmware image size is invalid")
-        }
-        val digest = MessageDigest.getInstance("SHA-256").digest(image)
-        otaImage = image
-        otaOffset = 0
-        otaLastChunkSize = 0
-        otaInFlight = true
-        otaWaitingForReady = true
-        otaStartWritePending = true
-        otaStartWriteComplete = false
-        otaFinishing = false
-        ready = false
-        listener.onReadyChanged(false)
-        listener.onDiagnostic("Starting authenticated BLE OTA (${image.size} bytes)")
-        val startPayload = CarKeyProtocol.otaStart(image.size, digest, current, psk)
-        val highPriorityRequested = gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) == true
-        listener.onDiagnostic("Requested high-throughput BLE connection for OTA: $highPriorityRequested")
-        nonce = null
-        handler.postDelayed({
-            if (!otaInFlight) return@postDelayed
-            if (!write(control, startPayload)) {
-                finishOta(false, "Android could not queue the firmware start request")
-                return@postDelayed
-            }
-            handler.postDelayed({
-                if (otaInFlight && (otaWaitingForReady || otaStartWritePending)) {
-                    finishOta(false, "ESP did not complete the firmware start request")
-                }
-            }, 5_000)
-        }, if (highPriorityRequested) 750L else 0L)
     }
-
-    /**
-     * Re-read the per-connection challenge when the Activity and GATT ready
-     * states have drifted apart. Reading while unauthenticated naturally
-     * restarts authentication; reading while authenticated supplies the fresh
-     * nonce required by OTA:START.
-     */
-    @SuppressLint("MissingPermission")
     fun requestFreshChallenge(): Boolean {
-        val g = gatt ?: return false
-        val c = challenge ?: return false
-        listener.onDiagnostic("Requesting a fresh challenge for firmware update")
-        nonce = null
-        listener.onReadyChanged(false)
-        return g.readCharacteristic(c)
-    }
-
-    private fun handleOtaStatus(value: String) {
-        listener.onDiagnostic("OTA status: $value")
-        when {
-            value == "OTA:READY" && otaInFlight -> {
-                otaWaitingForReady = false
-                listener.onOtaProgress(0, otaImage?.size ?: 0)
-                maybeStartOtaData()
-            }
-            value == "OTA:OK" && otaInFlight -> finishOta(true, "Firmware updated; car ESP is restarting")
-            value.startsWith("ERR:OTA_") && otaInFlight -> finishOta(false, otaErrorMessage(value))
-        }
-    }
-
-    private fun otaErrorMessage(status: String): String = when (status) {
-        "ERR:OTA_AUTH" -> "Firmware update authentication failed"
-        "ERR:OTA_BUSY" -> "Another phone is already updating the car"
-        "ERR:OTA_SIZE" -> "Firmware image does not fit the OTA partition"
-        "ERR:OTA_DIGEST" -> "Firmware was corrupted during transfer"
-        "ERR:OTA_IMAGE" -> "Firmware signature or image validation failed"
-        else -> "Car rejected firmware update ($status)"
-    }
-
-    private fun sendNextOtaChunk() {
-        if (!otaInFlight || otaWaitingForReady) return
-        val image = otaImage ?: return finishOta(false, "Firmware data was lost")
-        if (otaOffset >= image.size) {
-            listener.onDiagnostic("Firmware transfer complete; requesting signed-image validation")
-            otaFinishing = true
-            if (!write(otaControl ?: return finishOta(false, "OTA control characteristic disappeared"), byteArrayOf(0x02))) {
-                finishOta(false, "Android could not queue firmware validation")
-                return
-            }
-            handler.removeCallbacks(otaWriteTimeout)
-            handler.postDelayed(otaWriteTimeout, 10_000)
-            return
-        }
-
-        /* ATT writes carry MTU-3 bytes. Leave two bytes of headroom, then
-         * reserve four bytes for the firmware offset. The current 185 MTU
-         * sends 176-byte chunks; upgraded firmware can negotiate 517 and
-         * accept 508-byte chunks. */
-        val mtuDataCapacity = (negotiatedMtu - 9).coerceAtLeast(14)
-        val count = minOf(508, mtuDataCapacity, image.size - otaOffset)
-        val payload = ByteBuffer.allocate(4 + count).order(ByteOrder.LITTLE_ENDIAN)
-            .putInt(otaOffset)
-            .put(image, otaOffset, count)
-            .array()
-        otaLastChunkSize = count
-        if (!write(otaData ?: return finishOta(false, "OTA data characteristic disappeared"), payload)) {
-            otaLastChunkSize = 0
-            finishOta(false, "Android could not queue firmware data at byte $otaOffset")
-            return
-        }
-        handler.removeCallbacks(otaWriteTimeout)
-        handler.postDelayed(otaWriteTimeout, 5_000)
-    }
-
-    private fun maybeStartOtaData() {
-        if (!otaInFlight || otaWaitingForReady || !otaStartWriteComplete) return
-        if (otaOffset == 0 && otaLastChunkSize == 0 && !otaFinishing) sendNextOtaChunk()
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun finishOta(success: Boolean, message: String) {
-        if (!otaInFlight) return
-        otaInFlight = false
-        gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
-        otaWaitingForReady = false
-        otaStartWritePending = false
-        otaStartWriteComplete = false
-        otaFinishing = false
-        handler.removeCallbacks(otaWriteTimeout)
-        otaImage = null
-        otaLastChunkSize = 0
-        listener.onOtaResult(success, message)
-    }
-
-    private fun finishPress() {
-        pressInFlight = false
-        pressGeneration++
-        if (deviceState != null && !manuallyStopped) handler.postDelayed(statePoll, 500)
-    }
-
-    fun updatePsk(newPsk: String): Boolean {
-        val current = nonce ?: return false
-        val characteristic = pskUpdate ?: return false
-        pendingNewPsk = newPsk
-        pskUpdateInFlight = true
-        val generation = ++pskUpdateGeneration
-        listener.onDiagnostic("Sending authenticated car PSK update")
-        write(characteristic, CarKeyProtocol.pskUpdate(profile, current, psk, newPsk))
-        nonce = null
-        listener.onReadyChanged(false)
-        handler.postDelayed({
-            if (pskUpdateInFlight && generation == pskUpdateGeneration) {
-                finishPskUpdate(false, "Car PSK update timed out")
-            }
-        }, 3_500)
+        if (stopped || gatt == null || challenge == null || pendingCommand != null || pskRequest != null || otaInFlight) return false
+        readChallenge()
         return true
     }
-
+    fun press() {
+        if (!ready || nonce == null || pendingCommand != null || pskRequest != null || otaInFlight) {
+            listener.onCommandResult(false, "Connection is recovering; try again")
+            if (ready) readChallenge()
+            return
+        }
+        sendCommand(CarKeyProtocol.PRESS_COMMAND)
+    }
+    private fun sendCommand(cmd: Byte) {
+        val current = nonce ?: return fail("No fresh challenge")
+        val c = command ?: return fail("Command characteristic missing")
+        pendingCommand = cmd
+        pendingStatus = null
+        commandWritePending = true
+        val generation = ++commandGeneration
+        if (cmd == CarKeyProtocol.AUTH_COMMAND) { stage = "authenticate"; listener.onState(State.CONNECTING, "Authenticating…") }
+        nonce = null
+        listener.onReadyChanged(false)
+        diagnostic("Sending command=$cmd")
+        write(c, CarKeyProtocol.command(profile, cmd, current, psk)) {
+            commandWritePending = false
+            val response = pendingStatus
+            pendingStatus = null
+            if (response != null) handleStatus(response)
+            if (profile.responseMode == BleResponseMode.READ_AFTER_WRITE && pendingCommand != null) {
+                later(100) { if (generation == commandGeneration) status?.let { read(it) { v -> handleStatus(v.toString(Charsets.UTF_8)) } } }
+            }
+            later(3_000) { if (generation == commandGeneration && pendingCommand != null) fail("Command response timed out; execution unknown") }
+        }
+    }
+    private fun handleStatus(value: String) {
+        diagnostic("Device status: ${if (value.startsWith("PSK2:")) value.substringBeforeLast(':') else value}")
+        val request = pskRequest
+        if (request != null) {
+            val persisted = PskUpdateProtocol.verifyReceipt(request, value)
+            if (persisted != null) {
+                if (persisted) psk = pendingNewPsk!!
+                finishPskUpdate(persisted, if (persisted) "PSK updated on phone and car" else "Car could not save the PSK; previous key remains active")
+                readChallenge()
+            } else if (value.startsWith("ERR:PSK_")) fail("Secure PSK update rejected; confirm the car key before retrying")
+            return
+        }
+        val cmd = pendingCommand ?: return
+        if (commandWritePending) { pendingStatus = value; return }
+        if (!(value.startsWith("ERR:") || value == "OK:AUTH" || value == "OK:PRESSED")) return
+        if (cmd == CarKeyProtocol.AUTH_COMMAND && value != "OK:AUTH") return fail("BLE authentication failed; check the PSK")
+        if (cmd == CarKeyProtocol.PRESS_COMMAND && value == "OK:AUTH") return
+        pendingCommand = null
+        commandGeneration++
+        if (cmd == CarKeyProtocol.AUTH_COMMAND) {
+            ready = true
+            directFailures = 0
+            stage = "ready"
+            listener.onState(State.CONNECTED, "Authenticated")
+            scheduleStatePoll()
+        } else listener.onCommandResult(value == "OK:PRESSED", if (value == "OK:PRESSED") "Pressed" else "Command failed ($value)")
+        // Recovery reads a nonce; it never repeats an uncertain remote toggle.
+        readChallenge()
+    }
+    private fun scheduleStatePoll() {
+        if (deviceState == null) return
+        later(1_500) {
+            val c = deviceState
+            if (c != null && ready && !queue.busy && pendingCommand == null && pskRequest == null && !otaInFlight) {
+                read(c) { val state = it.toString(Charsets.UTF_8); if (state.startsWith("ERR:")) fail("Device session requires authentication") else listener.onDeviceState(state) }
+            }
+            scheduleStatePoll()
+        }
+    }
+    private fun write(c: BluetoothGattCharacteristic, value: ByteArray, done: () -> Unit = {}) {
+        val g = gatt ?: return fail("Bluetooth connection disappeared")
+        queue.enqueue("write:${c.uuid}", {
+            if (Build.VERSION.SDK_INT >= 33) {
+                val result = g.writeCharacteristic(c, value, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                if (result != BluetoothStatusCodes.SUCCESS) diagnostic("Write enqueue ${c.uuid} returned $result")
+                result == BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                run { c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT; c.value = value; g.writeCharacteristic(c) }
+            }
+        }, done)
+    }
+    fun updatePsk(newPsk: String): Boolean {
+        if (!securePskSupported) { listener.onPskUpdateResult(false, "Update the car firmware to v2.6.0 or later before changing its PSK"); return true }
+        val current = nonce ?: return false
+        val c = pskUpdate ?: return false
+        if (!PskUpdateProtocol.validKey(newPsk)) { listener.onPskUpdateResult(false, "PSK must be 1–128 UTF-8 bytes without NUL characters"); return true }
+        if (!ready || pendingCommand != null || pskRequest != null || otaInFlight) return false
+        val request = PskUpdateProtocol.create(profile.securityBinding, current, psk, newPsk)
+        pskRequest = request
+        pendingNewPsk = newPsk
+        nonce = null
+        listener.onReadyChanged(false)
+        write(c, request.payload) {
+            if (pskRequest === request) status?.let { read(it) { v -> handleStatus(v.toString(Charsets.UTF_8)) } }
+        }
+        later(8_000) { if (pskRequest === request) fail("PSK receipt timed out; confirm the car key before app-only recovery") }
+        return true
+    }
     private fun finishPskUpdate(success: Boolean, message: String) {
-        if (!pskUpdateInFlight) return
-        pskUpdateInFlight = false
-        pskUpdateGeneration++
+        pskRequest?.receiptKey?.fill(0)
+        pskRequest = null
         pendingNewPsk = null
         listener.onPskUpdateResult(success, message)
     }
-
-    @SuppressLint("MissingPermission")
-    private fun readChallenge() {
+    fun startOta(image: ByteArray) {
+        val current = nonce ?: return listener.onOtaResult(false, "No fresh challenge for firmware update")
+        val control = otaControl
+        if (control == null || otaData == null || otaStatus == null) return listener.onOtaResult(false, "Car needs the one-time USB OTA bootstrap firmware first")
+        if (image.isEmpty() || image.size > 0x1e0000) return listener.onOtaResult(false, "Firmware image size is invalid")
+        if (pendingCommand != null || pskRequest != null || otaInFlight) return listener.onOtaResult(false, "Another BLE operation is running")
+        otaImage = image; otaOffset = 0; otaInFlight = true; otaWaitingForReady = true
+        otaStartWriteComplete = false; otaFinishing = false; otaChunkPending = false; otaResponse = null
+        stage = "ota"
         nonce = null
-        gatt?.readCharacteristic(challenge)
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun enableNotifications(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
-        g.setCharacteristicNotification(c, true)
-        val descriptor = c.getDescriptor(CCCD_UUID) ?: return fail("Notification descriptor missing")
-        if (Build.VERSION.SDK_INT >= 33) g.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-        else {
-            @Suppress("DEPRECATION")
-            run {
-                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                g.writeDescriptor(descriptor)
-            }
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun write(c: BluetoothGattCharacteristic, value: ByteArray): Boolean {
-        val g = gatt ?: return false
-        return if (Build.VERSION.SDK_INT >= 33) {
-            g.writeCharacteristic(c, value, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS
-        } else {
-            @Suppress("DEPRECATION")
-            run {
-                c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                c.value = value
-                g.writeCharacteristic(c)
-            }
-        }
-    }
-
-    private fun fail(message: String) {
-        listener.onDiagnostic("BLE failure: $message")
-        listener.onState(State.DISCONNECTED, message)
         listener.onReadyChanged(false)
-        if (!manuallyStopped) scheduleReconnect()
+        val generation = ++otaGeneration
+        val payload = CarKeyProtocol.otaStart(image.size, MessageDigest.getInstance("SHA-256").digest(image), current, psk)
+        val highPriority = gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH) == true
+        diagnostic("OTA start bytes=${image.size} highPriority=$highPriority")
+        later(if (highPriority) 750 else 0) {
+            write(control, payload) { otaStartWriteComplete = true; maybeStartOtaData() }
+            later(8_000) { if (otaInFlight && generation == otaGeneration && otaWaitingForReady) fail("ESP did not confirm firmware start") }
+        }
     }
-
-    private fun scheduleReconnect() {
-        if (AppPolicies.shouldOfferScanFallback(directFailures, preferDirect)) {
-            awaitingScanFallback = true
-            listener.onState(State.DISCONNECTED, "Cached device unavailable — scan fallback available")
-            handler.removeCallbacksAndMessages(null)
-            handler.postDelayed({ if (!manuallyStopped) start(psk, reconnectAddress, true) }, 1_500)
+    private fun handleOtaStatus(value: String) {
+        diagnostic("OTA status: $value")
+        if (!otaInFlight) return
+        when {
+            value == "OTA:READY" -> { otaWaitingForReady = false; maybeStartOtaData() }
+            value == "OTA:OK" -> {
+                otaResponse = value
+                if (!queue.busy && otaFinishing) finishOta(true, "Firmware updated; car ESP is restarting")
+            }
+            value.startsWith("ERR:OTA_") -> fail("Car rejected firmware update ($value)")
+        }
+    }
+    private fun maybeStartOtaData() {
+        if (!otaInFlight || otaWaitingForReady || !otaStartWriteComplete || otaChunkPending || otaFinishing) return
+        val image = otaImage ?: return fail("Firmware image disappeared")
+        if (otaOffset >= image.size) {
+            otaFinishing = true
+            write(otaControl ?: return fail("OTA control missing"), byteArrayOf(0x02)) {
+                if (otaResponse == "OTA:OK") finishOta(true, "Firmware updated; car ESP is restarting")
+                else later(10_000) { if (otaInFlight) fail("Firmware validation response timed out") }
+            }
             return
         }
-        listener.onState(State.DISCONNECTED, "Reconnecting…")
-        handler.removeCallbacksAndMessages(null)
-        handler.postDelayed({ if (!manuallyStopped) start(psk, reconnectAddress, preferDirect) }, 1_500)
+        val count = minOf(508, (negotiatedMtu - 9).coerceAtLeast(14), image.size - otaOffset)
+        val payload = ByteBuffer.allocate(4 + count).order(ByteOrder.LITTLE_ENDIAN).putInt(otaOffset).put(image, otaOffset, count).array()
+        otaChunkPending = true
+        write(otaData ?: return fail("OTA data missing"), payload) {
+            otaChunkPending = false; otaOffset += count
+            listener.onOtaProgress(otaOffset, image.size)
+            maybeStartOtaData()
+        }
     }
-
-    private fun clearGatt() {
-        gatt = null
-        challenge = null
-        command = null
-        status = null
-        pskUpdate = null
-        otaControl = null
-        otaData = null
-        otaStatus = null
-        deviceState = null
-        stateReadInFlight = false
-        handler.removeCallbacks(statePoll)
-        nonce = null
-        ready = false
-        authAttempts = 0
-        descriptorStage = 0
-        authInFlight = false
-        authGeneration++
-        pendingNewPsk = null
-        pskUpdateInFlight = false
-        pskUpdateGeneration++
-        otaImage = null
-        otaInFlight = false
-        otaWaitingForReady = false
-        otaStartWritePending = false
-        otaStartWriteComplete = false
-        otaFinishing = false
-        handler.removeCallbacks(otaWriteTimeout)
-        otaOffset = 0
-        otaLastChunkSize = 0
-        negotiatedMtu = 23
+    private fun finishOta(success: Boolean, message: String) {
+        if (!otaInFlight) return
+        otaInFlight = false; otaGeneration++; otaImage = null
+        gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
+        listener.onOtaResult(success, message)
+    }
+    private fun fail(message: String) {
+        if (stopped) return
+        diagnostic("BLE failure: $message")
+        val wasPress = pendingCommand == CarKeyProtocol.PRESS_COMMAND
+        val wasPsk = pskRequest != null
+        val wasOta = otaInFlight
+        if (!ready && attemptingDirect) directFailures++
+        if (wasPsk || wasOta) stopped = true
+        teardown()
+        listener.onReadyChanged(false)
+        listener.onState(State.DISCONNECTED, message)
+        if (wasPress) listener.onCommandResult(false, "No confirmation; connection reset")
+        if (wasPsk) listener.onPskUpdateResult(false, "PSK update interrupted; confirm the car key before app-only recovery")
+        if (wasOta) listener.onOtaResult(false, message)
+        if (!stopped) {
+            if (AppPolicies.shouldOfferScanFallback(directFailures, preferDirect)) {
+                preferDirect = false; reconnectAddress = profile.defaultAddress
+                diagnostic("Cached attempts exhausted; switching to scan")
+            }
+            listener.onState(State.DISCONNECTED, "Reconnecting…")
+            later(1_500) { start(psk, reconnectAddress, preferDirect) }
+        }
+    }
+    private fun teardown() {
+        epoch++
+        handler.removeCallbacksAndMessages(null)
+        queue.clear()
+        stopScan()
+        val old = gatt
+        gatt = null // Invalidate ownership before disconnect can deliver callbacks.
+        runCatching { old?.disconnect() }; runCatching { old?.close() }
+        challenge = null; command = null; status = null; pskUpdate = null
+        otaControl = null; otaData = null; otaStatus = null; deviceState = null
+        nonce = null; ready = false; securePskSupported = false
+        pendingCommand = null; commandWritePending = false; pendingStatus = null; commandGeneration++
+        pskRequest?.receiptKey?.fill(0); pskRequest = null; pendingNewPsk = null
+        otaImage = null; otaInFlight = false; otaChunkPending = false; otaResponse = null; otaGeneration++
+        negotiatedMtu = 23; stage = "idle"
     }
 }

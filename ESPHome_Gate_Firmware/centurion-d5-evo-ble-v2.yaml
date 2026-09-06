@@ -2,7 +2,7 @@ substitutions:
   name: "centurion-d5-evo"
   friendly_name: "Centurion D5 Evo"
   comment: "Control Centurion D5 Evo gate motor remotely. Including Kocom bell ringing"
-  gate_ble_build: "gate-ble-v2.7.0-authenticated-live-state-production"
+  gate_ble_build: "gate-ble-v2.8.0-session-recovery-production"
 
   # Gate LED pulse-meter decoder tuning. pulse_meter captures rising edges
   # in its ISR path; the shared binary sensor is only used to determine the
@@ -75,10 +75,11 @@ esphome:
             id(gate_ble_device_state).on_read([](uint16_t conn_id) {
               for (size_t slot = 0; slot < id(gate_ble_conn_ids).size(); ++slot) {
                 if (id(gate_ble_conn_ids)[slot] != conn_id) continue;
-                if (!id(gate_ble_authenticated)[slot]) {
+                if (!id(gate_ble_authenticated)[slot] || id(gate_ble_closing)[slot]) {
                   id(gate_ble_device_state).set_value("ERR:AUTH_REQUIRED");
                   return;
                 }
+                id(gate_ble_activity_ms)[slot] = millis();
                 static const std::array<const char *, 8> states{{
                   "Unknown", "Closed", "Open", "Opening", "Closing",
                   "Pillar override", "No mains", "Low battery"
@@ -174,6 +175,22 @@ globals:
     type: 'std::array<bool, 5>'
     restore_value: false
     initial_value: '{false, false, false, false, false}'
+  - id: gate_ble_connected_ms
+    type: 'std::array<uint32_t, 5>'
+    restore_value: false
+    initial_value: '{0}'
+  - id: gate_ble_activity_ms
+    type: 'std::array<uint32_t, 5>'
+    restore_value: false
+    initial_value: '{0}'
+  - id: gate_ble_closing
+    type: 'std::array<bool, 5>'
+    restore_value: false
+    initial_value: '{false, false, false, false, false}'
+  - id: gate_ble_auth_failures
+    type: 'std::array<uint8_t, 5>'
+    restore_value: false
+    initial_value: '{0}'
   - id: gate_ble_split_hmac_part1
     type: 'std::array<std::array<uint8_t, 16>, 5>'
     restore_value: false
@@ -231,6 +248,7 @@ esp32_ble:
   max_connections: 5
 
 esp32_ble_server:
+  id: gate_ble_server
   manufacturer: "JshStadler"
   model: "Secure BLE Gate API v2"
   max_clients: 5
@@ -246,9 +264,14 @@ esp32_ble_server:
         if (slot < 0) {
           ESP_LOGE("gate_ble", "Client %u connected without a free session slot",
                    static_cast<unsigned>(id));
+          esp_ble_gatts_close(id(gate_ble_server).get_gatts_if(), id);
           return;
         }
         id(gate_ble_conn_ids)[slot] = id;
+        id(gate_ble_connected_ms)[slot] = millis();
+        id(gate_ble_activity_ms)[slot] = millis();
+        id(gate_ble_closing)[slot] = false;
+        id(gate_ble_auth_failures)[slot] = 0;
         for (size_t offset = 0; offset < id(gate_ble_nonces)[slot].size(); offset += 4) {
           const uint32_t random = random_uint32();
           memcpy(id(gate_ble_nonces)[slot].data() + offset, &random, 4);
@@ -263,6 +286,8 @@ esp32_ble_server:
         for (size_t slot = 0; slot < id(gate_ble_conn_ids).size(); ++slot) {
           if (id(gate_ble_conn_ids)[slot] == id) {
             id(gate_ble_conn_ids)[slot] = 65535;
+            id(gate_ble_closing)[slot] = false;
+            id(gate_ble_auth_failures)[slot] = 0;
             id(gate_ble_split_pending)[slot] = false;
             id(gate_ble_authenticated)[slot] = false;
             id(gate_ble_nonces)[slot].fill(0);
@@ -321,7 +346,7 @@ esp32_ble_server:
                       break;
                     }
                   }
-                  if (slot < 0) {
+                  if (slot < 0 || id(gate_ble_closing)[slot]) {
                     ESP_LOGW("gate_ble", "Android write rejected: no session for client %u",
                              static_cast<unsigned>(id));
                     return;
@@ -401,13 +426,21 @@ esp32_ble_server:
                              static_cast<unsigned>(id));
                     id(gate_ble_statuses)[slot] = "ERR:AUTH";
                     id(gate_ble_authenticated)[slot] = false;
+                    if (++id(gate_ble_auth_failures)[slot] >= 5) {
+                      id(gate_ble_closing)[slot] = true;
+                      esp_ble_gatts_close(id(gate_ble_server).get_gatts_if(), id);
+                    }
                   } else if (command == 0x01) {
                     id(gate_ble_authenticated)[slot] = true;
+                    id(gate_ble_auth_failures)[slot] = 0;
+                    id(gate_ble_activity_ms)[slot] = millis();
                     ESP_LOGI("gate_ble", "Android client %u authenticated as %s",
                              static_cast<unsigned>(id), key_names[matched_key].c_str());
                     id(gate_ble_statuses)[slot] = "OK:AUTH";
                   } else {
                     id(gate_ble_authenticated)[slot] = true;
+                    id(gate_ble_auth_failures)[slot] = 0;
+                    id(gate_ble_activity_ms)[slot] = millis();
                     const uint32_t current_ms = millis();
                     if (id(gate_ble_has_pressed) &&
                         current_ms - id(gate_ble_last_press_ms) < 1000) {
@@ -565,13 +598,21 @@ esp32_ble_server:
                              static_cast<unsigned>(id));
                     id(gate_ble_statuses)[slot] = "ERR:AUTH";
                     id(gate_ble_authenticated)[slot] = false;
+                    if (++id(gate_ble_auth_failures)[slot] >= 5) {
+                      id(gate_ble_closing)[slot] = true;
+                      esp_ble_gatts_close(id(gate_ble_server).get_gatts_if(), id);
+                    }
                   } else if (command == 0x01) {
                     id(gate_ble_authenticated)[slot] = true;
+                    id(gate_ble_auth_failures)[slot] = 0;
+                    id(gate_ble_activity_ms)[slot] = millis();
                     ESP_LOGI("gate_ble", "Garmin client %u authenticated as %s",
                              static_cast<unsigned>(id), key_names[matched_key].c_str());
                     id(gate_ble_statuses)[slot] = "OK:AUTH";
                   } else {
                     id(gate_ble_authenticated)[slot] = true;
+                    id(gate_ble_auth_failures)[slot] = 0;
+                    id(gate_ble_activity_ms)[slot] = millis();
                     const uint32_t current_ms = millis();
                     if (id(gate_ble_has_pressed) &&
                         current_ms - id(gate_ble_last_press_ms) < 1000) {
@@ -987,3 +1028,25 @@ sensor:
     device_class: "signal_strength"
     state_class: "measurement"
     entity_category: "diagnostic"
+
+# Absolute authentication deadline: public reads never extend it. Keep session
+# slots reserved until on_disconnect, so late writes cannot reuse a closing slot.
+interval:
+  - interval: 2s
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          for (size_t slot = 0; slot < id(gate_ble_conn_ids).size(); ++slot) {
+            const uint16_t conn = id(gate_ble_conn_ids)[slot];
+            if (conn == 65535) continue;
+            const bool authenticated = id(gate_ble_authenticated)[slot];
+            const uint32_t since = authenticated ? id(gate_ble_activity_ms)[slot] : id(gate_ble_connected_ms)[slot];
+            const uint32_t timeout = authenticated ? 1800000U : 20000U;
+            if (id(gate_ble_closing)[slot] || static_cast<uint32_t>(now - since) >= timeout) {
+              id(gate_ble_closing)[slot] = true;
+              id(gate_ble_authenticated)[slot] = false;
+              id(gate_ble_split_pending)[slot] = false;
+              ESP_LOGW("gate_ble", "Closing expired BLE session %u", static_cast<unsigned>(conn));
+              esp_ble_gatts_close(id(gate_ble_server).get_gatts_if(), conn);
+            }
+          }

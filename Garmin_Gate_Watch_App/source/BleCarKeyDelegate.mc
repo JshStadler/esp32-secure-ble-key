@@ -11,6 +11,21 @@ class BleCarKeyDelegate extends WatchUi.BehaviorDelegate {
     }
 
     // SELECT button = press the remote button
+    function onKey(event) {
+        _bleHandler.recordInteraction();
+        return BehaviorDelegate.onKey(event);
+    }
+
+    function onTap(event) {
+        _bleHandler.recordInteraction();
+        return BehaviorDelegate.onTap(event);
+    }
+
+    function onSwipe(event) {
+        _bleHandler.recordInteraction();
+        return BehaviorDelegate.onSwipe(event);
+    }
+
     function onSelect() {
         _bleHandler.sendPress();
         return true;

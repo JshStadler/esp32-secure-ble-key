@@ -1,6 +1,13 @@
 package dev.jshstadler.carkey
 
 object AppPolicies {
+    enum class AuthenticationRoute { COMBINED, BIOMETRIC, CREDENTIAL, UNAVAILABLE }
+    fun authenticationRoute(api: Int, available: Boolean, deviceSecure: Boolean): AuthenticationRoute = when {
+        available && api >= 30 -> AuthenticationRoute.COMBINED
+        available -> AuthenticationRoute.BIOMETRIC
+        deviceSecure -> AuthenticationRoute.CREDENTIAL
+        else -> AuthenticationRoute.UNAVAILABLE
+    }
     const val DIAGNOSTIC_RETENTION_MS = 24L * 60 * 60 * 1000
     const val OPERATION_RETENTION_MS = 7L * 24 * 60 * 60 * 1000
     const val CACHED_FAILURES_BEFORE_FALLBACK = 3

@@ -33,15 +33,13 @@ object CarKeyProtocol {
         hmac(v2Transcript(profile.securityBinding, command, challenge), key)
 
     internal fun v2Transcript(deviceBinding: String, command: Byte, challenge: ByteArray): ByteArray =
-        V2_DOMAIN.toByteArray(StandardCharsets.US_ASCII) +
+        requireNonce(challenge).let { V2_DOMAIN.toByteArray(StandardCharsets.US_ASCII) +
             byteArrayOf(0) +
             deviceBinding.toByteArray(StandardCharsets.UTF_8) +
             byteArrayOf(0, command) +
-            challenge
+            challenge }
 
-    fun pskUpdate(profile: BleDeviceProfile, challenge: ByteArray, currentKey: String, newKey: String): ByteArray =
-        hmac(v2Transcript(profile.securityBinding, PSK_UPDATE_COMMAND, challenge), currentKey) +
-            byteArrayOf(0) + newKey.toByteArray(StandardCharsets.UTF_8)
+    private fun requireNonce(challenge: ByteArray) = require(challenge.size == 16)
 
     /** START || image-size-LE || SHA-256 || HMAC(domain, size, digest, nonce). */
     fun otaStart(imageSize: Int, digest: ByteArray, challenge: ByteArray, key: String): ByteArray {

@@ -2,6 +2,7 @@ package dev.jshstadler.carkey
 
 import android.Manifest
 import android.app.AlertDialog
+import android.app.KeyguardManager
 import android.bluetooth.BluetoothManager
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -73,6 +74,7 @@ class MainActivity : FragmentActivity() {
     private val runtimes = mutableMapOf<String, DeviceRuntime>()
     private val deviceViews = mutableMapOf<String, DeviceViews>()
     private val clients = mutableMapOf<String, BleCarKeyClient>()
+    private val clientGenerations = mutableMapOf<String, Int>()
     private val profiles = mutableListOf<BleDeviceProfile>()
 
     private var appForeground = false
@@ -88,6 +90,12 @@ class MainActivity : FragmentActivity() {
     private var operationSession = UUID.randomUUID().toString()
     private var requireAuthentication = true
     private var authenticated = false
+    private var credentialCallback: ((Boolean) -> Unit)? = null
+    private val credentialLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        val callback = credentialCallback
+        credentialCallback = null
+        callback?.invoke(it.resultCode == RESULT_OK)
+    }
     private lateinit var authOverlay: LinearLayout
 
     private val vibrator: Vibrator by lazy {
@@ -176,6 +184,7 @@ class MainActivity : FragmentActivity() {
     }
 
     override fun onDestroy() {
+        BackgroundConnectionService.finish(this, false)
         operationGeneration++
         pendingPressId = null
         pendingPskValue = null
@@ -186,15 +195,37 @@ class MainActivity : FragmentActivity() {
 
     override fun onStart() {
         super.onStart()
+        BackgroundConnectionService.finish(this, true)
         appForeground = true
         startForegroundClients()
     }
 
+    override fun onResume() {
+        super.onResume()
+        BackgroundConnectionService.finish(this, true)
+        startForegroundClients()
+    }
+
+    override fun onPause() {
+        // Start while still visible, before Android's background-start limits apply.
+        if (!isFinishing && authenticated && hasPermissions() && clients.isNotEmpty()) {
+            BackgroundConnectionService.begin(this, BackgroundConnectionService.Lease(
+                busy = { pendingOtaImage != null },
+                disconnect = {
+                    EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Background connection window ended")
+                    stopAllClients()
+                },
+            ))
+        }
+        super.onPause()
+    }
+
     override fun onStop() {
         appForeground = false
-        // Keep the selected device connected while Android's document picker is
-        // in front, and never interrupt a transfer already in progress.
-        if (pendingOtaImage == null && !firmwarePickerActive) stopAllClients()
+        if (isFinishing) {
+            BackgroundConnectionService.finish(this, false)
+            stopAllClients()
+        }
         super.onStop()
     }
 
@@ -395,8 +426,10 @@ class MainActivity : FragmentActivity() {
         }, 18_000)
     }
 
-    private fun listenerFor(profile: BleDeviceProfile) = object : BleCarKeyClient.Listener {
+    private fun listenerFor(profile: BleDeviceProfile, generation: Int) = object : BleCarKeyClient.Listener {
+        private fun current() = clientGenerations[profile.id] == generation && clients.containsKey(profile.id)
         override fun onState(state: BleCarKeyClient.State, message: String) = runOnUiThread {
+            if (!current()) return@runOnUiThread
             EventLog.add(this@MainActivity, EventLog.Kind.DIAGNOSTIC, "${profile.displayName} ${state.name}: $message", deviceId = profile.id, deviceName = profile.displayName)
             val runtime = runtimes.getValue(profile.id)
             runtime.state = state
@@ -412,10 +445,12 @@ class MainActivity : FragmentActivity() {
         }
 
         override fun onDiagnostic(message: String) {
+            if (!current()) return
             EventLog.add(this@MainActivity, EventLog.Kind.DIAGNOSTIC, "${profile.displayName}: $message", deviceId = profile.id, deviceName = profile.displayName)
         }
 
         override fun onReadyChanged(ready: Boolean) = runOnUiThread {
+            if (!current()) return@runOnUiThread
             val runtime = runtimes.getValue(profile.id)
             runtime.ready = ready
             if (ready) runtime.message = "Ready"
@@ -441,32 +476,38 @@ class MainActivity : FragmentActivity() {
         }
 
         override fun onDeviceAddress(address: String) {
+            if (!current()) return
             val runtime = runtimes.getValue(profile.id)
             runtime.cachedAddress = address
             store.put(profile.addressStoreKey, address)
         }
 
         override fun onDeviceState(state: String) = runOnUiThread {
+            if (!current()) return@runOnUiThread
             val normalized = state.trim().lowercase().replaceFirstChar { it.uppercase() }
             runtimes.getValue(profile.id).deviceState = normalized
             updateDeviceView(profile.id)
         }
 
         override fun onCommandResult(success: Boolean, message: String) = runOnUiThread {
+            if (!current()) return@runOnUiThread
             finishOperation(profile, success, message)
         }
 
         override fun onPskUpdateResult(success: Boolean, message: String) = runOnUiThread {
+            if (!current()) return@runOnUiThread
             finishPskUpdate(profile, success, message)
         }
 
         override fun onOtaProgress(sent: Int, total: Int) = runOnUiThread {
+            if (!current()) return@runOnUiThread
             val percent = if (total == 0) 0 else sent * 100 / total
             runtimes.getValue(profile.id).message = "Updating firmware: $percent%"
             updateDeviceView(profile.id)
         }
 
         override fun onOtaResult(success: Boolean, message: String) = runOnUiThread {
+            if (!current()) return@runOnUiThread
             finishOtaOperation(profile, success, message)
         }
     }
@@ -652,18 +693,21 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun ensureClient(profile: BleDeviceProfile) {
-        if (!appForeground || !hasPermissions() || clients.containsKey(profile.id)) return
+        if (!appForeground || !authenticated || !hasPermissions() || clients.containsKey(profile.id)) return
         val runtime = runtimes.getValue(profile.id)
         if (runtime.psk.isEmpty()) return
         runtime.state = BleCarKeyClient.State.CONNECTING
         runtime.message = "Connecting..."
         updateDeviceView(profile.id)
-        val client = BleCarKeyClient(this, bluetoothManager, profile, listenerFor(profile))
+        val generation = (clientGenerations[profile.id] ?: 0) + 1
+        clientGenerations[profile.id] = generation
+        val client = BleCarKeyClient(this, bluetoothManager, profile, listenerFor(profile, generation))
         clients[profile.id] = client
         client.start(runtime.psk, runtime.cachedAddress ?: profile.defaultAddress, runtime.preferCached)
     }
 
     private fun stopClient(deviceId: String) {
+        clientGenerations[deviceId] = (clientGenerations[deviceId] ?: 0) + 1
         clients.remove(deviceId)?.stop(true)
         runtimes[deviceId]?.apply {
             ready = false
@@ -918,7 +962,7 @@ class MainActivity : FragmentActivity() {
                         val value = next.text.toString().trim()
                         when {
                             current != null && current.text.toString().trim() != runtime.psk -> current.error = "Existing PSK is incorrect"
-                            value.isEmpty() -> next.error = "PSK is required"
+                            !PskUpdateProtocol.validKey(value) -> next.error = "Use 1–128 UTF-8 bytes without NUL characters"
                             confirm != null && value != confirm.text.toString().trim() -> confirm.error = "PSKs do not match"
                             else -> {
                                 dialog.dismiss()
@@ -1136,26 +1180,45 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun authenticate(reason: String, result: (Boolean) -> Unit) {
-        val allowed = BiometricManager.Authenticators.BIOMETRIC_STRONG or
-            BiometricManager.Authenticators.DEVICE_CREDENTIAL
-        if (BiometricManager.from(this).canAuthenticate(allowed) != BiometricManager.BIOMETRIC_SUCCESS) {
-            result(true)
-            return
+        val allowed = if (Build.VERSION.SDK_INT >= 30) BiometricManager.Authenticators.BIOMETRIC_STRONG or
+            BiometricManager.Authenticators.DEVICE_CREDENTIAL else BiometricManager.Authenticators.BIOMETRIC_STRONG
+        val keyguard = getSystemService(KeyguardManager::class.java)
+        val route = AppPolicies.authenticationRoute(Build.VERSION.SDK_INT,
+            BiometricManager.from(this).canAuthenticate(allowed) == BiometricManager.BIOMETRIC_SUCCESS, keyguard.isDeviceSecure)
+        if (route == AppPolicies.AuthenticationRoute.CREDENTIAL) return authenticateCredential(reason, result)
+        if (route == AppPolicies.AuthenticationRoute.UNAVAILABLE) {
+            toast("Set a device PIN, password, or biometric before using protected actions")
+            return result(false)
         }
         BiometricPrompt(
             this,
             ContextCompat.getMainExecutor(this),
             object : BiometricPrompt.AuthenticationCallback() {
                 override fun onAuthenticationSucceeded(r: BiometricPrompt.AuthenticationResult) = result(true)
-                override fun onAuthenticationError(code: Int, message: CharSequence) = result(false)
+                override fun onAuthenticationError(code: Int, message: CharSequence) {
+                    if (code == BiometricPrompt.ERROR_NEGATIVE_BUTTON && Build.VERSION.SDK_INT < 30 && keyguard.isDeviceSecure)
+                        authenticateCredential(reason, result)
+                    else result(false)
+                }
             },
         ).authenticate(
             BiometricPrompt.PromptInfo.Builder()
                 .setTitle("BLE Key")
                 .setSubtitle(reason)
                 .setAllowedAuthenticators(allowed)
+                .apply { if (Build.VERSION.SDK_INT < 30) setNegativeButtonText(if (keyguard.isDeviceSecure) "Use device PIN" else "Cancel") }
                 .build(),
         )
+    }
+
+    @Suppress("DEPRECATION")
+    private fun authenticateCredential(reason: String, result: (Boolean) -> Unit) {
+        val keyguard = getSystemService(KeyguardManager::class.java)
+        val intent = if (keyguard.isDeviceSecure) keyguard.createConfirmDeviceCredentialIntent("BLE Key", reason) else null
+        if (intent == null || credentialCallback != null) return result(false)
+        credentialCallback = result
+        try { credentialLauncher.launch(intent) }
+        catch (_: Exception) { credentialCallback = null; result(false) }
     }
 
     private fun requiredPermissions(): Array<String> = if (Build.VERSION.SDK_INT >= 31) {
