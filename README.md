@@ -95,8 +95,32 @@ Achieved through ESP-IDF features unavailable in the Arduino framework:
 - Application USB Serial/JTAG controller and both console routes disabled in
   production; ROM USB recovery remains available
 - Button GPIO held in high-impedance idle (zero quiescent current)
-- Periodic restart every 3 hours when idle (state hygiene, while no device connected)
-- Daily restart deferred during a firmware transfer or button pulse
+- No three-hour scheduled restart; watchdog and BLE health recovery remain active
+- Daily fallback restart deferred during firmware transfer, button pulse, or pending press confirmation
+
+## Reliable Car press confirmation (v2.8.0)
+
+Car firmware, Android, and the Garmin Car app now support authenticated press
+receipts. If a connection drops after sending a press, the client reconnects
+and asks whether that same request completed; it never automatically sends a
+second press. The ESP retains results in RAM for **30 seconds**. Client
+recovery ends after 25 seconds. Receipt acknowledgment
+discards the result, retaining only the request ID until its original expiry
+to suppress duplicates. Reboot or expiry means **Unable to confirm — check the
+car**, rather than a claim that the button was not pressed. Confirmation means
+the GPIO pulse completed; it does not measure the physical lock state.
+
+Unsent queued presses expire after ten seconds. Tap **Cancel** on Android, or
+press SELECT again on the watch, to cancel a queued action. Android also cancels
+an unsent press when backgrounded. Gate keeps its existing response protocol.
+
+PSK changes now require a connected Car running v2.8.0. The phone durably keeps
+encrypted old/candidate keys until the change is confirmed and saved. After
+an interruption, use **Device Settings > Recover interrupted PSK change** to
+verify which key is installed without pressing the remote. Customized bootstrap
+keys are saved to NVS on first boot; storage failure disables commands. See
+[v2.8.0 release notes](RELEASE_NOTES_v2.8.0.md) for upgrade order and the
+existing-installation provisioning caveat.
 
 ## Device health and OTA confirmation (v2.7.0)
 
@@ -222,8 +246,9 @@ to disable the launch gate during periods of frequent use. PSK changes remain
 protected by device authentication even when the main app gate is disabled.
 
 **Device Settings → Use cached device address** enables an optional lower-latency
-direct connection. After three failed cached attempts the app offers a persistent
-scan fallback, while continuing cached retries until that fallback is selected.
+direct connection. After three failed cached attempts the app automatically
+switches to filtered scanning. Failed attempts back off; pending receipt
+recovery uses a shorter retry delay within its fixed 25-second deadline.
 
 The native app also includes connection diagnostics, shareable logs, a seven-day
 operation history, and optional location pins for the latest 30 foreground

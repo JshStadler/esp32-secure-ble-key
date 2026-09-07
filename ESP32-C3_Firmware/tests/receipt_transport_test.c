@@ -39,6 +39,7 @@ static void generate_nonce_for_slot(int slot, bool notify) { (void)notify; clien
 static void ble_gap_terminate(uint16_t handle, int reason) { (void)handle; (void)reason; }
 static void mark_authenticated(uint16_t handle) { clients[handle].auth_failures = 0; }
 static void mark_ble_activity(void) {}
+static void schedule_receipt_expiry(void) {}
 static bool press_remote_button(void) { pulse_count++; button_busy = true; return true; }
 #include "receipt_under_test.inc"
 

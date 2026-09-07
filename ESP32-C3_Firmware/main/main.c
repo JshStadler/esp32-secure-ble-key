@@ -316,6 +316,7 @@ static press_receipt_t press_receipts[RECEIPT_SLOTS];
 static int receipt_button_slot = -1;
 static volatile int receipt_released_slot = -1;
 static struct ble_npl_event receipt_button_event;
+static struct ble_npl_callout receipt_expiry_callout;
 
 static void receipt_button_complete(struct ble_npl_event *event) {
     (void)event;
@@ -1282,6 +1283,26 @@ static int chr_access_ota_status(uint16_t conn_handle, uint16_t attr_handle,
 
 /* RCP1 is fragmented into <=18-byte writes and a 19-byte authenticated read,
  * so the same protocol works on Android and Garmin's default ATT MTU. */
+static void schedule_receipt_expiry(void) {
+    int64_t now = now_ms(), remaining = RECEIPT_TTL_MS;
+    bool active = false;
+    for (int i = 0; i < RECEIPT_SLOTS; ++i) {
+        if (!press_receipts[i].result) continue;
+        active = true;
+        int64_t until = press_receipts[i].created_ms + RECEIPT_TTL_MS - now;
+        if (until < remaining) remaining = until;
+    }
+    if (active) ble_npl_callout_reset(&receipt_expiry_callout,
+        ble_npl_time_ms_to_ticks32((uint32_t)(remaining > 0 ? remaining : 1)));
+    else ble_npl_callout_stop(&receipt_expiry_callout);
+}
+
+static void receipt_expiry_callback(struct ble_npl_event *event) {
+    (void)event;
+    receipt_expire(press_receipts, now_ms());
+    schedule_receipt_expiry();
+}
+
 static int chr_access_receipt(uint16_t conn_handle, uint16_t attr_handle,
                               struct ble_gatt_access_ctxt *ctxt, void *arg) {
     (void)attr_handle; (void)arg;
@@ -1334,6 +1355,7 @@ static int chr_access_receipt(uint16_t conn_handle, uint16_t attr_handle,
         int found = receipt_find(press_receipts, client->receipt_id, now_ms());
         if (client->receipt_op == RECEIPT_PRESS && found < 0) {
             found = receipt_reserve(press_receipts, client->receipt_id, now_ms());
+            schedule_receipt_expiry();
             if (found >= 0) {
                 /* Reserve before any GPIO side effect. Completion is posted back
                  * to this host queue after the timer releases the output. */
@@ -2143,6 +2165,7 @@ void app_main(void) {
 
     ble_npl_event_init(&ble_health_event, ble_health_event_callback, NULL);
     ble_npl_event_init(&receipt_button_event, receipt_button_complete, NULL);
+    ble_npl_callout_init(&receipt_expiry_callout, nimble_port_get_dflt_eventq(), receipt_expiry_callback, NULL);
     ble_npl_callout_init(&slow_adv_callout, nimble_port_get_dflt_eventq(), slow_adv_callback, NULL);
 
     /* ---- Task watchdog ---- */

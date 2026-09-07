@@ -113,8 +113,8 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         armReceiptDeadline()
         psk = key
         preferDirect = useCachedAddress
-        reconnectAddress = if (useCachedAddress) cachedAddress else profile.defaultAddress
-        attemptingDirect = useCachedAddress && reconnectAddress != null
+        reconnectAddress = if (useCachedAddress || receiptId != null) cachedAddress else profile.defaultAddress
+        attemptingDirect = (useCachedAddress || receiptId != null) && reconnectAddress != null
         if (attemptingDirect) {
             listener.onState(State.CONNECTING, "Connecting to cached device…")
             val device = runCatching { bluetoothManager.adapter?.getRemoteDevice(reconnectAddress) }.getOrNull()
