@@ -37,6 +37,7 @@ class BleHandler extends Ble.BleDelegate {
     var _receiptOp = 0;
     var _receiptStage = 0;
     var _uncertainOutcome = false;
+    var _queuedAt = 0;
 
     function initialize() {
         BleDelegate.initialize();
@@ -200,12 +201,16 @@ class BleHandler extends Ble.BleDelegate {
             _hasPendingPress = false; _intentTimer.stop(); show("Press canceled"); return;
         }
         _intentTimer.stop(); _intentTimer.start(method(:onQueuedDeadline), 10000, false);
+        _queuedAt = System.getTimer();
         dispatchPress();
     }
     function onQueuedDeadline() as Void {
         if (_hasPendingPress) { _hasPendingPress = false; show("Not sent: timed out"); vibrateFailure(); }
     }
     private function dispatchPress() {
+        if (System.getTimer() - _queuedAt >= 10000) {
+            _hasPendingPress = false; _intentTimer.stop(); show("Not sent: timed out"); return;
+        }
         if (!configured()) { show("Set PSK in Connect IQ"); return; }
         if (_pendingCommand == CarKeyProfile.CMD_PRESS) { return; }
         if (_pendingCommand != null || _subscribing) { _hasPendingPress = true; show("Press queued"); return; }

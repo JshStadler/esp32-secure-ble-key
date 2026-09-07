@@ -80,6 +80,7 @@ class MainActivity : FragmentActivity() {
 
     private var appForeground = false
     private var pendingPressId: String? = null
+    private var pendingPressDeadline = 0L
     private var pressDispatched = false
     private var pendingPskValue: String? = null
     private var pendingPskOnSaved: (() -> Unit)? = null
@@ -421,6 +422,7 @@ class MainActivity : FragmentActivity() {
         val generation = operationGeneration
         operationSession = UUID.randomUUID().toString()
         runtime.uncertainOutcome = null
+        pendingPressDeadline = android.os.SystemClock.elapsedRealtime() + 10_000
         pendingPressId = profile.id
         pendingPskValue = null
         pendingPskOnSaved = null
@@ -484,6 +486,11 @@ class MainActivity : FragmentActivity() {
             if (ready && healthDeviceId == profile.id && pendingPressId == null) healthFetch?.invoke()
             if (ready && pendingPressId == profile.id && !pressDispatched &&
                 (appForeground || pendingPskValue != null || pendingOtaImage != null)) {
+                if (pendingPskValue == null && pendingOtaImage == null &&
+                    android.os.SystemClock.elapsedRealtime() >= pendingPressDeadline) {
+                    finishOperation(profile, false, "Not sent — connection timed out")
+                    return@runOnUiThread
+                }
                 pressDispatched = true
                 runtime.message = when {
                     pendingOtaImage != null -> "Preparing firmware update..."
