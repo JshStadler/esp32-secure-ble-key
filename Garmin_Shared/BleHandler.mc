@@ -29,6 +29,15 @@ class BleHandler extends Ble.BleDelegate {
     var _operationTimer;
     var _connectionTimer;
     var _windowTimer;
+    var _intentTimer;
+    var _receiptId = null;
+    var _receiptRequestId = null;
+    var _receiptNonce = null;
+    var _receiptMac = null;
+    var _receiptOp = 0;
+    var _receiptStage = 0;
+    var _uncertainOutcome = false;
+    var _queuedAt = 0;
 
     function initialize() {
         BleDelegate.initialize();
@@ -36,6 +45,7 @@ class BleHandler extends Ble.BleDelegate {
         _operationTimer = new Timer.Timer();
         _connectionTimer = new Timer.Timer();
         _windowTimer = new Timer.Timer();
+        _intentTimer = new Timer.Timer();
         Ble.setDelegate(self);
         try { Ble.registerProfile(CarKeyProfile.getProfileDef()); }
         catch (e) { System.println("Profile registration: " + e.getErrorMessage()); }
@@ -59,6 +69,7 @@ class BleHandler extends Ble.BleDelegate {
     function cleanup() {
         _stopped = true;
         _timer.stop(); _operationTimer.stop(); _connectionTimer.stop(); _windowTimer.stop();
+        _intentTimer.stop(); _receiptId = null; _receiptOp = 0; _receiptStage = 0;
         stopScan();
         _pendingCommand = null; _part2 = null; _earlyStatus = null; _hasPendingPress = false;
         // Retain a healthy cached pairing, but discard one with unfinished ATT work.
@@ -174,12 +185,32 @@ class BleHandler extends Ble.BleDelegate {
         if (status != Ble.STATUS_SUCCESS) { recover("Subscription failed", true); return; }
         beginAuthentication();
     }
-    private function beginAuthentication() { _pendingCommand = CarKeyProfile.CMD_AUTH_ONLY; readChallenge(); }
+    private function beginAuthentication() {
+        if (CarKeyProfile.RECEIPTS && characteristic(CarKeyProfile.RECEIPT_CHAR_UUID) != null) {
+            beginReceipt(1, Cryptography.randomBytes(16));
+        } else {
+            if (_receiptId != null) { onReceiptDeadline(); return; }
+            _pendingCommand = CarKeyProfile.CMD_AUTH_ONLY; readChallenge();
+        }
+    }
     function sendPress() {
         recordInteraction();
+        if (_receiptId != null) { return; }
+        _uncertainOutcome = false;
+        if (_hasPendingPress) {
+            _hasPendingPress = false; _intentTimer.stop(); show("Press canceled"); return;
+        }
+        _intentTimer.stop(); _intentTimer.start(method(:onQueuedDeadline), 10000, false);
+        _queuedAt = System.getTimer();
         dispatchPress();
     }
+    function onQueuedDeadline() as Void {
+        if (_hasPendingPress) { _hasPendingPress = false; show("Not sent: timed out"); vibrateFailure(); }
+    }
     private function dispatchPress() {
+        if (System.getTimer() - _queuedAt >= 10000) {
+            _hasPendingPress = false; _intentTimer.stop(); show("Not sent: timed out"); return;
+        }
         if (!configured()) { show("Set PSK in Connect IQ"); return; }
         if (_pendingCommand == CarKeyProfile.CMD_PRESS) { return; }
         if (_pendingCommand != null || _subscribing) { _hasPendingPress = true; show("Press queued"); return; }
@@ -190,6 +221,13 @@ class BleHandler extends Ble.BleDelegate {
             return;
         }
         _hasPendingPress = false;
+        _intentTimer.stop();
+        if (CarKeyProfile.RECEIPTS && characteristic(CarKeyProfile.RECEIPT_CHAR_UUID) != null) {
+            _receiptId = Cryptography.randomBytes(16);
+            _intentTimer.start(method(:onReceiptDeadline), 25000, false);
+            beginReceipt(2, _receiptId);
+            return;
+        }
         _pendingCommand = CarKeyProfile.CMD_PRESS;
         readChallenge();
     }
@@ -209,7 +247,10 @@ class BleHandler extends Ble.BleDelegate {
         if (uuid.equals(CarKeyProfile.CHALLENGE_CHAR_UUID) && _state == STATE_READING_CHALLENGE) {
             if (status != Ble.STATUS_SUCCESS || !(value instanceof Lang.ByteArray) || value.size() != 16) { recover("Invalid challenge", false); return; }
             _operationTimer.stop();
-            sendCommand(value);
+            if (_receiptOp != 0) { sendReceipt(value); } else { sendCommand(value); }
+        } else if (uuid.equals(CarKeyProfile.RECEIPT_CHAR_UUID) && _receiptOp != 0 && _receiptStage == 4) {
+            if (status != Ble.STATUS_SUCCESS) { recover("Receipt read failed", false); return; }
+            finishReceipt(value);
         } else if (CarKeyProfile.READ_STATUS && uuid.equals(CarKeyProfile.STATUS_CHAR_UUID) && _state == STATE_WAITING_STATUS) {
             if (status != Ble.STATUS_SUCCESS) { recover("Status read failed", false); return; }
             finishStatus(value);
@@ -239,6 +280,12 @@ class BleHandler extends Ble.BleDelegate {
     function onCharacteristicWrite(c, status) {
         if (!ownsCharacteristic(c) || _state != STATE_SENDING_COMMAND) { return; }
         var uuid = c.getUuid();
+        if (uuid.equals(CarKeyProfile.RECEIPT_CHAR_UUID) && _receiptOp != 0) {
+            if (status != Ble.STATUS_SUCCESS) { recover("Receipt write failed", false); return; }
+            _receiptStage++;
+            writeReceiptPart();
+            return;
+        }
         if (_writeStage == 1 && uuid.equals(CarKeyProfile.COMMAND_PT1_CHAR_UUID)) {
             if (status != Ble.STATUS_SUCCESS || _part2 == null) { recover("Write failed", false); return; }
             var second = characteristic(CarKeyProfile.COMMAND_PT2_CHAR_UUID);
@@ -288,7 +335,7 @@ class BleHandler extends Ble.BleDelegate {
     }
     private function armOperation() { _operationTimer.stop(); _operationTimer.start(method(:onOperationTimeout), 5000, false); }
     function onOperationTimeout() as Void {
-        if (!_stopped && (_subscribing || _pendingCommand != null)) { recover("No confirmation", false); }
+        if (!_stopped && (_subscribing || _pendingCommand != null || _receiptOp != 0)) { recover("No confirmation", false); }
     }
     function onConnectionTimeout() as Void {
         if (!_stopped && (_state == STATE_SCANNING || _state == STATE_CONNECTING)) { recover("Connection timed out", true); }
@@ -306,17 +353,18 @@ class BleHandler extends Ble.BleDelegate {
     private function recover(message, preserveQueued) {
         if (_stopped) { return; }
         var wasReady = _authenticated;
-        var uncertainPress = _pendingCommand == CarKeyProfile.CMD_PRESS;
+        var uncertainPress = _pendingCommand == CarKeyProfile.CMD_PRESS && _receiptOp != 4;
         System.println("BLE recovery: state=" + _state + " write=" + _writeStage + " " + message);
         _state = STATE_IDLE; // Invalidate state before stop/unpair callbacks.
         _timer.stop(); _operationTimer.stop(); _connectionTimer.stop();
         stopScan(); releaseDevice();
         _authenticated = false; _subscribing = false;
+        _receiptOp = 0; _receiptStage = 0; _receiptMac = null;
         _pendingCommand = null; _part2 = null; _earlyStatus = null; _writeStage = 0;
         if (!preserveQueued || uncertainPress) { _hasPendingPress = false; }
-        if (uncertainPress) { vibrateFailure(); }
+        if (uncertainPress && _receiptId == null) { vibrateFailure(); }
         if (wasReady) { vibrateDisconnected(); }
-        show(message);
+        show(_receiptId != null ? "Checking press..." : message);
         _retries++;
         _timer.start(method(:onReconnectTimer), _retries < 3 ? 1500 : 3000, false);
     }
@@ -324,6 +372,81 @@ class BleHandler extends Ble.BleDelegate {
         var chars = new [bytes.size()];
         for (var i = 0; i < bytes.size(); i++) { chars[i] = (bytes[i] & 0xff).toChar(); }
         return StringUtil.charArrayToString(chars);
+    }
+
+    private function beginReceipt(op, id) {
+        _receiptOp = op; _receiptRequestId = id; _receiptStage = 0;
+        _pendingCommand = op == 1 ? CarKeyProfile.CMD_AUTH_ONLY : CarKeyProfile.CMD_PRESS;
+        readChallenge();
+    }
+    private function receiptDigest(reply, result) {
+        var hmac = new Cryptography.HashBasedMessageAuthenticationCode({:algorithm => Cryptography.HASH_SHA256,
+            :key => utf8(Application.Properties.getValue("psk"))});
+        hmac.update(utf8(reply ? "BLEKEY-RCP1-ACK" : "BLEKEY-RCP1"));
+        hmac.update([0]b); hmac.update(utf8("car-main")); hmac.update([0, _receiptOp]b);
+        hmac.update(_receiptRequestId); hmac.update(_receiptNonce);
+        if (reply) { hmac.update([result]b); }
+        return hmac.digest();
+    }
+    private function sendReceipt(nonce) {
+        _receiptNonce = nonce;
+        _receiptMac = receiptDigest(false, 0);
+        _receiptStage = 1; _state = STATE_SENDING_COMMAND;
+        writeReceiptPart();
+    }
+    private function writeReceiptPart() {
+        armOperation();
+        try {
+            var c = characteristic(CarKeyProfile.RECEIPT_CHAR_UUID);
+            if (c == null) { recover("Receipt unavailable", false); return; }
+            if (_receiptStage == 4) { c.requestRead(); return; }
+            var packet = new [_receiptStage == 2 ? 18 : 17]b;
+            packet[0] = _receiptStage == 1 ? 0xf0 : (_receiptStage == 2 ? 0xf1 : 0xf2);
+            if (_receiptStage == 2) { packet[1] = _receiptOp; }
+            for (var i = 0; i < 16; i++) {
+                if (_receiptStage == 1) { packet[i + 1] = _receiptRequestId[i]; }
+                else if (_receiptStage == 2) { packet[i + 2] = _receiptMac[i]; }
+                else { packet[i + 1] = _receiptMac[i + 16]; }
+            }
+            c.requestWrite(packet, {:writeType => Ble.WRITE_TYPE_WITH_RESPONSE});
+        } catch (e) { recover("Receipt exchange failed", false); }
+    }
+    private function finishReceipt(value) {
+        if (!(value instanceof Lang.ByteArray) || value.size() != 19 || value[0] != 0xb1 || value[1] != _receiptOp) {
+            recover("Untrusted receipt", false); return;
+        }
+        var digest = receiptDigest(true, value[2]);
+        var difference = 0;
+        for (var i = 0; i < 16; i++) { difference |= digest[i] ^ value[i + 3]; }
+        if (difference != 0) { recover("Untrusted receipt", false); return; }
+        _operationTimer.stop();
+        var op = _receiptOp; var result = value[2];
+        _receiptOp = 0; _receiptStage = 0; _pendingCommand = null; _state = STATE_CONNECTED;
+        if (op == 1) {
+            if (result != 6) { recover("Device proof failed", false); return; }
+            _authenticated = true; _retries = 0;
+            if (_receiptId != null) { queryReceipt(); }
+            else { show(_uncertainOutcome ? "Unable to confirm" : "Authenticated"); vibrateConnected(); if (_hasPendingPress) { dispatchPress(); } }
+        } else if (op == 4) {
+            // Outcome was already displayed; acknowledgment cannot turn it into failure.
+        } else if (result == 1) {
+            _timer.stop(); _timer.start(method(:queryReceipt), 400, false);
+        } else {
+            _intentTimer.stop();
+            var id = _receiptId; _receiptId = null;
+            if (result == 2) { show("Pressed"); vibrateSuccess(); }
+            else { _uncertainOutcome = result != 3 && result != 5; show(_uncertainOutcome ? "Unable to confirm" : "Not pressed: busy"); vibrateFailure(); }
+            if (id != null && (result == 2 || result == 3)) { beginReceipt(4, id); }
+        }
+    }
+    function queryReceipt() as Void {
+        if (!_stopped && _receiptId != null) { beginReceipt(3, _receiptId); }
+    }
+    function onReceiptDeadline() as Void {
+        if (_receiptId == null) { return; }
+        _receiptId = null; _pendingCommand = null;
+        _uncertainOutcome = true;
+        vibrateFailure(); recover("Unable to confirm", false);
     }
     private function vibrateConnected() { vibratePattern([new Toybox.Attention.VibeProfile(100, 80)]); }
     private function vibrateDisconnected() { vibratePattern([new Toybox.Attention.VibeProfile(100, 80), new Toybox.Attention.VibeProfile(0, 60), new Toybox.Attention.VibeProfile(100, 80)]); }

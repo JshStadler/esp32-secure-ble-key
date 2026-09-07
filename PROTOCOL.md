@@ -1,5 +1,69 @@
 # Secure BLE Key protocol
 
+## Car press receipts (rcp1, v2.8.0)
+
+Car appends read/write characteristic `a1b2c3d4-e5f6-7890-abcd-ef123456789c`.
+Existing characteristics/handles and legacy API-v2 commands remain unchanged.
+New clients detect this characteristic and use RCP1 for mutual authentication,
+presses, result queries, and receipt acknowledgment. Older Car firmware and
+Gate retain their existing protocol; lost-response recovery requires RCP1.
+
+For every exchange, read a fresh 16-byte challenge. Choose a cryptographically
+random 16-byte request ID for PROVE or a new press. Retain the press ID across
+reconnects. QUERY and ACK use that same ID with a fresh challenge/MAC.
+
+```
+op = 1 PROVE | 2 PRESS | 3 QUERY | 4 ACK
+request = ASCII("BLEKEY-RCP1") || 0 || ASCII("car-main") || 0 ||
+          op || request_id[16] || nonce[16]                  # 54 bytes
+MAC = HMAC-SHA256(PSK, request)
+```
+
+Write three fragments with response, strictly in order, to `...789c`:
+`F0 || request_id`, `F1 || op || MAC[0..15]`, `F2 || MAC[16..31]`.
+They are 17, 18 and 17 bytes. Each connection has its own staging buffers;
+the sequence expires five seconds after F0. F2 consumes the sequence and
+rotates its challenge even when verification fails. Five authentication
+failures close the session. No action occurs before full authentication.
+
+Read the 19-byte response from the same characteristic:
+
+```
+reply = B1 || op || result || tag[16]
+tag = HMAC-SHA256(PSK,
+      ASCII("BLEKEY-RCP1-ACK") || 0 || ASCII("car-main") || 0 ||
+      op || request_id[16] || request_nonce[16] || result)[0..15]
+```
+
+The authenticated reply transcript is 59 bytes. Result values: 0 UNKNOWN,
+1 PENDING, 2 PRESSED (GPIO pulse finished), 3 BUSY (not pressed), 4 ACKED
+(outcome discarded), 5 FULL (not pressed; cache capacity), 6 PROVED. A PROVE
+exchange performs no GPIO operation. The independent random client ID binds
+the peripheral's proof to the current client request.
+
+The ESP reserves a cache entry before starting a pulse, then marks it PRESSED
+on the BLE host queue after the timer has returned the GPIO to high impedance.
+32 entries are held in RAM, independent of connection handles. Entries expire
+at **30 seconds from initial reservation**; reads, reconnects and ACK do not
+extend that deadline. No unexpired entry is evicted to admit another press.
+Duplicate PRESS IDs return their cached state without pulsing the output.
+ACK discards a completed outcome, retaining only the ID/expiry tombstone until
+the original deadline. Pending actions cannot be acknowledged away.
+
+After a lost response clients reconnect and QUERY, never automatically PRESS
+again. They stop recovery 25 seconds after beginning the original exchange.
+UNKNOWN, expired records or ESP restart mean “Unable to confirm”, not “not
+pressed”. PRESSED confirms only the GPIO pulse, not the car's physical lock
+state. No flash write is made for a press. Planned daily reboot waits for
+unexpired unacknowledged outcomes; fault/watchdog recovery can still restart.
+
+New Android key changes require RCP1-capable Car firmware so interrupted
+changes can be recovered with authenticated, non-actuating key proofs. Before
+transmission, the phone durably encrypts both old/candidate keys in a journal.
+It removes the journal only after a verified storage receipt and durable local
+save, or successful explicit recovery. Fresh firmware provisioning persists a
+customized bootstrap key in NVS; failure leaves commands disabled.
+
 All integer command values are one byte. Strings in authenticated transcripts
 use the exact UTF-8/ASCII bytes shown. HMAC is HMAC-SHA256 using the per-device
 pre-shared key, and each challenge is a fresh 16-byte random nonce.

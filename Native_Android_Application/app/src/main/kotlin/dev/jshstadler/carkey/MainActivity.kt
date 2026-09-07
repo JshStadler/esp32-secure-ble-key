@@ -59,6 +59,7 @@ class MainActivity : FragmentActivity() {
         var message: String = "Idle",
         var ready: Boolean = false,
         var deviceState: String? = null,
+        var uncertainOutcome: String? = null,
     )
 
     private data class DeviceViews(
@@ -79,6 +80,7 @@ class MainActivity : FragmentActivity() {
 
     private var appForeground = false
     private var pendingPressId: String? = null
+    private var pendingPressDeadline = 0L
     private var pressDispatched = false
     private var pendingPskValue: String? = null
     private var pendingPskOnSaved: (() -> Unit)? = null
@@ -229,6 +231,10 @@ class MainActivity : FragmentActivity() {
 
     override fun onStop() {
         appForeground = false
+        pendingPressId?.let { id ->
+            if (!pressDispatched && pendingPskValue == null && pendingOtaImage == null)
+                profiles.find { it.id == id }?.let { finishOperation(it, false, "Canceled before sending") }
+        }
         radioDialog?.dismiss()
         healthDialog?.dismiss()
         if (isFinishing) {
@@ -388,6 +394,9 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun requestPress(profile: BleDeviceProfile) {
+        if (pendingPressId == profile.id && !pressDispatched && pendingPskValue == null && pendingOtaImage == null) {
+            finishOperation(profile, false, "Canceled before sending"); return
+        }
         if (!authenticated) {
             authOverlay.visibility = View.VISIBLE
             return
@@ -397,6 +406,9 @@ class MainActivity : FragmentActivity() {
             return
         }
         val runtime = runtimes.getValue(profile.id)
+        if (store.get(pskJournalKey(profile)) != null) {
+            toast("Recover the interrupted PSK change in Device Settings first"); return
+        }
         if (runtime.psk.isEmpty()) {
             showDevicePskDialog(profile) { requestPress(profile) }
             return
@@ -409,6 +421,8 @@ class MainActivity : FragmentActivity() {
         operationGeneration++
         val generation = operationGeneration
         operationSession = UUID.randomUUID().toString()
+        runtime.uncertainOutcome = null
+        pendingPressDeadline = android.os.SystemClock.elapsedRealtime() + 10_000
         pendingPressId = profile.id
         pendingPskValue = null
         pendingPskOnSaved = null
@@ -423,16 +437,21 @@ class MainActivity : FragmentActivity() {
             clients[profile.id]?.press()
         } else {
             runtime.state = BleCarKeyClient.State.CONNECTING
-            runtime.message = "Connecting..."
+            runtime.message = "Connecting (up to 10s)… Tap Cancel to stop."
             updateDeviceView(profile.id)
             ensureClient(profile)
         }
 
         mainHandler.postDelayed({
             if (generation == operationGeneration && pendingPressId == profile.id) {
-                finishOperation(profile, false, "Timed out")
+                if (clients[profile.id]?.hasPendingReceipt != true)
+                    finishOperation(profile, false, if (pressDispatched) "Unable to confirm — check the car" else "Not sent — connection timed out")
             }
         }, 18_000)
+        mainHandler.postDelayed({
+            if (generation == operationGeneration && pendingPressId == profile.id && !pressDispatched)
+                finishOperation(profile, false, "Not sent — connection timed out")
+        }, 10_000)
     }
 
     private fun listenerFor(profile: BleDeviceProfile, generation: Int) = object : BleCarKeyClient.Listener {
@@ -465,7 +484,13 @@ class MainActivity : FragmentActivity() {
             if (ready) runtime.message = "Ready"
             updateDeviceView(profile.id)
             if (ready && healthDeviceId == profile.id && pendingPressId == null) healthFetch?.invoke()
-            if (ready && pendingPressId == profile.id && !pressDispatched) {
+            if (ready && pendingPressId == profile.id && !pressDispatched &&
+                (appForeground || pendingPskValue != null || pendingOtaImage != null)) {
+                if (pendingPskValue == null && pendingOtaImage == null &&
+                    android.os.SystemClock.elapsedRealtime() >= pendingPressDeadline) {
+                    finishOperation(profile, false, "Not sent — connection timed out")
+                    return@runOnUiThread
+                }
                 pressDispatched = true
                 runtime.message = when {
                     pendingOtaImage != null -> "Preparing firmware update..."
@@ -529,6 +554,7 @@ class MainActivity : FragmentActivity() {
         operationGeneration++
         val runtime = runtimes.getValue(profile.id)
         runtime.message = if (success && message == "Pressed") "Command completed" else message
+        runtime.uncertainOutcome = if (message.startsWith("Unable to confirm")) message else null
         updateDeviceView(profile.id)
         setAllActionsEnabled(true)
 
@@ -566,6 +592,18 @@ class MainActivity : FragmentActivity() {
         }
 
         val runtime = runtimes.getValue(profile.id)
+        if (store.get(pskJournalKey(profile)) != null) {
+            toast("Recover the previous PSK change first"); return
+        }
+        if (clients[profile.id]?.supportsSafePskUpdate != true) {
+            toast("Connect to Car firmware v2.8.0 or later before changing its PSK"); return
+        }
+        try {
+            store.putDurable(pskJournalKey(profile), org.json.JSONObject()
+                .put("old", runtime.psk).put("candidate", newPsk).toString())
+        } catch (_: Exception) {
+            toast("Could not save recovery keys. No change was sent."); return
+        }
         operationGeneration++
         val generation = operationGeneration
         pendingPressId = profile.id
@@ -589,6 +627,7 @@ class MainActivity : FragmentActivity() {
 
         mainHandler.postDelayed({
             if (generation == operationGeneration && pendingPskValue != null) {
+                stopClient(profile.id)
                 finishPskUpdate(profile, false, "PSK update timed out")
             }
         }, 18_000)
@@ -604,13 +643,19 @@ class MainActivity : FragmentActivity() {
         pressDispatched = false
         operationGeneration++
 
-        if (success) savePsk(profile, newPsk, restartClient = false)
+        var saved = success
+        if (success) {
+            try {
+                savePsk(profile, newPsk, restartClient = false)
+                store.removeDurable(pskJournalKey(profile))
+            } catch (_: Exception) { saved = false }
+        }
         val runtime = runtimes.getValue(profile.id)
-        runtime.message = message
+        runtime.message = if (saved) message else "PSK recovery required — both keys retained in Device Settings"
         updateDeviceView(profile.id)
         setAllActionsEnabled(true)
         EventLog.add(this, EventLog.Kind.DIAGNOSTIC, message, deviceId = profile.id, deviceName = profile.displayName)
-        if (success) {
+        if (saved) {
             vibrateSuccess()
             toast("${profile.displayName} and phone PSK updated")
             onSaved?.invoke()
@@ -704,6 +749,7 @@ class MainActivity : FragmentActivity() {
 
     private fun ensureClient(profile: BleDeviceProfile) {
         if (!appForeground || !authenticated || !hasPermissions() || clients.containsKey(profile.id)) return
+        if (store.get(pskJournalKey(profile)) != null && pendingPskValue == null) return
         val runtime = runtimes.getValue(profile.id)
         if (runtime.psk.isEmpty()) return
         runtime.state = BleCarKeyClient.State.CONNECTING
@@ -737,6 +783,7 @@ class MainActivity : FragmentActivity() {
         val runtime = runtimes[deviceId] ?: return
         val views = deviceViews[deviceId] ?: return
         views.statusText.text = when {
+            runtime.uncertainOutcome != null -> runtime.uncertainOutcome
             runtime.ready && runtime.deviceState != null -> "${runtime.deviceState} • Connected"
             runtime.deviceState != null -> "${runtime.message}\nLast state: ${runtime.deviceState}"
             else -> runtime.message
@@ -751,8 +798,10 @@ class MainActivity : FragmentActivity() {
             },
         )
         val busy = pendingPressId != null
-        views.actionButton.isEnabled = !busy
-        views.actionButton.alpha = if (busy) 0.5f else 1f
+        val cancellable = pendingPressId == deviceId && !pressDispatched && pendingPskValue == null && pendingOtaImage == null
+        views.actionButton.text = if (cancellable) "Cancel" else "Press"
+        views.actionButton.isEnabled = !busy || cancellable
+        views.actionButton.alpha = if (busy && !cancellable) 0.5f else 1f
     }
 
     private fun setAllActionsEnabled(enabled: Boolean) {
@@ -973,6 +1022,11 @@ class MainActivity : FragmentActivity() {
         layout.addView(name, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(6) })
         layout.addView(configuredAddress, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
         layout.addView(sectionLabel("Security"))
+        if (store.get(pskJournalKey(profile)) != null) {
+            layout.addView(primaryButton("Recover interrupted PSK change") {
+                recoverPskChange(profile)
+            }, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dp(8) })
+        }
         val pskActionLabel = when {
             runtime.psk.isEmpty() -> "Set PSK on app"
             profile.supportsRemotePskUpdate -> "Change PSK on ESP and app"
@@ -1333,12 +1387,46 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun savePsk(profile: BleDeviceProfile, value: String, restartClient: Boolean = true) {
-        if (runtimes.getValue(profile.id).psk == value) return
+        store.putDurable(profile.pskStoreKey, value)
         runtimes.getValue(profile.id).psk = value
-        store.put(profile.pskStoreKey, value)
         if (restartClient) {
             stopClient(profile.id)
             if (appForeground && authenticated) mainHandler.post { ensureClient(profile) }
+        }
+    }
+
+    private fun pskJournalKey(profile: BleDeviceProfile) = "${profile.pskStoreKey}_pending_change"
+
+    private fun recoverPskChange(profile: BleDeviceProfile) {
+        authenticate("Authenticate to recover the device key") { ok ->
+            if (!ok) return@authenticate
+            val journal = runCatching { org.json.JSONObject(store.get(pskJournalKey(profile)) ?: return@authenticate) }.getOrNull()
+            if (journal == null) { toast("Recovery record is unavailable"); return@authenticate }
+            val candidates = listOf(journal.getString("candidate"), journal.getString("old")).distinct()
+            fun attempt(index: Int) {
+                if (!appForeground || index >= candidates.size) {
+                    toast("Could not verify a key. Both keys remain saved; move closer and retry."); return
+                }
+                stopClient(profile.id)
+                val runtime = runtimes.getValue(profile.id)
+                val generation = (clientGenerations[profile.id] ?: 0) + 1
+                clientGenerations[profile.id] = generation
+                val client = BleCarKeyClient(this, bluetoothManager, profile, listenerFor(profile, generation)) { verified ->
+                    if (verified) {
+                        try {
+                            savePsk(profile, candidates[index], restartClient = false)
+                            store.removeDurable(pskJournalKey(profile))
+                            stopClient(profile.id)
+                            toast("Installed key verified and saved. Recovery complete.")
+                            ensureClient(profile)
+                        } catch (_: Exception) { toast("Could not save confirmed key. Recovery keys retained.") }
+                    } else attempt(index + 1)
+                }
+                clients[profile.id] = client
+                client.start(candidates[index], runtime.cachedAddress ?: profile.defaultAddress, true)
+                toast("Checking the installed key without pressing the remote…")
+            }
+            attempt(0)
         }
     }
 

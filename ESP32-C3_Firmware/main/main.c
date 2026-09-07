@@ -63,6 +63,7 @@
 /* PSA Crypto for HMAC-SHA256 (ESP-IDF 6 / mbedTLS 4 public API) */
 #include "psa/crypto.h"
 #include "psk_update.h"
+#include "press_receipt.h"
 
 /* BLE TX power control (NimBLE on C3) */
 #include "esp_bt.h"
@@ -152,8 +153,7 @@ static bool radio_config_persisted = false;
 #define AUTH_TIMEOUT_SEC   1800
 #define MAX_AUTH_FAILURES 5
 
-/* Periodic restart interval (seconds). 3 hours = 10800s. */
-#define RESTART_INTERVAL_SEC 10800
+/* Scheduled three-hour restart removed; targeted recovery and daily fallback remain. */
 
 /* Hard restart: force restart after this many seconds regardless
  * of connection state. Guards against slow memory leaks or NimBLE
@@ -263,6 +263,9 @@ static const ble_uuid128_t ota_status_uuid =
  * ============================================================ */
 
 static char    current_psk[MAX_PSK_LEN + 1];
+static const ble_uuid128_t receipt_uuid = BLE_UUID128_INIT(
+    0x9c, 0x78, 0x56, 0x34, 0x12, 0xef, 0xcd, 0xab,
+    0x90, 0x78, 0xf6, 0xe5, 0xd4, 0xc3, 0xb2, 0xa1);
 
 /* GATT attribute handles (populated by NimBLE after registration) */
 static uint16_t challenge_val_handle;
@@ -302,10 +305,27 @@ typedef struct {
     int64_t  connected_at;
     uint8_t  auth_failures;
     char     status[PSK2_RECEIPT_SIZE];
+    uint8_t receipt_id[16], receipt_mac[16], receipt_op, receipt_reply[19];
+    bool receipt_context, receipt_part, receipt_valid;
+    int64_t receipt_started;
     int64_t  last_activity_at;  /* milliseconds from now_ms() */
 } client_state_t;
 
 static client_state_t clients[MAX_CONNECTIONS];
+static press_receipt_t press_receipts[RECEIPT_SLOTS];
+static int receipt_button_slot = -1;
+static volatile int receipt_released_slot = -1;
+static struct ble_npl_event receipt_button_event;
+static struct ble_npl_callout receipt_expiry_callout;
+
+static void receipt_button_complete(struct ble_npl_event *event) {
+    (void)event;
+    int completed = receipt_released_slot;
+    if (completed >= 0 && press_receipts[completed].result == RECEIPT_PENDING)
+        press_receipts[completed].result = RECEIPT_PRESSED;
+    if (receipt_button_slot == completed) receipt_button_slot = -1;
+    receipt_released_slot = -1;
+}
 
 /* Split command buffer for low-MTU clients (Garmin watches) */
 typedef struct {
@@ -405,6 +425,8 @@ static void button_timer_callback(void *arg) {
 #endif
 
     button_busy = false;
+    receipt_released_slot = receipt_button_slot;
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &receipt_button_event);
 }
 
 static bool press_remote_button(void) {
@@ -464,6 +486,8 @@ static void park_led_pin(void) {
  * NVS: PSK storage
  * ============================================================ */
 
+static bool save_psk(const char *new_psk);
+
 static void load_psk(void) {
     nvs_handle_t handle;
     esp_err_t err = nvs_open("car_unlock", NVS_READONLY, &handle);
@@ -483,8 +507,8 @@ static void load_psk(void) {
     current_psk[0] = '\0';
     if ((err == ESP_ERR_NVS_NOT_FOUND) &&
         strcmp(DEFAULT_PSK, "CHANGE_ME_before_flashing_32chars!") != 0) {
-        strncpy(current_psk, DEFAULT_PSK, MAX_PSK_LEN);
-        current_psk[MAX_PSK_LEN] = '\0';
+        if (strlen(DEFAULT_PSK) > MAX_PSK_LEN || !save_psk(DEFAULT_PSK))
+            current_psk[0] = '\0';
     } else {
         LOG_E(TAG, "No valid provisioned PSK; remote commands disabled");
     }
@@ -1257,6 +1281,103 @@ static int chr_access_ota_status(uint16_t conn_handle, uint16_t attr_handle,
         ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
 
+/* RCP1 is fragmented into <=18-byte writes and a 19-byte authenticated read,
+ * so the same protocol works on Android and Garmin's default ATT MTU. */
+static void schedule_receipt_expiry(void) {
+    int64_t now = now_ms(), remaining = RECEIPT_TTL_MS;
+    bool active = false;
+    for (int i = 0; i < RECEIPT_SLOTS; ++i) {
+        if (!press_receipts[i].result) continue;
+        active = true;
+        int64_t until = press_receipts[i].created_ms + RECEIPT_TTL_MS - now;
+        if (until < remaining) remaining = until;
+    }
+    if (active) ble_npl_callout_reset(&receipt_expiry_callout,
+        ble_npl_time_ms_to_ticks32((uint32_t)(remaining > 0 ? remaining : 1)));
+    else ble_npl_callout_stop(&receipt_expiry_callout);
+}
+
+static void receipt_expiry_callback(struct ble_npl_event *event) {
+    (void)event;
+    receipt_expire(press_receipts, now_ms());
+    schedule_receipt_expiry();
+}
+
+static int chr_access_receipt(uint16_t conn_handle, uint16_t attr_handle,
+                              struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    (void)attr_handle; (void)arg;
+    int slot = ensure_client_slot(conn_handle);
+    if (slot < 0) return BLE_ATT_ERR_UNLIKELY;
+    client_state_t *client = &clients[slot];
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        if (!client->receipt_valid) return BLE_ATT_ERR_UNLIKELY;
+        return os_mbuf_append(ctxt->om, client->receipt_reply, 19) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
+    uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+    uint8_t packet[18];
+    if (len < 1 || len > sizeof(packet) || os_mbuf_copydata(ctxt->om, 0, len, packet) != 0)
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    if (packet[0] == 0xf0 && len == 17) {
+        memcpy(client->receipt_id, packet + 1, 16);
+        client->receipt_context = true; client->receipt_part = false; client->receipt_valid = false;
+        client->receipt_started = now_ms();
+        return 0;
+    }
+    if (!client->receipt_context || now_ms() - client->receipt_started > 5000) {
+        client->receipt_context = false; client->receipt_part = false;
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    if (packet[0] == 0xf1 && len == 18 && packet[1] >= RECEIPT_PROVE && packet[1] <= RECEIPT_ACK) {
+        client->receipt_op = packet[1];
+        memcpy(client->receipt_mac, packet + 2, 16); client->receipt_part = true;
+        return 0;
+    }
+    if (packet[0] != 0xf2 || len != 17 || !client->receipt_part) return BLE_ATT_ERR_UNLIKELY;
+    client->receipt_context = false; client->receipt_part = false;
+    uint8_t nonce[16], transcript[64], expected[32], supplied[32];
+    memcpy(nonce, client->nonce, 16);
+    memcpy(supplied, client->receipt_mac, 16); memcpy(supplied + 16, packet + 1, 16);
+    size_t size = receipt_transcript(transcript, false, client->receipt_op, client->receipt_id, nonce, 0);
+    bool valid = current_psk[0] && compute_hmac(transcript, size, current_psk, expected) &&
+        constant_time_equal(expected, supplied, 32);
+    generate_nonce_for_slot(slot, false);
+    if (!valid) {
+        if (++client->auth_failures >= MAX_AUTH_FAILURES) {
+            client->closing = true;
+            ble_gap_terminate(conn_handle, BLE_ERR_CONN_TERM_LOCAL);
+        }
+        return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+    }
+    mark_authenticated(conn_handle);
+    uint8_t result = RECEIPT_PROVED;
+    if (client->receipt_op != RECEIPT_PROVE) {
+        int found = receipt_find(press_receipts, client->receipt_id, now_ms());
+        if (client->receipt_op == RECEIPT_PRESS && found < 0) {
+            found = receipt_reserve(press_receipts, client->receipt_id, now_ms());
+            schedule_receipt_expiry();
+            if (found >= 0) {
+                /* Reserve before any GPIO side effect. Completion is posted back
+                 * to this host queue after the timer releases the output. */
+                if (button_busy || receipt_button_slot >= 0 || !press_remote_button())
+                    press_receipts[found].result = RECEIPT_BUSY;
+                else receipt_button_slot = found;
+            }
+        } else if (client->receipt_op == RECEIPT_ACK && found >= 0) {
+            receipt_ack(&press_receipts[found]);
+        }
+        result = found >= 0 ? press_receipts[found].result :
+            (client->receipt_op == RECEIPT_PRESS ? RECEIPT_FULL : RECEIPT_UNKNOWN);
+    }
+    mark_ble_activity();
+    size = receipt_transcript(transcript, true, client->receipt_op, client->receipt_id, nonce, result);
+    if (!compute_hmac(transcript, size, current_psk, expected)) return BLE_ATT_ERR_UNLIKELY;
+    client->receipt_reply[0] = 0xb1; client->receipt_reply[1] = client->receipt_op;
+    client->receipt_reply[2] = result; memcpy(client->receipt_reply + 3, expected, 16);
+    client->receipt_valid = true;
+    return 0;
+}
+
 static int chr_access_ota_control(uint16_t conn_handle, uint16_t attr_handle,
                                   struct ble_gatt_access_ctxt *ctxt, void *arg) {
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
@@ -1532,6 +1653,11 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
                 .access_cb  = chr_access_ota_status,
                 .val_handle = &ota_status_val_handle,
                 .flags      = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+            },
+            {
+                .uuid = &receipt_uuid.u,
+                .access_cb = chr_access_receipt,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE,
             },
             { 0 }, /* Terminator */
         },
@@ -1900,18 +2026,13 @@ static void maintain_ble_state(void) {
             }
         }
 
-        check_running_ota_image(ble_synced && task_wdt_monitored &&
+        receipt_expire(press_receipts, now);
+        check_running_ota_image(current_psk[0] && ble_synced && task_wdt_monitored &&
             recoveries_before == adv_recoveries && ghosts_before == ghost_reaps &&
             (nimble_count >= MAX_CONNECTIONS || ble_gap_adv_active()));
 
-        /* ---- Periodic restart (only when idle) ---- */
-        if (now > (int64_t)RESTART_INTERVAL_SEC * 1000 && count_active_slots() == 0) {
-            LOG_I(TAG, "Periodic restart (no active connections)");
-            restart_with_reason(REBOOT_PERIODIC);
-        }
-
         /* ---- Hard restart (unconditional, guards against long-running drift) ---- */
-        if (now > (int64_t)HARD_RESTART_SEC * 1000 && !ota_session.active && !button_busy) {
+        if (now > (int64_t)HARD_RESTART_SEC * 1000 && !ota_session.active && !button_busy && !receipt_waiting(press_receipts)) {
             LOG_E(TAG, "Hard restart after %d hours", HARD_RESTART_SEC / 3600);
             restart_with_reason(REBOOT_DAILY);
         }
@@ -2043,6 +2164,8 @@ void app_main(void) {
     assert(rc == 0);
 
     ble_npl_event_init(&ble_health_event, ble_health_event_callback, NULL);
+    ble_npl_event_init(&receipt_button_event, receipt_button_complete, NULL);
+    ble_npl_callout_init(&receipt_expiry_callout, nimble_port_get_dflt_eventq(), receipt_expiry_callback, NULL);
     ble_npl_callout_init(&slow_adv_callout, nimble_port_get_dflt_eventq(), slow_adv_callback, NULL);
 
     /* ---- Task watchdog ---- */
