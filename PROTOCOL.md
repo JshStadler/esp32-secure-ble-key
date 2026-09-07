@@ -4,9 +4,11 @@
 
 Car appends read/write characteristic `a1b2c3d4-e5f6-7890-abcd-ef123456789c`.
 Existing characteristics/handles and legacy API-v2 commands remain unchanged.
-New clients detect this characteristic and use RCP1 for mutual authentication,
-presses, result queries, and receipt acknowledgment. Older Car firmware and
-Gate retain their existing protocol; lost-response recovery requires RCP1.
+Version 2.8.0 clients detect this characteristic and use RCP1 for mutual
+authentication, presses, result queries, and receipt acknowledgment. Version
+2.8.1 clients use RCP1 only for device proof; normal presses use the shorter
+API-v2 command/status path to avoid the additional round-trip latency. Older
+Car firmware and Gate retain their existing protocol.
 
 For every exchange, read a fresh 16-byte challenge. Choose a cryptographically
 random 16-byte request ID for PROVE or a new press. Retain the press ID across
@@ -50,8 +52,8 @@ Duplicate PRESS IDs return their cached state without pulsing the output.
 ACK discards a completed outcome, retaining only the ID/expiry tombstone until
 the original deadline. Pending actions cannot be acknowledged away.
 
-After a lost response clients reconnect and QUERY, never automatically PRESS
-again. They stop recovery 25 seconds after beginning the original exchange.
+After a lost RCP1 press response, v2.8.0 clients reconnect and QUERY, never
+automatically PRESS again. They stop recovery 25 seconds after beginning the original exchange.
 UNKNOWN, expired records or ESP restart mean “Unable to confirm”, not “not
 pressed”. PRESSED confirms only the GPIO pulse, not the car's physical lock
 state. No flash write is made for a press. Planned daily reboot waits for
