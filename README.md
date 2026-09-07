@@ -98,17 +98,20 @@ Achieved through ESP-IDF features unavailable in the Arduino framework:
 - No three-hour scheduled restart; watchdog and BLE health recovery remain active
 - Daily fallback restart deferred during firmware transfer, button pulse, or pending press confirmation
 
-## Reliable Car press confirmation (v2.8.0)
+## Responsive Car presses (v2.8.1)
 
-Car firmware, Android, and the Garmin Car app now support authenticated press
-receipts. If a connection drops after sending a press, the client reconnects
-and asks whether that same request completed; it never automatically sends a
-second press. The ESP retains results in RAM for **30 seconds**. Client
-recovery ends after 25 seconds. Receipt acknowledgment
-discards the result, retaining only the request ID until its original expiry
-to suppress duplicates. Reboot or expiry means **Unable to confirm — check the
-car**, rather than a claim that the button was not pressed. Confirmation means
-the GPIO pulse completed; it does not measure the physical lock state.
+Android and Garmin Car use the short authenticated command/status path for
+normal presses. Android uses its ready connection's fresh nonce and sends one
+command write (two fragments at MTU 23); Garmin reads a challenge and sends two
+fragments. The existing ESP status reports the result without receipt polling
+or a follow-up acknowledgment exchange. If the response is lost, the client
+shows **Unable to confirm** and never automatically repeats the press.
+
+The v2.8.0 receipt exchange added several BLE round trips and noticeable delay
+on real connections, so v2.8.1 clients no longer use it for presses. The Car's
+30-second RAM receipt support remains available to older clients. Authenticated
+device proof and interrupted PSK-change recovery remain in use. No firmware
+update is needed for the v2.8.1 client changes.
 
 Unsent queued presses expire after ten seconds. Tap **Cancel** on Android, or
 press SELECT again on the watch, to cancel a queued action. Android also cancels
@@ -247,14 +250,19 @@ protected by device authentication even when the main app gate is disabled.
 
 **Device Settings → Use cached device address** enables an optional lower-latency
 direct connection. After three failed cached attempts the app automatically
-switches to filtered scanning. Failed attempts back off; pending receipt
-recovery uses a shorter retry delay within its fixed 25-second deadline.
+switches to filtered scanning. Failed connection attempts back off.
 
 The native app also includes connection diagnostics, shareable logs, a seven-day
 operation history, and optional location pins for the latest 30 foreground
 sessions. Location recording is opt-in per device, allowing the mobile car to
 record locations while leaving a fixed gate disabled, and does not affect BLE
 operation.
+
+**Logs** can be filtered by category, device, local calendar day, and search
+text. **Export** saves or shares a text file containing the matching displayed
+entries and filter details. **Clear** also respects the selected filters.
+Diagnostics remain available for 24 hours, operations for seven days, and
+locations for the latest 30 sessions; filters cannot recover expired records.
 
 The dashboard starts with Car and Gate cards, but cards can be renamed, removed,
 or extended with additional Standalone or ESPHome devices. Each card keeps its

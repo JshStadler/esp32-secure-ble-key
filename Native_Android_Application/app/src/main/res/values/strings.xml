@@ -1,0 +1,5 @@
+<resources>
+    <string name="log_choose_day">Choose day…</string>
+    <string name="log_all_dates">All dates</string>
+    <string name="log_entry_count">%1$d entries • %2$s</string>
+</resources>

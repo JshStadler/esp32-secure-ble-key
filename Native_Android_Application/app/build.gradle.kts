@@ -12,8 +12,8 @@ android {
         applicationId = "dev.jshstadler.carkey"
         minSdk = 23
         targetSdk = 36
-        versionCode = 24
-        versionName = "2.8.0"
+        versionCode = 25
+        versionName = "2.8.1"
         manifestPlaceholders["appLabel"] = "BLE Key"
     }
 

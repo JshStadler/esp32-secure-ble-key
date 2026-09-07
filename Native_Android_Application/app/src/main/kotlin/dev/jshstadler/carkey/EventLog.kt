@@ -74,12 +74,10 @@ object EventLog {
     }
 
     @Synchronized
-    fun clear(context: Context, kind: Kind, deviceId: String? = null) {
-        if (deviceId == null) {
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(kind.key).apply()
-        } else {
-            write(context, kind, read(context, kind).filterNot { it.deviceId == deviceId })
-        }
+    fun clear(context: Context, kind: Kind, filter: LogFilter = LogFilter()) {
+        write(context, kind, read(context, kind).filterNot {
+            filter.matches(it.timestamp, it.deviceId, it.message)
+        })
     }
 
     @Synchronized
@@ -123,17 +121,18 @@ object EventLog {
     }
 
     @Synchronized
-    fun clearLocations(context: Context, deviceId: String? = null) {
-        if (deviceId == null) {
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(LOCATIONS_KEY).apply()
-        } else {
-            writeLocations(context, readLocations(context).filterNot { it.deviceId == deviceId })
-        }
+    fun clearLocations(context: Context, filter: LogFilter = LogFilter()) {
+        writeLocations(context, readLocations(context).filterNot {
+            filter.matches(it.timestamp, it.deviceId, locationText(it))
+        })
     }
+
+    fun locationText(entry: LocationEntry) =
+        "${entry.deviceName.orEmpty()} ${entry.latitude},${entry.longitude} accuracy=${entry.accuracy}m"
 
     private fun write(context: Context, kind: Kind, entries: List<Entry>) {
         val array = JSONArray()
-        entries.takeLast(2_000).forEach { entry ->
+        entries.sortedByDescending { it.timestamp }.take(2_000).forEach { entry ->
             array.put(JSONObject().put("time", entry.timestamp).put("message", entry.message).apply {
                 entry.session?.let { put("session", it) }
                 entry.deviceId?.let { put("device_id", it) }
