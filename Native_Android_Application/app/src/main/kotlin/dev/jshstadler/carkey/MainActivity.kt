@@ -432,7 +432,7 @@ class MainActivity : FragmentActivity() {
 
         if (runtime.ready) {
             pressDispatched = true
-            runtime.message = "Sending command..."
+            runtime.message = "Pressing…"
             updateDeviceView(profile.id)
             clients[profile.id]?.press()
         } else {
@@ -444,8 +444,7 @@ class MainActivity : FragmentActivity() {
 
         mainHandler.postDelayed({
             if (generation == operationGeneration && pendingPressId == profile.id) {
-                if (clients[profile.id]?.hasPendingReceipt != true)
-                    finishOperation(profile, false, if (pressDispatched) "Unable to confirm — check the car" else "Not sent — connection timed out")
+                finishOperation(profile, false, if (pressDispatched) "Unable to confirm — check the car" else "Not sent — connection timed out")
             }
         }, 18_000)
         mainHandler.postDelayed({
@@ -495,7 +494,7 @@ class MainActivity : FragmentActivity() {
                 runtime.message = when {
                     pendingOtaImage != null -> "Preparing firmware update..."
                     pendingPskValue != null -> "Updating ESP PSK..."
-                    else -> "Sending command..."
+                    else -> "Pressing…"
                 }
                 updateDeviceView(profile.id)
                 when {
@@ -553,7 +552,7 @@ class MainActivity : FragmentActivity() {
         pressDispatched = false
         operationGeneration++
         val runtime = runtimes.getValue(profile.id)
-        runtime.message = if (success && message == "Pressed") "Command completed" else message
+        runtime.message = message
         runtime.uncertainOutcome = if (message.startsWith("Unable to confirm")) message else null
         updateDeviceView(profile.id)
         setAllActionsEnabled(true)

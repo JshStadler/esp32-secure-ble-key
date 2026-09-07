@@ -30,7 +30,6 @@ class BleHandler extends Ble.BleDelegate {
     var _connectionTimer;
     var _windowTimer;
     var _intentTimer;
-    var _receiptId = null;
     var _receiptRequestId = null;
     var _receiptNonce = null;
     var _receiptMac = null;
@@ -69,7 +68,7 @@ class BleHandler extends Ble.BleDelegate {
     function cleanup() {
         _stopped = true;
         _timer.stop(); _operationTimer.stop(); _connectionTimer.stop(); _windowTimer.stop();
-        _intentTimer.stop(); _receiptId = null; _receiptOp = 0; _receiptStage = 0;
+        _intentTimer.stop(); _receiptOp = 0; _receiptStage = 0;
         stopScan();
         _pendingCommand = null; _part2 = null; _earlyStatus = null; _hasPendingPress = false;
         // Retain a healthy cached pairing, but discard one with unfinished ATT work.
@@ -189,13 +188,11 @@ class BleHandler extends Ble.BleDelegate {
         if (CarKeyProfile.RECEIPTS && characteristic(CarKeyProfile.RECEIPT_CHAR_UUID) != null) {
             beginReceipt(1, Cryptography.randomBytes(16));
         } else {
-            if (_receiptId != null) { onReceiptDeadline(); return; }
             _pendingCommand = CarKeyProfile.CMD_AUTH_ONLY; readChallenge();
         }
     }
     function sendPress() {
         recordInteraction();
-        if (_receiptId != null) { return; }
         _uncertainOutcome = false;
         if (_hasPendingPress) {
             _hasPendingPress = false; _intentTimer.stop(); show("Press canceled"); return;
@@ -222,12 +219,7 @@ class BleHandler extends Ble.BleDelegate {
         }
         _hasPendingPress = false;
         _intentTimer.stop();
-        if (CarKeyProfile.RECEIPTS && characteristic(CarKeyProfile.RECEIPT_CHAR_UUID) != null) {
-            _receiptId = Cryptography.randomBytes(16);
-            _intentTimer.start(method(:onReceiptDeadline), 25000, false);
-            beginReceipt(2, _receiptId);
-            return;
-        }
+        // Keep normal presses on the short command/status path.
         _pendingCommand = CarKeyProfile.CMD_PRESS;
         readChallenge();
     }
@@ -325,7 +317,7 @@ class BleHandler extends Ble.BleDelegate {
         _state = STATE_CONNECTED;
         if (auth) {
             _authenticated = true; _retries = 0;
-            show("Authenticated");
+            show(_uncertainOutcome ? "Unable to confirm" : "Authenticated");
             vibrateConnected();
             if (_hasPendingPress) { dispatchPress(); }
         } else {
@@ -353,7 +345,7 @@ class BleHandler extends Ble.BleDelegate {
     private function recover(message, preserveQueued) {
         if (_stopped) { return; }
         var wasReady = _authenticated;
-        var uncertainPress = _pendingCommand == CarKeyProfile.CMD_PRESS && _receiptOp != 4;
+        var uncertainPress = _pendingCommand == CarKeyProfile.CMD_PRESS;
         System.println("BLE recovery: state=" + _state + " write=" + _writeStage + " " + message);
         _state = STATE_IDLE; // Invalidate state before stop/unpair callbacks.
         _timer.stop(); _operationTimer.stop(); _connectionTimer.stop();
@@ -362,9 +354,9 @@ class BleHandler extends Ble.BleDelegate {
         _receiptOp = 0; _receiptStage = 0; _receiptMac = null;
         _pendingCommand = null; _part2 = null; _earlyStatus = null; _writeStage = 0;
         if (!preserveQueued || uncertainPress) { _hasPendingPress = false; }
-        if (uncertainPress && _receiptId == null) { vibrateFailure(); }
+        if (uncertainPress) { _uncertainOutcome = true; vibrateFailure(); }
         if (wasReady) { vibrateDisconnected(); }
-        show(_receiptId != null ? "Checking press..." : message);
+        show(_uncertainOutcome ? "Unable to confirm" : message);
         _retries++;
         _timer.start(method(:onReconnectTimer), _retries < 3 ? 1500 : 3000, false);
     }
@@ -422,31 +414,11 @@ class BleHandler extends Ble.BleDelegate {
         _operationTimer.stop();
         var op = _receiptOp; var result = value[2];
         _receiptOp = 0; _receiptStage = 0; _pendingCommand = null; _state = STATE_CONNECTED;
-        if (op == 1) {
-            if (result != 6) { recover("Device proof failed", false); return; }
-            _authenticated = true; _retries = 0;
-            if (_receiptId != null) { queryReceipt(); }
-            else { show(_uncertainOutcome ? "Unable to confirm" : "Authenticated"); vibrateConnected(); if (_hasPendingPress) { dispatchPress(); } }
-        } else if (op == 4) {
-            // Outcome was already displayed; acknowledgment cannot turn it into failure.
-        } else if (result == 1) {
-            _timer.stop(); _timer.start(method(:queryReceipt), 400, false);
-        } else {
-            _intentTimer.stop();
-            var id = _receiptId; _receiptId = null;
-            if (result == 2) { show("Pressed"); vibrateSuccess(); }
-            else { _uncertainOutcome = result != 3 && result != 5; show(_uncertainOutcome ? "Unable to confirm" : "Not pressed: busy"); vibrateFailure(); }
-            if (id != null && (result == 2 || result == 3)) { beginReceipt(4, id); }
-        }
-    }
-    function queryReceipt() as Void {
-        if (!_stopped && _receiptId != null) { beginReceipt(3, _receiptId); }
-    }
-    function onReceiptDeadline() as Void {
-        if (_receiptId == null) { return; }
-        _receiptId = null; _pendingCommand = null;
-        _uncertainOutcome = true;
-        vibrateFailure(); recover("Unable to confirm", false);
+        if (op != 1 || result != 6) { recover("Device proof failed", false); return; }
+        _authenticated = true; _retries = 0;
+        show(_uncertainOutcome ? "Unable to confirm" : "Authenticated");
+        vibrateConnected();
+        if (_hasPendingPress) { dispatchPress(); }
     }
     private function vibrateConnected() { vibratePattern([new Toybox.Attention.VibeProfile(100, 80)]); }
     private function vibrateDisconnected() { vibratePattern([new Toybox.Attention.VibeProfile(100, 80), new Toybox.Attention.VibeProfile(0, 60), new Toybox.Attention.VibeProfile(100, 80)]); }
