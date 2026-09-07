@@ -9,6 +9,8 @@ using Toybox.Timer;
 // UUIDs matching the ESP32 firmware
 class CarKeyProfile {
     static const READ_STATUS = false;
+    static const RECEIPTS = true;
+    static const RECEIPT_CHAR_UUID = Ble.longToUuid(0xa1b2c3d4e5f67890l, 0xabcdef123456789cl);
     static const DEVICE_NAME = "BLE-Device";
     static const BINDING = "car-main";
     static const SERVICE_UUID         = Ble.longToUuid(0xa1b2c3d4e5f67890l, 0xabcdef1234567890l);
@@ -28,6 +30,7 @@ class CarKeyProfile {
         return {
             :uuid => SERVICE_UUID,
             :characteristics => [
+                { :uuid => RECEIPT_CHAR_UUID },
                 {
                     :uuid => CHALLENGE_CHAR_UUID,
                     :descriptors => [CCCD_UUID]

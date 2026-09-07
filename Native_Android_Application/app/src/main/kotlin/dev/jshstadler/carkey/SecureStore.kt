@@ -33,11 +33,17 @@ class SecureStore(context: Context) {
         }
     }
 
-    fun put(name: String, value: String) {
+    fun put(name: String, value: String) { write(name, value, false) }
+
+    /** Credentials/journals must reach disk before a remote mutation or receipt ACK. */
+    fun putDurable(name: String, value: String) { write(name, value, true) }
+
+    private fun write(name: String, value: String, durable: Boolean) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, key())
         val packed = cipher.iv + cipher.doFinal(value.toByteArray(Charsets.UTF_8))
-        prefs.edit().putString(name, Base64.encodeToString(packed, Base64.NO_WRAP)).apply()
+        val edit = prefs.edit().putString(name, Base64.encodeToString(packed, Base64.NO_WRAP))
+        if (durable) check(edit.commit()) { "Secure storage write failed" } else edit.apply()
     }
 
     fun get(name: String): String? = try {
@@ -51,5 +57,9 @@ class SecureStore(context: Context) {
 
     fun remove(name: String) {
         prefs.edit().remove(name).apply()
+    }
+
+    fun removeDurable(name: String) {
+        check(prefs.edit().remove(name).commit()) { "Secure storage removal failed" }
     }
 }

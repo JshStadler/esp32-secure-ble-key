@@ -9,12 +9,23 @@ typedef int esp_err_t;
 #define NVS_READONLY 0
 #define NVS_READWRITE 1
 #define MAX_PSK_LEN 128
+#ifdef TEST_BOOTSTRAP
+static const char *bootstrap_default = "synthetic-private-bootstrap-key";
+#define DEFAULT_PSK bootstrap_default
+#else
 #define DEFAULT_PSK "CHANGE_ME_before_flashing_32chars!"
+#endif
 #define LOG_I(...) ((void)0)
 #define LOG_E(...) ((void)0)
 static char current_psk[129], stored[129], pending[129];
 static int open_result, get_result, set_result, commit_result;
-static int nvs_open(const char *ns, int mode, nvs_handle_t *h) { (void)ns; (void)mode; *h = 1; return open_result; }
+static int nvs_open(const char *ns, int mode, nvs_handle_t *h) {
+    (void)ns; (void)mode; *h = 1;
+#ifdef TEST_BOOTSTRAP
+    if (mode == NVS_READONLY && !stored[0]) return ESP_ERR_NVS_NOT_FOUND;
+#endif
+    return open_result;
+}
 static void nvs_close(nvs_handle_t h) { (void)h; }
 static int nvs_get_str(nvs_handle_t h, const char *name, char *out, size_t *length) {
     (void)h; (void)name;
@@ -29,6 +40,16 @@ static int nvs_set_str(nvs_handle_t h, const char *name, const char *value) {
 static int nvs_commit(nvs_handle_t h) { (void)h; if (!commit_result) strcpy(stored, pending); return commit_result; }
 #include "nvs_under_test.inc"
 int main(void) {
+#ifdef TEST_BOOTSTRAP
+    commit_result = 4;
+    load_psk(); assert(current_psk[0] == 0 && stored[0] == 0);
+    commit_result = 0;
+    load_psk(); assert(!strcmp(stored, bootstrap_default));
+    memset(current_psk, 0, sizeof(current_psk));
+    bootstrap_default = "CHANGE_ME_before_flashing_32chars!"; /* generic release OTA */
+    load_psk(); assert(!strcmp(current_psk, "synthetic-private-bootstrap-key"));
+    puts("Fresh provisioning persists before generic release OTA; storage failure stays closed");
+#else
     for (int n = 1; n <= 128; n++) {
         memset(stored, 'k', n); stored[n] = 0;
         load_psk(); assert(strlen(current_psk) == (size_t)n); assert(!strcmp(current_psk, stored));
@@ -47,4 +68,5 @@ int main(void) {
     commit_result = 0; assert(save_psk("new")); assert(!strcmp(current_psk, "new"));
     load_psk(); assert(!strcmp(current_psk, "new"));
     puts("NVS key lengths, fail-closed loading and atomic save tests passed");
+#endif
 }

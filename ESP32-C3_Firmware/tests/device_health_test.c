@@ -12,7 +12,7 @@ int main(void) {
         RADIO_DEFAULTS, "recent"};
     int n = device_health_format(out, sizeof(out), &h);
     assert(n > 0 && n < (int)sizeof(out));
-    assert(strstr(out, "press,ota1,psk2,health1,radio1,fw=2.7.0") != NULL);
+    assert(strstr(out, "press,ota1,psk2,health1,radio1,rcp1,fw=2.7.0") != NULL);
     assert(strstr(out, "up=18446744073709551615,reset=brownout,ota=valid") != NULL);
     assert(strstr(out, "minheap=4294967295,links=3") != NULL);
     char short_out[8];
