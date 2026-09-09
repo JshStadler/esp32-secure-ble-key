@@ -13,6 +13,15 @@ Keystore entries, device configuration, or history. Keep the existing app until
 you have reconfigured Remote Key with the device PSKs from your password manager
 and verified access. Saved PSKs cannot be revealed in the old app.
 
+Privacy and support: `info@6675162.xyz`. The app contains no ads. Read the bundled
+privacy policy from App Settings or the authentication screen. App Settings also
+provides a support email action and optional connection-notification permission
+on Android 13 and later. BLE operation does not depend on notification permission.
+
+The [Play Console submission pack](PLAY_CONSOLE_SUBMISSION.md) includes the public
+policy publishing steps, signing choices, listing copy, foreground-service
+declaration, and demonstration recording script.
+
 ## Features
 
 - Configurable device-card dashboard, initially populated with Car and Gate
@@ -93,8 +102,9 @@ $env:CAR_KEY_KEY_PASSWORD = '<key password>'
 .\gradlew.bat assembleRelease
 ```
 
-Never commit the keystore or its passwords. Android updates must be signed with
-the same permanent key.
+Never commit the keystore or its passwords. Android updates require compatible
+signing certificates. The release workflow now uploads both the APK and AAB;
+see the submission pack before enrolling in Play App Signing.
 
 For Google Play, configure the signing environment above with the upload key
 registered in Play Console, then build an Android App Bundle:

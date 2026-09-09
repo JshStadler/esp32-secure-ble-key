@@ -1,0 +1,44 @@
+<h1>Remote Key Privacy Policy</h1>
+<p>Last updated: 9 September 2026</p>
+<p>Remote Key (Android application ID <b>dev.logiclabs.remotekey</b>) is provided by Logic-Labs. This policy explains how the app handles information when you use it to control compatible Bluetooth Low Energy (BLE) devices.</p>
+<p>For privacy questions, requests, or support, email <a href="mailto:info@6675162.xyz">info@6675162.xyz</a>.</p>
+
+<h2>How the app works</h2>
+<p>Remote Key connects directly to compatible ESP devices over Bluetooth. The app has no account registration, advertising, advertising identifiers, analytics SDKs, or automatic developer-operated cloud sync. The app does not send your device settings, keys, logs, or locations to Logic-Labs automatically.</p>
+
+<h2>Information stored on your phone</h2>
+<ul>
+<li><b>Device configuration:</b> device names, device types and identifiers, Bluetooth addresses, connection preferences, and per-device location preferences.</li>
+<li><b>Security information:</b> the pre-shared keys (PSKs) you enter or generate, authentication preferences, and recovery information needed to complete interrupted key changes.</li>
+<li><b>Local history:</b> diagnostic messages about Bluetooth connections and device responses, operation timestamps and results, device names, identifiers, and session identifiers.</li>
+<li><b>Optional location pins:</b> latitude, longitude, accuracy, timestamp, and associated device/session information when you enable location recording for a device and trigger it.</li>
+</ul>
+<p>This information supports device authentication and control, reconnection, troubleshooting, and your operation history. Device names and logs may identify your equipment or activity; choose names and share logs accordingly.</p>
+
+<h2>Permissions and authentication</h2>
+<p><b>Bluetooth / Nearby devices:</b> used to discover and communicate with your configured BLE equipment. On Android 11 and earlier, Android also requires location permission for BLE discovery; granting that permission does not turn on operation-location recording.</p>
+<p><b>Location:</b> operation-location recording is off by default and can be enabled separately for each device. If enabled and permission is granted, the app requests a location when that device is triggered. This is not continuous location tracking, and the app does not request background-location permission. Android location services may use GPS or a network-based provider under your phone's settings.</p>
+<p><b>Notifications and foreground service:</b> the app can keep existing BLE connections ready for a short period after you leave it and while an active operation or firmware transfer completes. A foreground-service notification describes this work. On Android 13 and later, notification-drawer visibility requires your optional notification permission. Declining it does not disable BLE control.</p>
+<p><b>Biometrics or screen lock:</b> authentication is handled by Android. Remote Key receives the authentication result; it does not receive or store your fingerprint, face template, PIN, pattern, or device password.</p>
+
+<h2>Transfers you initiate</h2>
+<p><b>BLE equipment:</b> the app exchanges authentication challenges/responses, commands, device status and diagnostic information with the device you configure. When you change a supported device's PSK, it transfers the replacement key to that device using the app's key-update protocol. When you select a firmware file, it reads that file and transfers the firmware over BLE. Clearing the phone app does not erase keys or other information already stored on your ESP device.</p>
+<p><b>Log exports and maps:</b> saving or sharing a log creates a text export that may contain device information, activity, diagnostic details, and locations if you export location entries. You choose the destination or receiving app. Opening a saved location in a maps app passes its coordinates to that app. Those apps and any cloud storage you select handle the information under their own policies.</p>
+<p><b>Clipboard:</b> if you choose to copy a newly generated PSK, the app places it on the Android clipboard. Protect the copied key and avoid sharing it in support messages or recordings.</p>
+<p><b>Support:</b> if you email us, we receive your email address, message, and any attachments or logs you choose to send. We use these to respond, troubleshoot, and handle your request. Our email provider processes messages to deliver and store correspondence. We do not sell your information or use support messages for advertising.</p>
+
+<h2>Storage, retention, and deletion</h2>
+<p>Device settings and PSKs are encrypted in app-private storage using AES-GCM with a key held by Android Keystore. Diagnostic logs, operation history, and location pins use separate app-private storage without additional app-level encryption. Android backup is disabled in the app manifest. No security method can guarantee complete protection.</p>
+<p>Diagnostic history is limited to the last 24 hours and operation history to seven days, with up to 2,000 entries per category. Expired entries are removed when that history is read or updated; there is no scheduled background deletion while the app is unused. The app keeps up to the latest 30 location entries across devices until replaced or cleared. Settings and keys remain until you remove or replace them or clear the app's storage.</p>
+<p>Use Logs to clear history and location entries. Clearing respects your active filters: choose all devices and dates and remove search filters to clear an entire category. Removing a device card does not automatically erase its old history. Disable location recording in Device Settings or revoke location permission to stop future location recording.</p>
+<p>Temporary log-export files are kept in the app cache; exports older than 24 hours are cleaned up when another export is created. Android may clear cached files earlier. Files you save elsewhere or send to others are separate copies; delete them at their destinations if needed.</p>
+<p>Use Android Settings to clear Remote Key's app storage or uninstall it to remove its local data. Configure or reset your ESP hardware separately to revoke keys stored there. We cannot retrieve or remotely delete data that exists only on your phone or hardware.</p>
+<p>We retain support correspondence only as needed to handle the request and meet applicable legal obligations. You can request access, correction, or deletion of information you have sent us by emailing the contact above. Available rights depend on your location; we may need to verify your request.</p>
+
+<h2>Platform services and international use</h2>
+<p>Google Play, Android, your location provider, your email service, and apps you choose for sharing or maps may process information independently under their own privacy policies. For example, platform services may provide download or crash reporting information to developers. This policy does not replace those services' policies. Support email and public website hosting may be processed in countries other than your own.</p>
+<p>If you view this policy on GitHub Pages, visiting that website involves ordinary web requests to GitHub, which may process technical information such as your IP address under its own privacy statement. Reading the bundled policy inside Remote Key does not load a website.</p>
+
+<h2>Children and policy changes</h2>
+<p>Remote Key is a utility for people authorized to operate their compatible access-control equipment and is not directed at children. If you believe a child has sent us personal information, contact us so we can address it.</p>
+<p>We may update this policy when the app or our practices change. The updated policy will show a new revision date and will be included in the app and on its public policy page. Where required, we will provide additional notice or obtain consent.</p>

@@ -35,6 +35,19 @@ to preserve the compiler's manifest hashes and checks the final IQ packages.
 The decoded key is removed on exit. Artifacts contain only signed PRG and IQ
 packages. Remove the compiler-input asset before publishing the release.
 
+## Android and Google Play
+
+The Android workflow builds both a signed APK and an Android App Bundle (AAB)
+using the existing `CAR_KEY_*` keystore secrets. For compatible updates between
+GitHub APKs and Play installations, provide this existing app signing key through
+Play Console's encrypted enrollment procedure. A Google-generated app signing
+private key cannot be downloaded into GitHub.
+
+Play can initially accept uploads signed with this same key. If you register a
+separate upload key later, configure AAB signing separately from the key used for
+GitHub APKs; replacing the APK signing key would break their update continuity.
+See [the signing and Console preparation guide](Native_Android_Application/PLAY_CONSOLE_SUBMISSION.md).
+
 GitHub secrets cannot be read back after creation. Keep an additional encrypted
 offline backup of every private key and its passwords. Never add decoded keys,
 keystores, or passwords to the repository or workflow artifacts.

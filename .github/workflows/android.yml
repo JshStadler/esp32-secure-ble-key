@@ -54,8 +54,8 @@ jobs:
         run: printf '%s' "$CAR_KEY_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/car-key-release.jks"
         env:
           CAR_KEY_KEYSTORE_BASE64: ${{ secrets.CAR_KEY_KEYSTORE_BASE64 }}
-      - name: Build signed release APK
-        run: ./gradlew testDebugUnitTest lintRelease assembleRelease
+      - name: Build signed release APK and Play App Bundle
+        run: ./gradlew testDebugUnitTest lintRelease assembleRelease bundleRelease
         env:
           CAR_KEY_KEYSTORE_PATH: ${{ runner.temp }}/car-key-release.jks
           CAR_KEY_STORE_PASSWORD: ${{ secrets.CAR_KEY_STORE_PASSWORD }}
@@ -67,8 +67,11 @@ jobs:
       - name: Set artifact name
         id: artifact
         shell: bash
-        run: echo "name=Car-Key-${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
+        run: echo "name=Remote-Key-${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.artifact.outputs.name }}
-          path: Native_Android_Application/app/build/outputs/apk/release/app-release.apk
+          path: |
+            Native_Android_Application/app/build/outputs/apk/release/app-release.apk
+            Native_Android_Application/app/build/outputs/bundle/release/app-release.aab
+          if-no-files-found: error

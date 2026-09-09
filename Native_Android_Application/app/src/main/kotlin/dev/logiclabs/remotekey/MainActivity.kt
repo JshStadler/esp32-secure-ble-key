@@ -25,7 +25,9 @@ import android.os.PersistableBundle
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
+import android.provider.Settings
 import android.text.InputType
+import android.text.method.LinkMovementMethod
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
@@ -43,6 +45,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
+import androidx.core.text.HtmlCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -136,6 +140,12 @@ class MainActivity : FragmentActivity() {
             if (granted && profile != null) "Location recording enabled for ${profile.displayName}"
             else "Location recording remains disabled",
         )
+    }
+
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        toast(if (granted) "Connection notifications enabled" else "Notifications remain off. You can enable them in Android settings; BLE still works.")
     }
 
     private val firmwareFileLauncher = registerForActivityResult(
@@ -342,6 +352,8 @@ class MainActivity : FragmentActivity() {
                     }
                 }
             }, LinearLayout.LayoutParams(dp(180), dp(52)))
+            addView(primaryButton("Privacy policy") { showPrivacyPolicy() },
+                LinearLayout.LayoutParams(dp(180), dp(52)).apply { topMargin = dp(12) })
         }
         root.addView(authOverlay, FrameLayout.LayoutParams(-1, -1))
         updateAllDeviceViews()
@@ -1351,14 +1363,62 @@ class MainActivity : FragmentActivity() {
             settingsDialog.dismiss()
             showAddDevice()
         }, LinearLayout.LayoutParams(-1, dp(48)))
+        options.addView(sectionLabel("Privacy and support"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+        options.addView(primaryButton("Connection notifications") { showConnectionNotifications() }, LinearLayout.LayoutParams(-1, dp(48)))
+        options.addView(primaryButton("Privacy policy") { showPrivacyPolicy() }, LinearLayout.LayoutParams(-1, dp(48)))
+        options.addView(primaryButton("Contact support") {
+            runCatching {
+                startActivity(Intent(Intent.ACTION_SENDTO, "mailto:info@6675162.xyz".toUri())
+                    .putExtra(Intent.EXTRA_SUBJECT, "Remote Key support"))
+            }.onFailure { toast("Email info@6675162.xyz for support") }
+        }, LinearLayout.LayoutParams(-1, dp(48)))
         settingsDialog = AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
             .setTitle("Remote Key Settings")
-            .setView(options)
+            .setView(ScrollView(this).apply { addView(options) })
             .setPositiveButton("Done") { _, _ ->
                 persistSettings()
             }
             .create()
         settingsDialog.show()
+    }
+
+    private fun showPrivacyPolicy() {
+        val policy = resources.openRawResource(R.raw.privacy_policy).bufferedReader().use { it.readText() }
+        val content = text("", 15f, false).apply {
+            text = HtmlCompat.fromHtml(policy, HtmlCompat.FROM_HTML_MODE_LEGACY)
+            setTextIsSelectable(true)
+            movementMethod = LinkMovementMethod.getInstance()
+            setLinkTextColor(Color.rgb(160, 190, 255))
+            setPadding(dp(20), dp(12), dp(20), dp(12))
+        }
+        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+            .setTitle("Privacy policy")
+            .setView(ScrollView(this).apply { addView(content) })
+            .setPositiveButton("Done", null)
+            .show()
+    }
+
+    private fun showConnectionNotifications() {
+        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+            .setTitle("Connection notifications")
+            .setMessage("Remote Key keeps existing Bluetooth connections ready for up to two minutes after you leave the app, or while a firmware update finishes. Allow notifications to see when this is happening. Notifications are optional and never contain ads.")
+            .setPositiveButton("Enable / manage") { _, _ ->
+                if (Build.VERSION.SDK_INT >= 33 &&
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+                    (store.get("notification_permission_requested") != "true" || shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS))) {
+                    store.put("notification_permission_requested", "true")
+                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                } else {
+                    val intent = if (Build.VERSION.SDK_INT >= 26) {
+                        Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                    } else {
+                        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, "package:$packageName".toUri())
+                    }
+                    runCatching { startActivity(intent) }.onFailure { toast("Open Android Settings to manage Remote Key notifications") }
+                }
+            }
+            .setNegativeButton("Not now", null)
+            .show()
     }
 
     private fun showGeneratedPsk(generated: String) {
