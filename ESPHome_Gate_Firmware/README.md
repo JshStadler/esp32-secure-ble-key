@@ -38,17 +38,17 @@ ble_psk: "replace-with-the-current-app-psk"
 ```
 
 Up to five keys can be enabled in the `substitutions` block. An empty PSK
-disables that slot. For example, to identify Joshua's phone and watch
-separately, add secrets such as `ble_psk_joshua_phone` and
-`ble_psk_joshua_watch`, then configure the slots like this:
+disables that slot. For example, to identify a phone and watch
+separately, add secrets such as `ble_psk_phone` and
+`ble_psk_watch`, then configure the slots like this:
 
 ```yaml
-gate_ble_key_2_name: "Joshua Phone"
-gate_ble_key_2_event: "joshua_phone"
-gate_ble_key_2_psk: !secret ble_psk_joshua_phone
-gate_ble_key_3_name: "Joshua Watch"
-gate_ble_key_3_event: "joshua_watch"
-gate_ble_key_3_psk: !secret ble_psk_joshua_watch
+gate_ble_key_2_name: "Phone"
+gate_ble_key_2_event: "phone"
+gate_ble_key_2_psk: !secret ble_psk_phone
+gate_ble_key_3_name: "Watch"
+gate_ble_key_3_event: "watch"
+gate_ble_key_3_psk: !secret ble_psk_watch
 ```
 
 Enter the corresponding PSK in that phone app or Garmin build. Names are shown
@@ -67,7 +67,7 @@ ESPHome build files before installing again.
 
 Successful BLE operations trigger the Home Assistant event entity
 `Gate BLE Remote`. Its event type identifies the configured key and client,
-for example `joshua_phone_android_press` or `joshua_watch_garmin_press`.
+for example `phone_android_press` or `watch_garmin_press`.
 This distinguishes BLE operations from presses initiated through Home Assistant.
 
 Gate state is decoded from the controller LED with ESPHome's interrupt-backed
