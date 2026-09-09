@@ -5,16 +5,16 @@ plugins {
 val releaseKeystorePath = System.getenv("CAR_KEY_KEYSTORE_PATH")
 
 android {
-    namespace = "dev.jshstadler.carkey"
+    namespace = "dev.logiclabs.remotekey"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "dev.jshstadler.carkey"
+        applicationId = "dev.logiclabs.remotekey"
         minSdk = 23
         targetSdk = 36
         versionCode = 25
         versionName = "2.8.1"
-        manifestPlaceholders["appLabel"] = "BLE Key"
+        manifestPlaceholders["appLabel"] = "Remote Key"
     }
 
     buildFeatures {
@@ -39,7 +39,7 @@ android {
         debug {
             applicationIdSuffix = ".test"
             versionNameSuffix = "-test"
-            manifestPlaceholders["appLabel"] = "BLE Key"
+            manifestPlaceholders["appLabel"] = "Remote Key"
         }
         release {
             isMinifyEnabled = false
