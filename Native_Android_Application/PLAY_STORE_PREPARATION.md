@@ -3,6 +3,9 @@
 Checked against the project and Google's documentation on 9 September 2026.
 These are preparation tasks, not confirmation that Play Console setup is complete.
 
+See the [copy-ready submission pack](PLAY_CONSOLE_SUBMISSION.md) for signing
+choices, GitHub Pages setup, listing text, declaration wording, and recording steps.
+
 ## Build and signing
 
 - Release identity: `dev.logiclabs.remotekey`; launcher name: **Remote Key**.
@@ -24,8 +27,8 @@ These are preparation tasks, not confirmation that Play Console setup is complet
   `.\gradlew.bat bundleRelease`). Upload
   `app/build/outputs/bundle/release/app-release.aab`. Google Play requires an
   [Android App Bundle for new apps](https://developer.android.com/studio/publish/).
-  The current GitHub release workflow produces only an APK; add `bundleRelease`
-  and the AAB artifact path there if you want automated Play upload artifacts.
+  The GitHub release workflow builds and uploads both a signed APK and AAB using
+  the existing release signing secrets.
 - The current version is `2.8.1` / version code `25`. Check previously uploaded
   bundles in this Console app and increase `versionCode` when required; each
   subsequent release needs a new, increasing code. Verify the final bundle's
@@ -34,7 +37,8 @@ These are preparation tasks, not confirmation that Play Console setup is complet
 ## Privacy, permissions, and review access
 
 - Publish a public privacy policy and add a link or policy text within the app
-  as well as its Play listing. No in-app privacy policy entry currently exists.
+  as well as its Play listing. A policy is now bundled offline in Settings and
+  on the authentication screen; publish its GitHub Pages version before submission.
   Describe device names/addresses, PSKs, local diagnostic and operation logs,
   optional location pins, retention/deletion, user-initiated exports and map
   intents, and a privacy contact. All apps need a policy, including apps that
