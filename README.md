@@ -231,6 +231,11 @@ password manager and, for ESPHome, an ignored `secrets.yaml`. See
 
 ### 📱 Android App (native Kotlin)
 
+The native Android app is **Remote Key**, with release application ID
+`dev.logiclabs.remotekey`. See its
+[Google Play preparation checklist](Native_Android_Application/PLAY_STORE_PREPARATION.md)
+for publishing requirements and the installation transition from the old ID.
+
 Download the current APK from [GitHub Releases](https://github.com/JshStadler/esp32-secure-ble-key/releases), or build it with JDK 17 and Android SDK 36.
 
 ```powershell

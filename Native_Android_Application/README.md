@@ -1,7 +1,17 @@
-# BLE Key — native Android app
+# Remote Key — native Android app
 
-This is the supported native Kotlin/Android BLE Key application. It controls
+This is the supported native Kotlin/Android Remote Key application. It controls
 the separately identified Car and Gate devices without a Flutter runtime.
+
+The release application ID and Kotlin namespace are `dev.logiclabs.remotekey`.
+Debug builds use `dev.logiclabs.remotekey.test` so they can be installed alongside
+the release app. Both display **Remote Key**.
+
+This identity is a new installation relative to `dev.jshstadler.carkey` (and its
+`.test` variant). Android does not migrate the old app's encrypted preferences,
+Keystore entries, device configuration, or history. Keep the existing app until
+you have reconfigured Remote Key with the device PSKs from your password manager
+and verified access. Saved PSKs cannot be revealed in the old app.
 
 ## Features
 
@@ -45,7 +55,7 @@ BLE address for each. The app requires an address for the additional card and
 pins the existing learned device as well, preventing nearby devices from being
 mixed up during scanning.
 
-The card name is only the label displayed in BLE Key and may be anything useful
+The card name is only the label displayed in Remote Key and may be anything useful
 to the user; it does not need to match the ESP's advertised Bluetooth name. A
 BLE address such as `AA:BB:CC:DD:EE:FF` identifies one physical ESP and is used
 to target it when multiple devices of the same firmware type are nearby.
@@ -85,3 +95,16 @@ $env:CAR_KEY_KEY_PASSWORD = '<key password>'
 
 Never commit the keystore or its passwords. Android updates must be signed with
 the same permanent key.
+
+For Google Play, configure the signing environment above with the upload key
+registered in Play Console, then build an Android App Bundle:
+
+```powershell
+.\gradlew.bat bundleRelease
+```
+
+The bundle is written to `app/build/outputs/bundle/release/app-release.aab`.
+With Play App Signing, Google signs delivered APKs using the app signing key;
+the upload key authenticates bundles you submit. Coordinate the signing identity
+with any APKs distributed outside Play. See the
+[Google Play preparation checklist](PLAY_STORE_PREPARATION.md) before uploading.
