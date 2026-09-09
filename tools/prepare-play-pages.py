@@ -1,4 +1,4 @@
-"""Build the public policy page from the same HTML fragment bundled in Android."""
+"""Build the public Remote Key privacy policy for GitHub Pages."""
 
 from pathlib import Path
 import argparse
@@ -16,7 +16,8 @@ def main():
         / "Native_Android_Application/app/src/main/res/raw/privacy_policy.html"
     ).read_text(encoding="utf-8")
 
-    args.output.mkdir(parents=True, exist_ok=True)
+    privacy_dir = args.output / "privacy"
+    privacy_dir.mkdir(parents=True, exist_ok=True)
 
     page = """<!doctype html>
 <html lang="en">
@@ -50,6 +51,10 @@ def main():
         --text: #e6edf3;
         --link: #58a6ff;
       }
+    }
+
+    * {
+      box-sizing: border-box;
     }
 
     body {
@@ -109,10 +114,14 @@ def main():
 </html>
 """
 
-    (args.output / "index.html").write_text(page, encoding="utf-8")
+    (privacy_dir / "index.html").write_text(
+        page,
+        encoding="utf-8",
+    )
+
     (args.output / ".nojekyll").touch()
 
-    print(f"Prepared {args.output / 'index.html'}")
+    print(f"Prepared {privacy_dir / 'index.html'}")
 
 
 if __name__ == "__main__":
