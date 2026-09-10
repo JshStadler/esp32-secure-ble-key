@@ -12,6 +12,7 @@ Desktop.ini
 *~
 
 # Build outputs
+/psk2_vectors.h
 **/build/
 **/.kotlin/
 **/.pio/
