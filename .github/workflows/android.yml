@@ -26,7 +26,7 @@ jobs:
           cache: gradle
       - uses: gradle/actions/setup-gradle@v6
       - run: chmod +x gradlew
-      - run: ./gradlew testDebugUnitTest lintDebug assembleDebug
+      - run: ./gradlew testDebugUnitTest lintDebug assembleDebug :app:minifyReleaseWithR8
       - uses: actions/upload-artifact@v7
         with:
           name: android-verification-reports
@@ -64,6 +64,8 @@ jobs:
       - name: Remove restored release keystore
         if: always()
         run: rm -f "$RUNNER_TEMP/car-key-release.jks"
+      - name: Verify release mapping file
+        run: test -s app/build/outputs/mapping/release/mapping.txt
       - name: Set artifact name
         id: artifact
         shell: bash
@@ -74,4 +76,5 @@ jobs:
           path: |
             Native_Android_Application/app/build/outputs/apk/release/app-release.apk
             Native_Android_Application/app/build/outputs/bundle/release/app-release.aab
+            Native_Android_Application/app/build/outputs/mapping/release/mapping.txt
           if-no-files-found: error
