@@ -1364,8 +1364,8 @@ class MainActivity : FragmentActivity() {
             showAddDevice()
         }, LinearLayout.LayoutParams(-1, dp(48)))
         options.addView(sectionLabel("Privacy and support"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
-        options.addView(primaryButton("Connection notifications") { showConnectionNotifications() }, LinearLayout.LayoutParams(-1, dp(48)))
-        options.addView(primaryButton("Privacy policy") { showPrivacyPolicy() }, LinearLayout.LayoutParams(-1, dp(48)))
+        options.addView(primaryButton("Connection notifications") { showConnectionNotifications() }, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dp(8) })
+        options.addView(primaryButton("Privacy policy") { showPrivacyPolicy() }, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dp(8) })
         options.addView(primaryButton("Contact support") {
             runCatching {
                 startActivity(Intent(Intent.ACTION_SENDTO, "mailto:info@6675162.xyz".toUri())
