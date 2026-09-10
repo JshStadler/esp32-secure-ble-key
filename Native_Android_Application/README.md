@@ -113,4 +113,8 @@ To build an Android App Bundle using the configured signing key:
 ```
 
 The bundle is written to `app/build/outputs/bundle/release/app-release.aab`.
-The release workflow produces both APK and AAB artifacts.
+Release builds enable R8 code optimization and resource shrinking. The release
+workflow produces APK, AAB, and `app/build/outputs/mapping/release/mapping.txt`
+artifacts. Keep the mapping file for each released build to decode obfuscated
+crash reports; the AAB also includes it for Google Play. Debug builds remain
+unobfuscated.

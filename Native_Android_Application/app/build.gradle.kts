@@ -12,8 +12,8 @@ android {
         applicationId = "dev.logiclabs.remotekey"
         minSdk = 23
         targetSdk = 36
-        versionCode = 25
-        versionName = "2.8.1"
+        versionCode = 28
+        versionName = "2.8.2"
         manifestPlaceholders["appLabel"] = "Remote Key"
     }
 
@@ -42,7 +42,9 @@ android {
             manifestPlaceholders["appLabel"] = "Remote Key"
         }
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
             signingConfig = signingConfigs.getByName("release")
         }
     }
