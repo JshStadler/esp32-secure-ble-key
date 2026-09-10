@@ -18,9 +18,8 @@ privacy policy from App Settings or the authentication screen. App Settings also
 provides a support email action and optional connection-notification permission
 on Android 13 and later. BLE operation does not depend on notification permission.
 
-The [Play Console submission pack](PLAY_CONSOLE_SUBMISSION.md) includes the public
-policy publishing steps, signing choices, listing copy, foreground-service
-declaration, and demonstration recording script.
+Read the [privacy policy](app/src/main/res/raw/privacy_policy.html) for details
+about local storage, optional locations, exports, and deletion.
 
 ## Features
 
@@ -43,8 +42,9 @@ binding. The gate uses the distinct `b1b2c3d4-...` API-v2 family and
 `gate-main`, preventing discovery from selecting the wrong ESP while all
 devices are in range.
 Nearby configured devices connect and authenticate when the app is open, making
-card-button presses immediate. Ordinary connections close when the app leaves
-the foreground. Normal PSK changes require the existing PSK. Car changes
+card-button presses immediate. Existing connections remain available for up to
+two minutes after the app is backgrounded, or while a firmware update is active.
+Normal PSK changes require the existing PSK. Car changes
 securely update the car ESP over BLE and save the phone copy only after the ESP
 confirms persistence; ESPHome access-device changes update the app copy after
 the YAML secret has been changed. A separately labelled, device-authenticated
@@ -86,13 +86,14 @@ action from rebuilding the BLE connection during OTA.
 Use JDK 17 and the included wrapper:
 
 ```powershell
-$env:JAVA_HOME = 'C:\dev\jdk-17'
+$env:JAVA_HOME = 'C:\path\to\jdk-17'
 .\gradlew.bat assembleDebug
 ```
 
 The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`.
 
-Release builds require the permanent signing key through environment variables:
+Release builds require a signing keystore through environment variables. Use
+your own key for a fork; the project's private release key is not distributed.
 
 ```powershell
 $env:CAR_KEY_KEYSTORE_PATH = 'C:\secure\car-key-release.jks'
@@ -103,18 +104,13 @@ $env:CAR_KEY_KEY_PASSWORD = '<key password>'
 ```
 
 Never commit the keystore or its passwords. Android updates require compatible
-signing certificates. The release workflow now uploads both the APK and AAB;
-see the submission pack before enrolling in Play App Signing.
+signing certificates. See [signing and credentials](../SIGNING_KEYS.md).
 
-For Google Play, configure the signing environment above with the upload key
-registered in Play Console, then build an Android App Bundle:
+To build an Android App Bundle using the configured signing key:
 
 ```powershell
 .\gradlew.bat bundleRelease
 ```
 
 The bundle is written to `app/build/outputs/bundle/release/app-release.aab`.
-With Play App Signing, Google signs delivered APKs using the app signing key;
-the upload key authenticates bundles you submit. Coordinate the signing identity
-with any APKs distributed outside Play. See the
-[Google Play preparation checklist](PLAY_STORE_PREPARATION.md) before uploading.
+The release workflow produces both APK and AAB artifacts.

@@ -3,7 +3,7 @@
        width="48"
        align="left"
        style="margin-right: 12px;" />
-  BLE Car Key Solution
+  ESP32 Secure BLE Key
 </h1>
 
 ESP32 Secure BLE Key is an open-source Bluetooth Low Energy access-control system that uses an ESP32-C3, a native Kotlin Android app, and a Garmin Connect IQ watch app. It authenticates commands using HMAC-SHA256 challenge-response authentication and can trigger a car remote, gate, garage door, or similar low-voltage control.
@@ -223,18 +223,21 @@ four USB-flashed binaries at specific offsets while preserving NVS. See
 the files, partition values, exact command, PSK-preservation warning, and later
 mobile BLE-OTA procedure.
 
-Production Android, Garmin, and firmware signing identities are backed up as
-encrypted GitHub Actions secrets and excluded from Git. Device/user PSKs are
-not build secrets and are never stored in the repository; keep them in a
-password manager and, for ESPHome, an ignored `secrets.yaml`. See
-[`SIGNING_KEYS.md`](SIGNING_KEYS.md) for the key-continuity and recovery policy.
+Release binaries are signed. Private signing keys and device PSKs are excluded
+from Git; use your own keys when building a fork. Keep device PSKs in a password
+manager and, for ESPHome, an ignored `secrets.yaml`. See
+[signing and credentials](SIGNING_KEYS.md) for build inputs and update compatibility.
 
 ### 📱 Android App (native Kotlin)
 
 The native Android app is **Remote Key**, with release application ID
-`dev.logiclabs.remotekey`. See its
-[Google Play preparation checklist](Native_Android_Application/PLAY_STORE_PREPARATION.md)
-for publishing requirements and the installation transition from the old ID.
+`dev.logiclabs.remotekey`. See the
+[Android app README](Native_Android_Application/README.md) for features, build
+instructions, and migration from the previous application ID.
+
+Remote Key has no ads. Privacy and support: **info@6675162.xyz**. The
+[privacy policy](Native_Android_Application/app/src/main/res/raw/privacy_policy.html)
+is also available offline inside the app.
 
 Download the current APK from [GitHub Releases](https://github.com/JshStadler/esp32-secure-ble-key/releases), or build it with JDK 17 and Android SDK 36.
 
