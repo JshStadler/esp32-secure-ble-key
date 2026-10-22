@@ -1237,12 +1237,12 @@ class MainActivity : FragmentActivity() {
         ).apply {
             setTextColor(Color.rgb(184, 186, 198))
         }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+        layout.addView(sectionLabel("Device health"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+        layout.addView(primaryButton("Device health and BLE signal") {
+            settingsDialog.dismiss()
+            showDeviceHealth(profile)
+        }, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(4) })
         if (profile.supportsBleOta) {
-            layout.addView(sectionLabel("Firmware"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
-            layout.addView(primaryButton("Device health and firmware version") {
-                settingsDialog.dismiss()
-                showDeviceHealth(profile)
-            }, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(4) })
             layout.addView(primaryButton("Update ESP firmware (.bin)") {
                 pendingFirmwareProfileId = profile.id
                 firmwarePickerActive = true

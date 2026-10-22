@@ -72,6 +72,35 @@ pre-shared key, and each challenge is a fresh 16-byte random nonce.
 
 ## API v2
 
+### Compact Car authentication transport (auth2, v2.8.4)
+
+The Car identity advertises `auth2`. This is an optional transport for RCP1
+PROVE, with the **same transcript, independent random 16-byte client request ID,
+full 32-byte request HMAC, and verified 16-byte reply tag** described above.
+It performs no GPIO operation and changes no GATT handles or properties.
+
+At ATT MTU 52 or higher, write `F3 || request_id[16] || MAC[32]` (49 bytes)
+to `...789c`. At smaller MTUs, write the existing F0/F1/F2 fragments, replacing
+only F1's opcode with F4; its operation byte must be PROVE (1). F4 cannot request
+a press, query or acknowledgment. The same per-connection staging expiry and
+authentication failure limits apply. Every completed verification consumes its
+challenge, including failures.
+
+On success, firmware sends the rotated challenge on the existing challenge
+notification, and the existing **19-byte RCP1 PROVED result** on the requesting
+connection's status notification. It also retains that binary result for status
+and receipt reads. No result is broadcast to other connections. Clients verify
+the proof for their exact request and wait for the final write callback before
+becoming ready; an early notification may be buffered. A missing or invalid
+proof closes the connection, never silently downgrades authentication. Android
+reads the next challenge only if its notification did not arrive.
+
+This removes two request writes, the separate proof read and normally the
+post-proof challenge read from Android setup. Garmin still uses three writes at
+its default MTU, and replaces the proof read with a notification; capability
+discovery adds a read on new connections. Older clients retain F0/F1/F2 and
+read their reply; new clients use this path only when `auth2` is advertised.
+
 The Car binding is `car-main`; the Gate binding is `gate-main`.
 
 ```text
@@ -114,7 +143,7 @@ may poll it while connected. Current values are `Unknown`, `Closed`, `Open`,
 
 The existing read-only identity characteristic `a1b2c3d4-e5f6-7890-abcd-ef1234567897`
 keeps its UUID and handle. A read before authentication returns only
-`blekey|2|car-main|car|press,ota1,psk2,health1,radio1`. On an authenticated, non-closing
+`blekey|2|car-main|car|press,ota1,psk2,health1,radio1,rcp1,auth2`. On an authenticated, non-closing
 connection, an explicit read appends comma-separated health fields to this
 capability list:
 The two lines below are concatenated without a newline on the wire.
@@ -131,6 +160,12 @@ reason; application-triggered software resets add a reason retained in RTC RAM
 without writing flash. `ota` is `pending`, `valid`, `initial`, or `unknown`.
 Advertising min/max values use 0.625ms BLE units, `idlesec` is seconds, and
 `advmode` is `recent`, `inactive`, or `off` (all connection slots may be occupied).
+Firmware v2.8.4 optionally appends `,rssi=-67`: the RSSI in dBm measured by the
+ESP for **this authenticated connection**. A failed/unavailable controller
+reading is omitted (127 is never a valid measurement). Android separately
+requests connected RSSI from its own controller only when the health view is
+opened/refreshed. The two directions are labelled explicitly; there is no
+background RSSI polling. Older firmware remains readable without this field.
 Health is a maximum 512-byte ASCII read; clients must support long reads if
 the negotiated MTU is smaller. Unknown capabilities/fields can be ignored.
 
@@ -189,7 +224,15 @@ packet         = 0xA2 || random_IV[12] || AES-256-GCM(encryption_key, IV, new_PS
 ```
 
 The GCM output is ciphertext followed by its 16-byte tag. New keys must be
-1–128 UTF-8 bytes without NUL. Send the packet to the existing PSK-update
+32–128 UTF-8 bytes without NUL, contain at least eight distinct byte values,
+and must not repeat a pattern of 1–16 bytes (including a partial final repeat).
+Android checks replacements before transmission and the firmware checks the
+decrypted key before saving. Fresh customized bootstrap keys use the same policy.
+Use the random PSK generator: these checks reject obvious weaknesses but cannot
+prove that a manually chosen key has enough entropy. Existing installed keys
+still authenticate and can be imported or recovered using the original
+1–128-byte format; this does not permit a weak new remote replacement.
+Send the packet to the existing PSK-update
 characteristic. The nonce rotates after verification. No key change occurs
 unless GCM verification and persistent storage both succeed.
 

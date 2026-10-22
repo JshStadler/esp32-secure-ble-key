@@ -7,8 +7,15 @@ data class DeviceHealth(
     val freeHeap: Long, val minimumHeap: Long, val connections: Long,
     val advertisingRecoveries: Long, val ghostReaps: Long,
     val radio: RadioSettings? = null, val advertisingMode: String = "unknown",
+    val espRssi: Int? = null, val phoneRssi: Int? = null,
+    val hasFirmwareHealth: Boolean = true,
 ) {
     fun display(): String {
+        val signal = "BLE signal strength\n" +
+            "At phone (ESP → phone): ${phoneRssi?.let { "$it dBm" } ?: "Unavailable"}\n" +
+            "At ESP (phone → ESP): ${espRssi?.let { "$it dBm" } ?: "Unavailable — firmware support required"}\n" +
+            "Closer to 0 dBm means a stronger received signal. These are connection snapshots, not transmit power."
+        if (!hasFirmwareHealth) return "$signal\n\nDetailed ESP health is not supported by this firmware. Tap Refresh for a new phone signal reading."
         val ota = when (otaState) {
             "valid" -> "Validated"
             "pending" -> "Checking BLE health — refresh after one minute"
@@ -30,7 +37,7 @@ data class DeviceHealth(
         }
         val advertising = radio?.let { "\n\nAdvertising: $advertisingMode\nRecent activity: ${it.recentText()} ms\n" +
             "Inactive: ${it.inactiveText()} ms\nInactivity before slowing: ${it.idleSeconds}s" }.orEmpty()
-        return "Firmware: $firmware\nBuild: $build\nOTA status: $ota\n\n" +
+        return "$signal\n\nFirmware: $firmware\nBuild: $build\nOTA status: $ota\n\n" +
             "Uptime: ${uptimeSeconds / 86400}d ${uptimeSeconds / 3600 % 24}h ${uptimeSeconds / 60 % 60}m ${uptimeSeconds % 60}s\n" +
             "Last reset: $reset\n\n" +
             "Free memory: ${freeHeap / 1024} KiB\nLowest free memory: ${minimumHeap / 1024} KiB\n" +
@@ -40,6 +47,8 @@ data class DeviceHealth(
     }
 
     companion object {
+        fun signalOnly() = DeviceHealth("", "", "", 0, "", "unknown", 0, 0, 0, 0, 0,
+            hasFirmwareHealth = false)
         fun capabilities(value: String): List<String> = value.split('|').let {
             if (it.size == 5 && it[0] == "blekey" && it[1] == "2" && it[3] == "car") it[4].split(',') else emptyList()
         }
@@ -63,9 +72,13 @@ data class DeviceHealth(
             val radio = if ("radio1" in caps) RadioSettings(number("fastmin", 3200).toInt(),
                 number("fastmax", 3200).toInt(), number("slowmin", 3200).toInt(),
                 number("slowmax", 3200).toInt(), number("idlesec", 3600).toInt()).also { require(it.valid()) } else null
+            val rssi = fields["rssi"]?.let { value ->
+                require(value.matches(Regex("-?[0-9]{1,3}")))
+                value.toInt().also { require(it in -127..20) }
+            }
             DeviceHealth(field("fw"), build, field("idf"), number("up", Long.MAX_VALUE),
                 field("reset"), field("ota"), heap, minimum, number("links", 3),
-                number("advrec"), number("ghost"), radio, if (radio == null) "unknown" else field("advmode"))
+                number("advrec"), number("ghost"), radio, if (radio == null) "unknown" else field("advmode"), espRssi = rssi)
         }.getOrNull()
     }
 }

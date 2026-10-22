@@ -51,6 +51,11 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
     private var deviceState: BluetoothGattCharacteristic? = null
     private var receipt: BluetoothGattCharacteristic? = null
     private var receiptBusy = false
+    private var compactAuthSupported = false
+    private var compactAuth: CompactAuthSession? = null
+    private var phoneRssi: Int? = null
+    private var rssiGeneration = 0
+    private var rssiDone: (() -> Unit)? = null
     val supportsSafePskUpdate get() = ready && receipt != null && securePskSupported
     private var nonce: ByteArray? = null
     private var readValue = byteArrayOf()
@@ -67,6 +72,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
     private var healthSupported = false
     private var radioSupported = false
     private var healthCallback: ((DeviceHealth?, String?) -> Unit)? = null
+    private var healthGeneration = 0
     private var radioCallback: ((Boolean, String) -> Unit)? = null
     private var radioResponse: String? = null
     private var radioWritePending = false
@@ -102,7 +108,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
     }
     private fun publishReady() {
         listener.onReadyChanged(!stopped && ready && nonce?.size == 16 && !queue.busy &&
-            pendingCommand == null && pskRequest == null && !otaInFlight && radioCallback == null && !receiptBusy)
+            pendingCommand == null && pskRequest == null && !otaInFlight && radioCallback == null && healthCallback == null && !receiptBusy)
     }
     fun start(key: String, cachedAddress: String?, useCachedAddress: Boolean) {
         teardown()
@@ -223,6 +229,12 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
             if (c.uuid != profile.otaDataUuid) diagnostic("Write ${c.uuid} status=$code")
             queue.complete("write:${c.uuid}", code == BluetoothGatt.GATT_SUCCESS)
         }
+        override fun onReadRemoteRssi(g: BluetoothGatt, rssi: Int, code: Int) = dispatch(g) {
+            phoneRssi = if (code == BluetoothGatt.GATT_SUCCESS && rssi in -127..20) rssi else null
+            val done = rssiDone
+            rssiDone = null
+            done?.invoke()
+        }
     }
     private fun receiveRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray, code: Int) = dispatch(g) {
         readValue = value
@@ -232,7 +244,13 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
     private fun receiveNotification(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) = dispatch(g) {
         when (c.uuid) {
             profile.challengeUuid -> { if (value.size == 16) nonce = value else fail("Invalid challenge length") }
-            profile.statusUuid -> handleStatus(value.toString(Charsets.UTF_8))
+            profile.statusUuid -> {
+                val auth = compactAuth
+                if (auth != null) {
+                    if (!auth.receive(value)) fail("Untrusted authentication result")
+                    else finishCompactAuth(auth)
+                } else handleStatus(value.toString(Charsets.UTF_8))
+            }
             profile.otaStatusUuid -> handleOtaStatus(value.toString(Charsets.UTF_8))
         }
         publishReady()
@@ -268,6 +286,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
                 securePskSupported = "psk2" in caps
                 healthSupported = "health1" in caps
                 radioSupported = "radio1" in caps
+                compactAuthSupported = "auth2" in caps && receipt != null
             }
         }
         readChallenge()
@@ -301,7 +320,8 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
             else {
                 nonce = value.copyOf()
                 if (!ready && pendingCommand == null && !otaInFlight && !receiptBusy) {
-                    if (receipt != null) {
+                    if (compactAuthSupported) authenticateCompact()
+                    else if (receipt != null) {
                         exchangeReceipt(PressReceiptProtocol.PROVE, PressReceiptProtocol.newId()) { result ->
                             if (result != PressReceiptProtocol.PROVED) fail("Device proof failed")
                             else {
@@ -322,32 +342,50 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         }
     }
     fun requestFreshChallenge(): Boolean {
-        if (stopped || gatt == null || challenge == null || pendingCommand != null || pskRequest != null || otaInFlight || radioCallback != null) return false
+        if (stopped || gatt == null || challenge == null || pendingCommand != null || pskRequest != null || otaInFlight || radioCallback != null || healthCallback != null || receiptBusy) return false
         readChallenge()
         return true
     }
 
     fun requestDeviceHealth(done: (DeviceHealth?, String?) -> Unit) {
-        if (stopped || !ready || queue.busy || pendingCommand != null || pskRequest != null || otaInFlight || healthCallback != null || radioCallback != null) {
+        if (stopped || !ready || queue.busy || pendingCommand != null || pskRequest != null || otaInFlight || healthCallback != null || radioCallback != null || rssiDone != null) {
             done(null, "Connection is busy or recovering. Try Refresh when connected.")
             return
         }
-        val identity = gatt?.getService(profile.serviceUuid)?.getCharacteristic(profile.identityUuid)
-        if (!healthSupported || identity == null) {
-            done(null, "Device health requires Car firmware v2.7.0 or later. Update the ESP, then reconnect.")
-            return
-        }
         healthCallback = done
+        val generation = ++healthGeneration
         listener.onReadyChanged(false)
-        read(identity) {
+        val identity = gatt?.getService(profile.serviceUuid)?.getCharacteristic(profile.identityUuid)
+        fun finish(snapshot: DeviceHealth?) {
+            if (generation != healthGeneration) return
             val callback = healthCallback
             healthCallback = null
-            val snapshot = DeviceHealth.parse(it.toString(Charsets.UTF_8))
-            callback?.invoke(snapshot, if (snapshot == null) "Device returned incomplete health data. Try Refresh after reconnecting." else null)
+            callback?.invoke(snapshot?.copy(phoneRssi = phoneRssi),
+                if (snapshot == null) "Device returned incomplete health data. Try Refresh after reconnecting." else null)
+            publishReady()
+        }
+        readPhoneRssi {
+            if (generation != healthGeneration) return@readPhoneRssi
+            if (!healthSupported || identity == null) finish(DeviceHealth.signalOnly())
+            else read(identity) { finish(DeviceHealth.parse(it.toString(Charsets.UTF_8))) }
         }
     }
 
-    fun cancelDeviceHealth() { healthCallback = null }
+    // On-demand only: do not poll RSSI or add traffic while the health view is closed.
+    // RSSI is an HCI request, not an ATT request; keep other work paused until it
+    // finishes. A missing optional RSSI callback must not break a working link.
+    private fun readPhoneRssi(done: () -> Unit) {
+        phoneRssi = null
+        val generation = ++rssiGeneration
+        rssiDone = done
+        if (runCatching { gatt?.readRemoteRssi() == true }.getOrDefault(false)) {
+            later(2_000) { if (generation == rssiGeneration) {
+                val complete = rssiDone; rssiDone = null; complete?.invoke()
+            } }
+        } else { rssiDone = null; done() }
+    }
+
+    fun cancelDeviceHealth() { healthGeneration++; healthCallback = null; publishReady() }
 
     fun updateRadioSettings(settings: RadioSettings, done: (Boolean, String) -> Unit) {
         val control = otaControl
@@ -389,7 +427,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         callback?.invoke(value == "RADIO:OK", message)
     }
     fun press() {
-        if (!ready || nonce == null || queue.busy || receiptBusy || pendingCommand != null || pskRequest != null || otaInFlight || radioCallback != null) {
+        if (!ready || nonce == null || queue.busy || receiptBusy || pendingCommand != null || pskRequest != null || otaInFlight || radioCallback != null || healthCallback != null) {
             listener.onCommandResult(false, "Connection is recovering; try again")
             if (ready && !queue.busy && !receiptBusy) readChallenge()
             return
@@ -422,6 +460,37 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         if (cached != null) exchange(cached) else read(ch) { fresh ->
             if (fresh.size != 16) fail("Invalid receipt challenge") else exchange(fresh)
         }
+    }
+
+    private fun authenticateCompact() {
+        val c = receipt ?: return fail("Authentication characteristic missing")
+        val current = nonce?.copyOf() ?: return fail("No fresh authentication challenge")
+        val auth = CompactAuthSession(PressReceiptProtocol.newId(), current, psk)
+        val packets = CompactAuthProtocol.packets(auth.id, current, psk, negotiatedMtu)
+        compactAuth = auth; receiptBusy = true; nonce = null; stage = "authenticate"
+        listener.onState(State.CONNECTING, "Authenticating…")
+        diagnostic("AUTH2 packets=${packets.size} mtu=$negotiatedMtu")
+        fun send(index: Int) {
+            write(c, packets[index]) {
+                if (index + 1 < packets.size) send(index + 1)
+                else { auth.writeCompleted(); finishCompactAuth(auth) }
+            }
+        }
+        send(0)
+        later(5_000) { if (compactAuth === auth) fail("Authentication result timed out") }
+    }
+
+    private fun finishCompactAuth(auth: CompactAuthSession) {
+        if (compactAuth !== auth || !auth.complete) return
+        compactAuth = null; receiptBusy = false
+        val proof = proofResult
+        if (proof != null) { proofResult = null; stop(); proof(true); return }
+        ready = true; directFailures = 0; retryFailures = 0; stage = "ready"
+        gatt?.device?.address?.let(listener::onDeviceAddress)
+        listener.onState(State.CONNECTED, "Authenticated")
+        // New firmware notifies the rotated challenge before its result. Read
+        // only if it did not arrive, never assume an old nonce is reusable.
+        if (nonce == null) readChallenge() else publishReady()
     }
 
     private fun sendCommand(cmd: Byte) {
@@ -488,7 +557,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         if (deviceState == null) return
         later(1_500) {
             val c = deviceState
-            if (c != null && ready && !queue.busy && pendingCommand == null && pskRequest == null && !otaInFlight) {
+            if (c != null && ready && !queue.busy && pendingCommand == null && pskRequest == null && !otaInFlight && healthCallback == null && radioCallback == null && !receiptBusy) {
                 read(c) { val state = it.toString(Charsets.UTF_8); if (state.startsWith("ERR:")) fail("Device session requires authentication") else listener.onDeviceState(state) }
             }
             scheduleStatePoll()
@@ -513,7 +582,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         val current = nonce ?: return false
         val c = pskUpdate ?: return false
         if (!PskUpdateProtocol.validNewKey(newPsk)) { listener.onPskUpdateResult(false, PskKeyPolicy.NEW_KEY_GUIDANCE); return true }
-        if (!ready || queue.busy || receiptBusy || pendingCommand != null || pskRequest != null || otaInFlight || radioCallback != null) return false
+        if (!ready || queue.busy || receiptBusy || pendingCommand != null || pskRequest != null || otaInFlight || radioCallback != null || healthCallback != null) return false
         val request = PskUpdateProtocol.create(profile.securityBinding, current, psk, newPsk)
         if (request.payload.size > negotiatedMtu - 3) {
             listener.onPskUpdateResult(false, "BLE packet size is too small for this key; reconnect first"); return true
@@ -636,6 +705,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
     private fun teardown() {
         val cancelledHealth = healthCallback
         healthCallback = null
+        healthGeneration++
         val cancelledRadio = radioCallback
         radioCallback = null; radioResponse = null; radioWritePending = false; radioGeneration++
         epoch++
@@ -648,7 +718,8 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         challenge = null; command = null; status = null; pskUpdate = null
         commandPt1 = null; commandPt2 = null
         otaControl = null; otaData = null; otaStatus = null; deviceState = null
-        receipt = null; receiptBusy = false
+        receipt = null; receiptBusy = false; compactAuth = null; compactAuthSupported = false
+        phoneRssi = null; rssiDone = null; rssiGeneration++
         nonce = null; ready = false; securePskSupported = false; healthSupported = false; radioSupported = false
         pendingCommand = null; commandWritePending = false; pendingStatus = null; commandGeneration++
         pskRequest?.receiptKey?.fill(0); pskRequest = null; pendingNewPsk = null

@@ -6,7 +6,7 @@
 #include <inttypes.h>
 #include "radio_config.h"
 
-#define CAR_IDENTITY "blekey|2|car-main|car|press,ota1,psk2,health1,radio1,rcp1"
+#define CAR_IDENTITY "blekey|2|car-main|car|press,ota1,psk2,health1,radio1,rcp1,auth2"
 
 typedef struct {
     const char *version, *build, *idf, *reset, *ota;
@@ -14,6 +14,8 @@ typedef struct {
     uint32_t free_heap, min_heap, connections, adv_recoveries, ghost_reaps;
     radio_config_t radio;
     const char *adv_mode;
+    bool rssi_valid;
+    int rssi;
 } device_health_t;
 
 /* Extend the existing capability list so old clients and cached GATT handles
@@ -22,14 +24,17 @@ typedef struct {
 static inline int device_health_format(char *out, size_t size,
                                        const device_health_t *h) {
     if (!h) return snprintf(out, size, "%s", CAR_IDENTITY);
+    char rssi[16] = "";
+    if (h->rssi_valid && h->rssi >= -127 && h->rssi <= 20)
+        snprintf(rssi, sizeof(rssi), ",rssi=%d", h->rssi);
     return snprintf(out, size, CAR_IDENTITY
         ",fw=%s,build=%s,idf=%s,up=%" PRIu64 ",reset=%s,ota=%s"
         ",heap=%" PRIu32 ",minheap=%" PRIu32 ",links=%" PRIu32
         ",advrec=%" PRIu32 ",ghost=%" PRIu32
-        ",fastmin=%u,fastmax=%u,slowmin=%u,slowmax=%u,idlesec=%u,advmode=%s",
+        ",fastmin=%u,fastmax=%u,slowmin=%u,slowmax=%u,idlesec=%u,advmode=%s%s",
         h->version, h->build, h->idf, h->uptime_s, h->reset, h->ota,
         h->free_heap, h->min_heap, h->connections, h->adv_recoveries, h->ghost_reaps,
         (unsigned)h->radio.fast_min, (unsigned)h->radio.fast_max,
         (unsigned)h->radio.slow_min, (unsigned)h->radio.slow_max,
-        (unsigned)h->radio.idle_seconds, h->adv_mode);
+        (unsigned)h->radio.idle_seconds, h->adv_mode, rssi);
 }

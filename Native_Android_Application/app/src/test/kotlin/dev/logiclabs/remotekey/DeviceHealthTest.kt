@@ -4,6 +4,22 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class DeviceHealthTest {
+    @Test fun showsBothRssiDirectionsAndAcceptsOlderFirmwareWithoutRssi() {
+        val health = DeviceHealth.parse("$snapshot,rssi=-71")!!.copy(phoneRssi = -62)
+        assertEquals(-71, health.espRssi)
+        assertTrue(health.display().contains("At phone (ESP → phone): -62 dBm"))
+        assertTrue(health.display().contains("At ESP (phone → ESP): -71 dBm"))
+        assertNull(DeviceHealth.parse(snapshot)!!.espRssi)
+        assertFalse(DeviceHealth.signalOnly().hasFirmwareHealth)
+        assertTrue(DeviceHealth.signalOnly().copy(phoneRssi = -58).display().contains("-58 dBm"))
+    }
+
+    @Test fun rejectsRssiSentinelsAndMalformedValues() {
+        listOf("127", "-128", "21", "-999", "-70dBm", "", "--5").forEach {
+            assertNull(it, DeviceHealth.parse("$snapshot,rssi=$it"))
+        }
+        assertNull(DeviceHealth.parse("$snapshot,rssi=-70,rssi=-50"))
+    }
     private val identity = "blekey|2|car-main|car|press,ota1,psk2,health1"
     private val snapshot = "$identity,fw=2.7.0,build=012345abcdef,idf=v6.0.1,up=90061,reset=brownout,ota=valid,heap=123456,minheap=100000,links=2,advrec=4,ghost=1"
 

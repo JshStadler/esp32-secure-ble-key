@@ -63,6 +63,7 @@
 /* PSA Crypto for HMAC-SHA256 (ESP-IDF 6 / mbedTLS 4 public API) */
 #include "psa/crypto.h"
 #include "psk_update.h"
+#include "psk_key_policy.h"
 #include "press_receipt.h"
 
 /* BLE TX power control (NimBLE on C3) */
@@ -305,8 +306,9 @@ typedef struct {
     int64_t  connected_at;
     uint8_t  auth_failures;
     char     status[PSK2_RECEIPT_SIZE];
+    uint16_t status_length;
     uint8_t receipt_id[16], receipt_mac[16], receipt_op, receipt_reply[19];
-    bool receipt_context, receipt_part, receipt_valid;
+    bool receipt_context, receipt_part, receipt_valid, receipt_compact;
     int64_t receipt_started;
     int64_t  last_activity_at;  /* milliseconds from now_ms() */
 } client_state_t;
@@ -507,7 +509,8 @@ static void load_psk(void) {
     current_psk[0] = '\0';
     if ((err == ESP_ERR_NVS_NOT_FOUND) &&
         strcmp(DEFAULT_PSK, "CHANGE_ME_before_flashing_32chars!") != 0) {
-        if (strlen(DEFAULT_PSK) > MAX_PSK_LEN || !save_psk(DEFAULT_PSK))
+        if (!psk_valid_new_key((const uint8_t *)DEFAULT_PSK, strlen(DEFAULT_PSK)) ||
+            !save_psk(DEFAULT_PSK))
             current_psk[0] = '\0';
     } else {
         LOG_E(TAG, "No valid provisioned PSK; remote commands disabled");
@@ -630,6 +633,7 @@ static int ensure_client_slot(uint16_t conn_handle) {
     clients[slot].in_use        = true;
     clients[slot].connected_at = now_ms();
     strcpy(clients[slot].status, "READY");
+    clients[slot].status_length = 5;
     clients[slot].authenticated = false;
     clients[slot].last_activity_at = now_ms();
     clients[slot].conn_handle   = conn_handle;
@@ -728,6 +732,7 @@ static void set_status(uint16_t conn_handle, const char *msg) {
     char *status_str = clients[slot].status;
     strncpy(status_str, msg, sizeof(clients[slot].status) - 1);
     status_str[sizeof(clients[slot].status) - 1] = '\0';
+    clients[slot].status_length = strlen(status_str);
 
     /* A command result belongs only to its initiating client. Broadcasting it
      * makes another connected phone/watch report a command it did not send. */
@@ -740,6 +745,16 @@ static void set_status(uint16_t conn_handle, const char *msg) {
                   conn_handle, rc, status_str);
         }
     }
+}
+
+/* AUTH2 uses the existing status handle; no GATT handles or CCCDs move.
+ * Only a client explicitly requesting AUTH2 receives a binary proof. */
+static void set_auth_result(uint16_t conn_handle, const uint8_t reply[19]) {
+    int slot = find_client_by_handle(conn_handle);
+    if (slot < 0) return;
+    memcpy(clients[slot].status, reply, 19);
+    clients[slot].status_length = 19;
+    ble_gatts_notify_custom(conn_handle, status_val_handle, om_from_buf(reply, 19));
 }
 
 static void set_ota_status(uint16_t conn_handle, const char *msg) {
@@ -981,7 +996,7 @@ static int chr_access_status(uint16_t conn_handle, uint16_t attr_handle,
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
         int slot = ensure_client_slot(conn_handle);
         if (slot < 0) return BLE_ATT_ERR_UNLIKELY;
-        int rc = os_mbuf_append(ctxt->om, clients[slot].status, strlen(clients[slot].status));
+        int rc = os_mbuf_append(ctxt->om, clients[slot].status, clients[slot].status_length);
         return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
     return BLE_ATT_ERR_UNLIKELY;
@@ -1256,6 +1271,8 @@ static int chr_access_identity(uint16_t conn_handle, uint16_t attr_handle,
             default: break;
         }
     } else if (state_result == ESP_ERR_NOT_FOUND || running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY) ota = "initial";
+    int8_t rssi = 127;
+    bool rssi_valid = ble_gap_conn_rssi(conn_handle, &rssi) == 0 && rssi != 127;
     device_health_t health = {
         .version = app->version, .build = build, .idf = app->idf_ver,
         .reset = health_reset_reason(), .ota = ota,
@@ -1265,6 +1282,7 @@ static int chr_access_identity(uint16_t conn_handle, uint16_t attr_handle,
         .ghost_reaps = ghost_reaps,
         .radio = radio_config,
         .adv_mode = !ble_gap_adv_active() ? "off" : adv_using_fast_interval ? "recent" : "inactive",
+        .rssi_valid = rssi_valid, .rssi = rssi,
     };
     char response[512];
     int length = device_health_format(response, sizeof(response), &health);
@@ -1315,33 +1333,49 @@ static int chr_access_receipt(uint16_t conn_handle, uint16_t attr_handle,
     }
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
     uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
-    uint8_t packet[18];
+    uint8_t packet[49];
     if (len < 1 || len > sizeof(packet) || os_mbuf_copydata(ctxt->om, 0, len, packet) != 0)
         return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     if (packet[0] == 0xf0 && len == 17) {
         memcpy(client->receipt_id, packet + 1, 16);
         client->receipt_context = true; client->receipt_part = false; client->receipt_valid = false;
+        client->receipt_compact = false;
         client->receipt_started = now_ms();
         return 0;
+    }
+    /* One write at MTU >= 52: opcode + independent client ID + full HMAC.
+     * Same RCP1 PROVE transcript and 128-bit device proof as the legacy path. */
+    bool full_auth = packet[0] == 0xf3 && len == 49;
+    if (full_auth) {
+        memcpy(client->receipt_id, packet + 1, 16);
+        memcpy(client->receipt_mac, packet + 17, 16);
+        client->receipt_op = RECEIPT_PROVE;
+        client->receipt_context = true; client->receipt_part = true;
+        client->receipt_valid = false; client->receipt_compact = true;
+        client->receipt_started = now_ms();
     }
     if (!client->receipt_context || now_ms() - client->receipt_started > 5000) {
         client->receipt_context = false; client->receipt_part = false;
         return BLE_ATT_ERR_UNLIKELY;
     }
-    if (packet[0] == 0xf1 && len == 18 && packet[1] >= RECEIPT_PROVE && packet[1] <= RECEIPT_ACK) {
+    if ((packet[0] == 0xf1 || packet[0] == 0xf4) && len == 18 &&
+        packet[1] >= RECEIPT_PROVE && packet[1] <= RECEIPT_ACK &&
+        (packet[0] != 0xf4 || packet[1] == RECEIPT_PROVE)) {
+        client->receipt_compact = packet[0] == 0xf4;
         client->receipt_op = packet[1];
         memcpy(client->receipt_mac, packet + 2, 16); client->receipt_part = true;
         return 0;
     }
-    if (packet[0] != 0xf2 || len != 17 || !client->receipt_part) return BLE_ATT_ERR_UNLIKELY;
+    if ((!full_auth && (packet[0] != 0xf2 || len != 17)) || !client->receipt_part) return BLE_ATT_ERR_UNLIKELY;
     client->receipt_context = false; client->receipt_part = false;
     uint8_t nonce[16], transcript[64], expected[32], supplied[32];
     memcpy(nonce, client->nonce, 16);
-    memcpy(supplied, client->receipt_mac, 16); memcpy(supplied + 16, packet + 1, 16);
+    memcpy(supplied, client->receipt_mac, 16);
+    memcpy(supplied + 16, packet + (full_auth ? 33 : 1), 16);
     size_t size = receipt_transcript(transcript, false, client->receipt_op, client->receipt_id, nonce, 0);
     bool valid = current_psk[0] && compute_hmac(transcript, size, current_psk, expected) &&
         constant_time_equal(expected, supplied, 32);
-    generate_nonce_for_slot(slot, false);
+    generate_nonce_for_slot(slot, client->receipt_compact);
     if (!valid) {
         if (++client->auth_failures >= MAX_AUTH_FAILURES) {
             client->closing = true;
@@ -1375,6 +1409,7 @@ static int chr_access_receipt(uint16_t conn_handle, uint16_t attr_handle,
     client->receipt_reply[0] = 0xb1; client->receipt_reply[1] = client->receipt_op;
     client->receipt_reply[2] = result; memcpy(client->receipt_reply + 3, expected, 16);
     client->receipt_valid = true;
+    if (client->receipt_compact) set_auth_result(conn_handle, client->receipt_reply);
     return 0;
 }
 
@@ -1697,6 +1732,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
             clients[slot].in_use        = true;
             clients[slot].connected_at = now_ms();
             strcpy(clients[slot].status, "READY");
+            clients[slot].status_length = 5;
             clients[slot].authenticated = false;
             clients[slot].last_activity_at = now_ms();
             clients[slot].conn_handle   = conn_handle;
