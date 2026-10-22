@@ -27,7 +27,7 @@ substitutions:
   gate_ble_key_1_psk: !secret ble_psk
   gate_ble_key_2_name: "BLE Remote 2"
   gate_ble_key_2_event: "ble_remote_2"
-  gate_ble_key_2_psk: ""
+  gate_ble_key_2_psk: !secret ble_psk2
   gate_ble_key_3_name: "BLE Remote 3"
   gate_ble_key_3_event: "ble_remote_3"
   gate_ble_key_3_psk: ""
@@ -42,7 +42,7 @@ esphome:
   name: ${name}
   friendly_name: ${friendly_name}
   comment: ${comment}
-  min_version: 2026.7.3
+  min_version: 2026.10.0
   includes:
     - <esp_bt.h>
   on_boot:
@@ -136,7 +136,7 @@ api:
 
 ota:
   - platform: esphome
-    password: !secret ota_password
+    encryption:
 
 wifi:
   ssid: !secret wifi_ssid
@@ -260,8 +260,10 @@ esp32_ble:
 
 external_components:
   - source:
-      type: local
-      path: components
+      type: git
+      url: https://github.com/JshStadler/esp32-secure-ble-key
+      ref: 3516cf15fcbd52c2322b778ae7788487522cb333
+      path: ESPHome_Gate_Firmware/components
     components: [gate_ble_signal]
 
 gate_ble_signal:

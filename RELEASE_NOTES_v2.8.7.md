@@ -4,10 +4,12 @@ Android version code: **33**. Minimum Android: **7.0 / API 24**.
 
 - Gate Device health can show both directions: received at the phone
   (gate ESP → phone) and received at the gate ESP (phone → gate ESP).
-- The reverse reading requires the updated ESPHome gate YAML and its local
-  `components/gate_ble_signal/` folder. Build with the installed node's existing
-  secrets and use ESPHome OTA. Never install a validation binary built with
-  dummy credentials.
+- The reverse reading requires the updated ESPHome gate YAML. The deployment
+  YAML now fetches `gate_ble_signal` from a fixed Git commit, so no component
+  folder upload is needed. It is based on the supplied installed config,
+  retaining `ble_psk2` and encrypted OTA, and requires ESPHome 2026.10.0.
+  Build with the installed node's existing secrets and use ESPHome OTA. Never
+  install a validation binary built with dummy credentials.
 - Reading is on demand, scoped to the authenticated connection, bounded, and
   correlated to a new random request ID. No continuous polling or extra scans.
 - Older gate firmware still shows phone-side RSSI. A failed optional reverse

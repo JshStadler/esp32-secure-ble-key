@@ -28,11 +28,16 @@ separate Car and Gate apps so each watch app keeps one clear target and PSK.
 ## Install with ESPHome OTA
 
 Use `centurion-d5-evo-ble-v2.yaml` as the ESPHome device configuration. It
-contains the existing gate configuration and BLE/HMAC logic. Copy the
-`components/gate_ble_signal/` directory beside the YAML as well; the local
-external component adds on-demand, connection-specific signal diagnostics.
+contains the existing gate configuration and BLE/HMAC logic. Its
+`external_components` block fetches the signal diagnostic from a fixed commit
+in this repository, so the YAML can be pasted directly into ESPHome Builder.
+For local component development, replace that source with `type: local` and
+`path: components`, and copy `components/gate_ble_signal/` beside the YAML.
 Keep the existing `secrets.yaml` with your installed Wi-Fi/API/OTA credentials
 and BLE keys. Compile and install with the normal ESPHome OTA workflow.
+This deployment configuration requires ESPHome 2026.10.0, preserves the second
+key reference `!secret ble_psk2`, and uses OTA encryption inherited from the
+existing native API key. Do not substitute validation credentials when flashing.
 
 The first slot remains the generic `BLE Remote` and uses the existing secret:
 
