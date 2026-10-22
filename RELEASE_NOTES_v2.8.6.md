@@ -39,6 +39,40 @@ track, they must opt out of internal testing and opt into closed testing using
 the same eligible Google account. Do not uninstall or clear app storage.
 The closed release may require Google review before its opt-in link is active.
 
+### Publication status and foreground-service demo
+
+Version 2.8.6 (32) was published to internal testing on 22 October 2026. The
+closed Alpha release is prepared with the same 11-entry Internal Testers list,
+but remains a draft: Play requires a demo video for the connected-device
+foreground-service declaration before the release can be saved and submitted.
+The appropriate declaration is continuous data transfer to an external device;
+Google's automotive-key use case is specific to automotive manufacturers.
+
+Prepare a short recording using a real configured test ESP:
+
+1. Open Remote Key, show About / version 2.8.6, and select a 30-second background
+   connection duration in App Settings. Configure the device and key off-camera.
+2. Show the in-app connection reaching Ready (Reconnect can demonstrate the
+   connection flow), then use the key button and show the successful result.
+   Include the external device's response if possible, using another camera.
+3. Go Home, open the notification shade and show the Remote Key connected
+   notification and its 30-second background window.
+4. Stay outside the app until the notification disappears after the window,
+   then return and show reconnection. Do not swipe the app away during the demo.
+
+Keep keys, credential QR codes, private notifications and identifying location
+details out of the video. Supply an accessible link, such as an unlisted YouTube
+video, for the Play form. No fixed duration is prescribed here; around one to
+two minutes should cover these steps. The release still needs Google review
+after the declaration is completed. Leave testers on internal until closed is
+available. Production access additionally requires at least 12 closed testers
+opted in continuously for 14 days; the current list has 11 entries.
+
+References:
+- https://support.google.com/googleplay/android-developer/answer/13392821
+- https://support.google.com/googleplay/android-developer/answer/9845334
+- https://support.google.com/googleplay/android-developer/answer/14151465
+
 ## Google Play notes
 
 Choose how long Bluetooth connections stay ready after leaving the app. Add
