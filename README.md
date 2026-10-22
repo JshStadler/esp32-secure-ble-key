@@ -127,6 +127,12 @@ existing-installation provisioning caveat.
 
 ## Device health and OTA confirmation (v2.7.0)
 
+Android 2.8.7 also supports both gate BLE signal directions under **Device
+settings > Device health and BLE signal**, using the updated [ESPHome gate
+package](ESPHome_Gate_Firmware/README.md). Older gate firmware still shows the
+signal received by the phone. Gate diagnostics run only on explicit requests;
+this feature does not change transmit power, advertising or relay behavior.
+
 In the Android app, open a Car device's **Settings > Device health and firmware
 version**. Opening this view requests one authenticated snapshot. **Refresh**
 requests another; normal connections and background operation do not fetch

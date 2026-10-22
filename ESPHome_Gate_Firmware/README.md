@@ -25,7 +25,7 @@ separate Car and Gate apps so each watch app keeps one clear target and PSK.
 - BLE transmit power is set to the classic ESP32 maximum of +9 dBm for both
   advertising and connections. Enclosure and antenna placement still affect range.
 
-## Easiest install: one YAML file
+## Install with ESPHome OTA
 
 Use `centurion-d5-evo-ble-v2.yaml` as the ESPHome device configuration. It
 contains the existing gate configuration and BLE/HMAC logic. Copy the

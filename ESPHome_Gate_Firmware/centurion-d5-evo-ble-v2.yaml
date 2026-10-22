@@ -348,26 +348,6 @@ esp32_ble_server:
             data: "ERR:AUTH_REQUIRED"
             type: string
 
-        # On-demand, session-specific RSSI. Requests are eight random bytes;
-        # replies are state (0 waiting / 1 ready / 2 unavailable), echoed request,
-        # signed RSSI byte. Ten bytes fits the default ATT MTU.
-        - id: gate_ble_signal_value
-          uuid: b1b2c3d4-e5f6-7890-abcd-ef123456789c
-          read: true
-          write: true
-          value:
-            data: [2, 0, 0, 0, 0, 0, 0, 0, 0, 127]
-          on_write:
-            - lambda: |-
-                for (size_t slot = 0; slot < id(gate_ble_conn_ids).size(); ++slot) {
-                  if (id(gate_ble_conn_ids)[slot] == id &&
-                      id(gate_ble_authenticated)[slot] && !id(gate_ble_closing)[slot]) {
-                    id(gate_ble_activity_ms)[slot] = millis();
-                    id(gate_signal).request(id, x);
-                    return;
-                  }
-                }
-
         # Android path: command byte followed by a 32-byte HMAC-SHA256.
         # API v2 authenticates the protocol domain, device, action, and nonce:
         # BLEKEY-V2 || 0x00 || gate-main || 0x00 || command || nonce
@@ -680,6 +660,27 @@ esp32_ble_server:
           value:
             data: "blekey|2|gate-main|gate|press,state,signal1"
             type: string
+
+        # Append diagnostics after existing characteristics so their handles
+        # remain stable for installed phone/watch clients.
+        # Requests: eight random bytes. Replies: state (0 waiting / 1 ready /
+        # 2 unavailable), echoed request, signed RSSI. Fits the default MTU.
+        - id: gate_ble_signal_value
+          uuid: b1b2c3d4-e5f6-7890-abcd-ef123456789c
+          read: true
+          write: true
+          value:
+            data: [2, 0, 0, 0, 0, 0, 0, 0, 0, 127]
+          on_write:
+            - lambda: |-
+                for (size_t slot = 0; slot < id(gate_ble_conn_ids).size(); ++slot) {
+                  if (id(gate_ble_conn_ids)[slot] == id &&
+                      id(gate_ble_authenticated)[slot] && !id(gate_ble_closing)[slot]) {
+                    id(gate_ble_activity_ms)[slot] = millis();
+                    id(gate_signal).request(id, x);
+                    return;
+                  }
+                }
 
 event:
   - platform: template
