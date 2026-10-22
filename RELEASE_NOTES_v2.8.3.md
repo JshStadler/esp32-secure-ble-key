@@ -3,6 +3,9 @@
 Android version code: **29**. This is an Android-only update compatible with the
 currently supported Car and ESPHome firmware and Garmin apps.
 
+Minimum Android version: **Android 7.0 (API 24)**, required by the app's enabled
+Google Play automatic protection. Android 6 devices cannot install this update.
+
 - Show when Bluetooth is off, changing state, unavailable, or missing permission.
   Offer Android's Bluetooth enable prompt and pause connection retries while off.
 - Reconnect configured devices when Bluetooth returns, without replaying an

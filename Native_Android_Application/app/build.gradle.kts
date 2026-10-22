@@ -10,7 +10,7 @@ android {
 
     defaultConfig {
         applicationId = "dev.logiclabs.remotekey"
-        minSdk = 23
+        minSdk = 24
         targetSdk = 36
         versionCode = 29
         versionName = "2.8.3"
