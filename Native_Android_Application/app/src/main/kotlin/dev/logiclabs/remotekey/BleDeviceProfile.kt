@@ -78,12 +78,29 @@ object BleDeviceProfiles {
 }
 
 /** Encrypted ordered card list. PSKs remain in their own encrypted entries. */
-class DeviceProfileRepository(private val store: SecureStore) {
+class DeviceProfileRepository(
+    private val read: (String) -> String?,
+    private val write: (String, String) -> Unit,
+) {
+    constructor(store: SecureStore) : this(store::get, store::put)
+
     companion object { private const val KEY = "device_profiles_v1" }
 
+    fun needsInitialSetup() = read(KEY) == null
+
     fun load(): MutableList<BleDeviceProfile> {
-        val saved = store.get(KEY)
-        if (saved == null) return BleDeviceProfiles.defaults.toMutableList().also(::save)
+        val saved = read(KEY)
+        if (saved == null) {
+            // Preserve pre-dashboard installations and their original credential IDs.
+            val legacyKeys = listOf("psk", "cached_address") + BleDeviceProfiles.defaults.flatMap {
+                listOf(it.pskStoreKey, it.addressStoreKey)
+            }
+            if (legacyKeys.any { !read(it).isNullOrBlank() }) {
+                return BleDeviceProfiles.defaults.toMutableList().also(::save)
+            }
+            // Do not persist until setup is completed or explicitly skipped.
+            return mutableListOf()
+        }
         return runCatching {
             val array = JSONArray(saved)
             MutableList(array.length()) { index ->
@@ -108,6 +125,6 @@ class DeviceProfileRepository(private val store: SecureStore) {
                 put("address", profile.defaultAddress ?: "")
             })
         }
-        store.put(KEY, array.toString())
+        write(KEY, array.toString())
     }
 }

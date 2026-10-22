@@ -57,6 +57,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
     private var psk = ""
     private var ready = false
     private var stopped = true
+    val isRunning get() = !stopped
     private var reconnectAddress: String? = null
     private var preferDirect = false
     private var attemptingDirect = false
@@ -107,6 +108,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         teardown()
         stopped = false
         psk = key
+        if (!requireBluetooth()) return
         preferDirect = useCachedAddress
         reconnectAddress = if (useCachedAddress) cachedAddress else profile.defaultAddress
         attemptingDirect = useCachedAddress && reconnectAddress != null
@@ -131,6 +133,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         scan()
     }
     private fun scan() {
+        if (!requireBluetooth()) return
         attemptingDirect = false
         stage = "scan"
         listener.onState(State.SCANNING, "Scanning…")
@@ -169,6 +172,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         if (callback != null) runCatching { scanner?.stopScan(callback) }
     }
     private fun connect(device: BluetoothDevice) {
+        if (!requireBluetooth()) return
         stage = "connect"
         listener.onState(State.CONNECTING, "Connecting…")
         gatt = try { device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE) } catch (_: Exception) { null }
@@ -508,7 +512,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         if (!securePskSupported) { listener.onPskUpdateResult(false, "Update the car firmware to v2.6.0 or later before changing its PSK"); return true }
         val current = nonce ?: return false
         val c = pskUpdate ?: return false
-        if (!PskUpdateProtocol.validKey(newPsk)) { listener.onPskUpdateResult(false, "PSK must be 1–128 UTF-8 bytes without NUL characters"); return true }
+        if (!PskUpdateProtocol.validNewKey(newPsk)) { listener.onPskUpdateResult(false, PskKeyPolicy.NEW_KEY_GUIDANCE); return true }
         if (!ready || queue.busy || receiptBusy || pendingCommand != null || pskRequest != null || otaInFlight || radioCallback != null) return false
         val request = PskUpdateProtocol.create(profile.securityBinding, current, psk, newPsk)
         if (request.payload.size > negotiatedMtu - 3) {
@@ -591,8 +595,17 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         gatt?.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
         listener.onOtaResult(success, message)
     }
-    private fun fail(message: String) {
+    private fun requireBluetooth(): Boolean {
+        val availability = BluetoothAvailability.read(context, bluetoothManager)
+        if (availability == BluetoothAvailability.AVAILABLE) return true
+        fail(availability.message ?: "Bluetooth is unavailable")
+        return false
+    }
+
+    private fun fail(reason: String) {
         if (stopped) return
+        val availability = BluetoothAvailability.read(context, bluetoothManager)
+        val message = availability.message ?: reason
         val proof = proofResult
         if (proof != null) {
             proofResult = null; stop(); proof(false); return
@@ -602,7 +615,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         val wasPsk = pskRequest != null
         val wasOta = otaInFlight
         if (!ready && attemptingDirect) directFailures++
-        if (wasPsk || wasOta) stopped = true
+        if (wasPsk || wasOta || availability != BluetoothAvailability.AVAILABLE) stopped = true
         teardown()
         listener.onReadyChanged(false)
         listener.onState(State.DISCONNECTED, message)

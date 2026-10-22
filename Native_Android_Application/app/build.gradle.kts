@@ -12,8 +12,8 @@ android {
         applicationId = "dev.logiclabs.remotekey"
         minSdk = 23
         targetSdk = 36
-        versionCode = 28
-        versionName = "2.8.2"
+        versionCode = 29
+        versionName = "2.8.3"
         manifestPlaceholders["appLabel"] = "Remote Key"
     }
 
@@ -55,4 +55,5 @@ dependencies {
     implementation("androidx.biometric:biometric:1.1.0")
     implementation("androidx.fragment:fragment:1.8.9")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

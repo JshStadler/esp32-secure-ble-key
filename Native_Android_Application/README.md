@@ -23,7 +23,8 @@ about local storage, optional locations, exports, and deletion.
 
 ## Features
 
-- Configurable device-card dashboard, initially populated with Car and Gate
+- First-launch device-type chooser with Standalone, ESPHome, or setup-later options; no pre-created Car/Gate cards
+- Bluetooth availability banner with a system turn-on action, paused connection retries while off, and automatic reconnection when enabled
 - Add, rename, or remove Standalone and ESPHome device cards from app settings
 - Foreground-persistent BLE connections with per-device cached-address retries and scan fallback
 - Independent encrypted PSK and address settings for each device
@@ -41,6 +42,21 @@ The car uses the `a1b2c3d4-...` API-v2 UUID family and `car-main` security
 binding. The gate uses the distinct `b1b2c3d4-...` API-v2 family and
 `gate-main`, preventing discovery from selecting the wrong ESP while all
 devices are in range.
+Fresh installations start with no device cards. After app authentication, select
+one or both firmware types, or choose **Set up later**. Selected cards use neutral
+type labels; open their settings to set a name and the installed device's PSK.
+An empty dashboard provides an **Add device** action. Existing saved device lists
+and legacy credentials are retained on upgrade, and removing all cards does not
+restart onboarding.
+
+The dashboard distinguishes Bluetooth off, switching on/off, missing permission,
+and unsupported BLE hardware. Press actions are disabled while Bluetooth is
+unavailable. **Turn on Bluetooth** opens Android's enable prompt; denying it leaves
+the off state visible. Turning Bluetooth back on reconnects configured devices
+while the app is open without replaying interrupted commands. A key change that
+was interrupted keeps its recovery journal; a dispatched press without a receipt
+remains marked as unconfirmed.
+
 Nearby configured devices connect and authenticate when the app is open, making
 card-button presses immediate. Existing connections remain available for up to
 two minutes after the app is backgrounded, or while a firmware update is active.
@@ -58,6 +74,13 @@ PSK. A newly generated PSK is revealed with a Copy action only in the generation
 dialog; after it is saved, the app masks it and does not provide a later reveal
 or copy action. Store the copied value in a password manager before closing the
 dialog, then configure the matching ESP with that same value.
+
+New Car key replacements require 32–128 UTF-8 bytes, at least eight distinct
+byte values, and no repeating pattern of 1–16 bytes. Use the generator rather
+than a memorable password: validation cannot establish randomness. Firmware
+enforces the same rule on BLE updates and fresh customized bootstrap keys.
+Existing keys still work; setup, ESPHome key import, and app-only recovery
+accept the installed device's original key without forcing a remote change.
 
 When two cards use the same firmware type and service UUID, configure a fixed
 BLE address for each. The app requires an address for the additional card and
