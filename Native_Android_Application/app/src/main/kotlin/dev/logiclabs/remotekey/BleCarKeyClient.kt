@@ -63,6 +63,10 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
     private var ready = false
     private var stopped = true
     val isRunning get() = !stopped
+    val canRestartConnection get() = ConnectionPreferences.canRestart(
+        pressPending = pendingCommand == CarKeyProtocol.PRESS_COMMAND,
+        keyChangePending = pskRequest != null, firmwarePending = otaInFlight,
+        radioPending = radioCallback != null, firmwarePicker = false)
     private var reconnectAddress: String? = null
     private var preferDirect = false
     private var attemptingDirect = false

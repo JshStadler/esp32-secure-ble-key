@@ -60,8 +60,28 @@ was interrupted keeps its recovery journal; a dispatched press without a receipt
 remains marked as unconfirmed.
 
 Nearby configured devices connect and authenticate when the app is open, making
-card-button presses immediate. Existing connections remain available for up to
-two minutes after the app is backgrounded, or while a firmware update is active.
+card-button presses immediate. Each device's **Connect automatically when the
+app opens** switch defaults to on. Turning it off still permits an explicit
+Press, Device health, Reconnect or Rescan to establish a connection.
+**Reconnect** and **Rescan for this device** use saved settings; Rescan bypasses
+the direct-address shortcut while preserving any explicitly configured target
+address. Neither action is allowed during a pending press, key change, radio
+write, firmware selection or firmware transfer, and neither sends a press.
+
+App Settings provides **Background connections: Off / 30 seconds / 2 minutes**.
+Existing installations default to two minutes. The deadline uses elapsed time,
+including screen-off sleep. An already-started operation or open firmware picker
+is allowed to finish; the original deadline is not extended after it finishes.
+Off disconnects on leaving the app unless such an operation is active. Returning
+to the app cancels the old lease. These are phone connection preferences, not
+changes to the ESP advertising or sleep configuration.
+
+**Copy support summary** includes app/build version, Android API, Bluetooth
+state, connection preferences, and last collected health firmware/signal data
+labelled with snapshot age. It does not connect or refresh health on its own.
+Missing readings are labelled, and PSKs, names, BLE addresses, locations and logs
+are excluded. Device health Refresh collects a new snapshot for the summary.
+
 Normal PSK changes require the existing PSK. Car changes
 securely update the car ESP over BLE and save the phone copy only after the ESP
 confirms persistence; ESPHome access-device changes update the app copy after

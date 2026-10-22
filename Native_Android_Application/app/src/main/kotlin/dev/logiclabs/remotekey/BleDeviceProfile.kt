@@ -36,6 +36,7 @@ data class BleDeviceProfile(
     val pskStoreKey get() = "device_${id}_psk"
     val addressStoreKey get() = "device_${id}_address"
     val preferCachedStoreKey get() = "device_${id}_prefer_cached"
+    val autoConnectStoreKey get() = "device_${id}_auto_connect"
     val recordLocationStoreKey get() = "device_${id}_record_location"
 }
 
