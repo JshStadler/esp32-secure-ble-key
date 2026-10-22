@@ -43,4 +43,22 @@ class RadioSettingsTest {
             packet.copyOfRange(11, 43).joinToString("") { "%02x".format(it) })
         assertTrue(runCatching { RadioSettings.DEFAULT.packet(ByteArray(15), "test-key") }.isFailure)
     }
+    @Test fun powerUsesVersionedFullMacAndSignedByteWithoutChangingLegacyPackets() {
+        val nonce = ByteArray(16) { it.toByte() }
+        val settings = RadioSettings.DEFAULT.copy(txPowerDbm = -12)
+        val packet = settings.packet(nonce, "test-key")
+        assertEquals(44, packet.size)
+        assertEquals(5.toByte(), packet[0])
+        assertEquals((-12).toByte(), packet[11])
+        assertEquals("8773aca385f2cf69f73cc55b896addffa6ce85e25154ed9f56c9d132c8e3e00c", packet.copyOfRange(12, 44).joinToString("") { "%02x".format(it) })
+        assertFalse(packet.contentEquals(settings.copy(txPowerDbm = 9).packet(nonce, "test-key")))
+        assertFalse(packet.contentEquals(settings.packet(ByteArray(16), "test-key")))
+        RadioSettings.TX_POWER_LEVELS.forEach { assertTrue(settings.copy(txPowerDbm = it).valid()) }
+        listOf(-15, -11, 1, 10, 12, 127).forEach { power ->
+            assertFalse(settings.copy(txPowerDbm = power).valid())
+            assertTrue(runCatching { settings.copy(txPowerDbm = power).packet(nonce, "test-key") }.isFailure)
+        }
+        assertEquals(43, settings.copy(txPowerDbm = null).packet(nonce, "test-key").size)
+    }
+
 }

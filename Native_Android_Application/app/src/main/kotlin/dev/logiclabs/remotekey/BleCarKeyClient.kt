@@ -54,8 +54,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
     private var compactAuthSupported = false
     private var compactAuth: CompactAuthSession? = null
     private var phoneRssi: Int? = null
-    private var rssiGeneration = 0
-    private var rssiDone: (() -> Unit)? = null
+    private val phoneRssiRequest = PhoneRssiRequest()
     val supportsSafePskUpdate get() = ready && receipt != null && securePskSupported
     private var nonce: ByteArray? = null
     private var readValue = byteArrayOf()
@@ -76,6 +75,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
     private var healthSupported = false
     private var gateSignalSupported = false
     private var radioSupported = false
+    private var radioPowerSupported = false
     private var healthCallback: ((DeviceHealth?, String?) -> Unit)? = null
     private var healthGeneration = 0
     private var radioCallback: ((Boolean, String) -> Unit)? = null
@@ -235,10 +235,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
             queue.complete("write:${c.uuid}", code == BluetoothGatt.GATT_SUCCESS)
         }
         override fun onReadRemoteRssi(g: BluetoothGatt, rssi: Int, code: Int) = dispatch(g) {
-            phoneRssi = if (code == BluetoothGatt.GATT_SUCCESS && rssi in -127..20) rssi else null
-            val done = rssiDone
-            rssiDone = null
-            done?.invoke()
+            phoneRssiRequest.complete(if (code == BluetoothGatt.GATT_SUCCESS) rssi else null)
         }
     }
     private fun receiveRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray, code: Int) = dispatch(g) {
@@ -292,6 +289,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
                 healthSupported = "health1" in caps
                 gateSignalSupported = profile.type == BleDeviceType.ESPHOME_ACCESS && "signal1" in caps
                 radioSupported = "radio1" in caps
+                radioPowerSupported = "radio2" in caps
                 compactAuthSupported = "auth2" in caps && receipt != null
             }
         }
@@ -354,7 +352,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
     }
 
     fun requestDeviceHealth(done: (DeviceHealth?, String?) -> Unit) {
-        if (stopped || !ready || queue.busy || pendingCommand != null || pskRequest != null || otaInFlight || healthCallback != null || radioCallback != null || rssiDone != null) {
+        if (stopped || !ready || queue.busy || pendingCommand != null || pskRequest != null || otaInFlight || healthCallback != null || radioCallback != null) {
             done(null, "Connection is busy or recovering. Try Refresh when connected.")
             return
         }
@@ -402,16 +400,15 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
     // finishes. A missing optional RSSI callback must not break a working link.
     private fun readPhoneRssi(done: () -> Unit) {
         phoneRssi = null
-        val generation = ++rssiGeneration
-        rssiDone = done
-        if (runCatching { gatt?.readRemoteRssi() == true }.getOrDefault(false)) {
-            later(2_000) { if (generation == rssiGeneration) {
-                val complete = rssiDone; rssiDone = null; complete?.invoke()
-            } }
-        } else { rssiDone = null; done() }
+        phoneRssiRequest.request(
+            start = { runCatching { gatt?.readRemoteRssi() == true }.getOrDefault(false) },
+            timeout = { later(2_000, it) },
+        ) { value -> phoneRssi = value; done() }
     }
 
-    fun cancelDeviceHealth() { healthGeneration++; healthCallback = null; publishReady() }
+    fun cancelDeviceHealth() {
+        healthGeneration++; healthCallback = null; phoneRssiRequest.cancel(); publishReady()
+    }
 
     fun updateRadioSettings(settings: RadioSettings, done: (Boolean, String) -> Unit) {
         val control = otaControl
@@ -421,7 +418,10 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
             otaInFlight || radioCallback != null || healthCallback != null) {
             done(false, "Connection is busy or recovering. Try again when connected."); return
         }
-        if (!settings.valid() || negotiatedMtu < 46) { done(false, "Invalid settings or BLE MTU too small; reconnect and try again."); return }
+        if (settings.txPowerDbm != null && !radioPowerSupported) {
+            done(false, "Update the standalone ESP firmware to v2.8.8 for transmit power control."); return
+        }
+        if (!settings.valid() || negotiatedMtu < (if (settings.txPowerDbm == null) 46 else 47)) { done(false, "Invalid settings or BLE MTU too small; reconnect and try again."); return }
         radioCallback = done
         radioResponse = null
         radioWritePending = true
@@ -432,7 +432,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
             radioWritePending = false
             radioResponse?.let { handleRadioStatus(it) }
         }
-        later(8_000) { if (radioCallback != null && generation == radioGeneration) fail("Advertising settings response timed out") }
+        later(8_000) { if (radioCallback != null && generation == radioGeneration) fail("Radio settings response timed out") }
     }
 
     private fun handleRadioStatus(value: String) {
@@ -444,10 +444,12 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         radioGeneration++
         readChallenge()
         val message = when (value) {
-            "RADIO:OK" -> "Advertising settings saved on the ESP and applied."
+            "RADIO:OK" -> "Radio settings saved on the ESP and applied."
             "ERR:RADIO_BUSY" -> "Wait until the firmware update and startup health check finish, then retry."
             "ERR:RADIO_SAVE" -> "ESP could not save settings; previous settings remain active."
-            "ERR:RADIO_RANGE" -> "ESP rejected the interval range."
+            "ERR:RADIO_RANGE" -> "ESP rejected the interval or transmit power range."
+            "ERR:RADIO_APPLY" -> "ESP could not apply transmit power; previous settings were restored."
+            "ERR:RADIO_RESTORE" -> "ESP could not restore transmit power after an error. Saved settings are unchanged; reconnect and check device health."
             else -> "ESP rejected settings authentication. Reconnect and retry."
         }
         callback?.invoke(value == "RADIO:OK", message)
@@ -745,8 +747,8 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         commandPt1 = null; commandPt2 = null
         otaControl = null; otaData = null; otaStatus = null; deviceState = null
         receipt = null; receiptBusy = false; compactAuth = null; compactAuthSupported = false
-        phoneRssi = null; rssiDone = null; rssiGeneration++
-        nonce = null; ready = false; securePskSupported = false; healthSupported = false; gateSignalSupported = false; radioSupported = false
+        phoneRssi = null; phoneRssiRequest.reset()
+        nonce = null; ready = false; securePskSupported = false; healthSupported = false; gateSignalSupported = false; radioSupported = false; radioPowerSupported = false
         pendingCommand = null; commandWritePending = false; pendingStatus = null; commandGeneration++
         pskRequest?.receiptKey?.fill(0); pskRequest = null; pendingNewPsk = null
         otaImage = null; otaInFlight = false; otaChunkPending = false; otaResponse = null; otaGeneration++

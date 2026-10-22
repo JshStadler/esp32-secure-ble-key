@@ -62,8 +62,29 @@ class DeviceHealthTest {
         val data = snapshot.replace("health1,", "health1,radio1,") +
             ",fastmin=80,fastmax=160,slowmin=320,slowmax=640,idlesec=60,advmode=inactive"
         assertEquals(RadioSettings.DEFAULT, DeviceHealth.parse(data)!!.radio)
+        assertTrue(DeviceHealth.parse(data)!!.display().contains("Inactive: 200-400 ms"))
         assertEquals("inactive", DeviceHealth.parse(data)!!.advertisingMode)
         assertNull(DeviceHealth.parse(data.replace("slowmax=640", "slowmax=9999")))
         assertNull(DeviceHealth.parse(data.substringBefore(",idlesec=")))
     }
+    @Test fun powerReadbackDistinguishesTargetActualAndUnavailable() {
+        val data = snapshot.replace("health1,", "health1,radio1,radio2,") +
+            ",fastmin=80,fastmax=160,slowmin=320,slowmax=640,idlesec=60,advmode=inactive,txdbm=9"
+        val missing = DeviceHealth.parse(data)!!
+        assertEquals(9, missing.radio!!.txPowerDbm)
+        assertNull(missing.advertisingTxDbm)
+        assertTrue(missing.display().contains("Saved target: 9 dBm"))
+        assertTrue(missing.display().contains("Advertising: Unavailable"))
+        val actual = DeviceHealth.parse("$data,txadv=9,txconn=3")!!
+        assertEquals(9, actual.advertisingTxDbm)
+        assertEquals(3, actual.connectionTxDbm)
+        assertTrue(actual.display().contains("This connection: 3 dBm"))
+        assertTrue(actual.espSignalSupported)
+        listOf("10", "-15", "", "abc", "127").forEach {
+            assertNull(DeviceHealth.parse(data.replace("txdbm=9", "txdbm=$it")))
+        }
+        assertNull(DeviceHealth.parse("$data,txadv=127"))
+        assertNull(DeviceHealth.parse(data.substringBefore(",txdbm=")))
+    }
+
 }

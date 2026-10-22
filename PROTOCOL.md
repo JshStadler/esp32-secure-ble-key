@@ -143,7 +143,7 @@ may poll it while connected. Current values are `Unknown`, `Closed`, `Open`,
 
 The existing read-only identity characteristic `a1b2c3d4-e5f6-7890-abcd-ef1234567897`
 keeps its UUID and handle. A read before authentication returns only
-`blekey|2|car-main|car|press,ota1,psk2,health1,radio1,rcp1,auth2`. On an authenticated, non-closing
+`blekey|2|car-main|car|press,ota1,psk2,health1,radio1,rcp1,auth2,radio2`. On an authenticated, non-closing
 connection, an explicit read appends comma-separated health fields to this
 capability list:
 The two lines below are concatenated without a newline on the wire.
@@ -207,6 +207,45 @@ uncertain outcome: never repeat the write automatically; read health to inspect
 the actual values. After Save, Android explicitly reads them back. Saving
 starts the recent-activity window and restarts advertising with the new values;
 existing connections are retained. A host callout handles the inactive deadline.
+
+## Car transmit power configuration (radio2, v2.8.8)
+
+`radio2` extends `radio1` on the same OTA-control characteristic, without changing
+GATT handles. Clients only use it when the ESP advertises the new capability.
+
+```text
+config2 = config[10] || signed_int8(tx_dbm)       # 11 bytes
+transcript = ASCII("BLEKEY-RADIO2") || 0x00 || ASCII("car-main") ||
+             0x00 || nonce[16] || config2        # 50 bytes
+packet = 0x05 || config2 || HMAC-SHA256(PSK, transcript)  # 44 bytes, MTU >= 47
+```
+
+Allowed power levels are -12, -9, -6, -3, 0, +3, +6 and +9 dBm; default +3.
+The full MAC covers the signed power byte and fresh challenge. Authentication,
+nonce rotation, OTA exclusion, and failure limits are the same as radio1.
+Legacy radio1 writes preserve the current power target.
+
+Firmware applies and verifies default, advertising and every active connection's
+controller power before committing the complete v2 configuration. A failure
+restores the previous target to all affected links. `ERR:RADIO_APPLY` means the
+controller rejected the update and the previous target was restored;
+`ERR:RADIO_SAVE` means persistence failed and the previous target was restored.
+`ERR:RADIO_RESTORE` means restoration also failed: inspect health and reconnect;
+never assume the controller matches the saved target after this error.
+Interval changes become active only after persistence succeeds. A missing
+acknowledgement remains an uncertain outcome: reconnect and read health.
+
+The `radio2` NVS record is version 2 plus the 11-byte config. Firmware falls back
+to a valid legacy `radio1` record with +3 dBm when no valid v2 record exists.
+It retains that legacy record for rollback, so a downgrade restores the older
+intervals and fixed power rather than the newer radio settings. New connections
+receive the saved target individually using their actual controller handle.
+
+Authenticated health adds `txdbm` (saved target), `txadv` (controller advertising
+power) and `txconn` (controller power for this connection), all in dBm. Failed
+controller reads omit the actual field rather than reporting a placeholder.
+These values are controller settings, not measured RF output or received RSSI.
+The existing 512-byte health limit is unchanged.
 
 ## Car PSK2 (v2.6.0)
 

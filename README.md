@@ -388,3 +388,34 @@ Key constants in `main/main.c`:
 ## 📜 License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+
+### 2.8.8 radio control and review
+
+The native Android app and standalone ESP firmware support authenticated transmit
+power selection through **Device health → Radio settings**. The default remains
++3 dBm; selectable levels are -12 through +9 dBm in 3 dB steps. Health reports the
+saved target separately from the controller's advertising and connection power.
+The firmware retains older app/watch compatibility. Gate firmware is unchanged.
+
+Regression checks cover delayed Android RSSI callbacks, legacy radio migration,
+invalid power values, authenticated packet vectors, all active connection handles,
+and controller/storage failures with restoration of the previous power target.
+See [the protocol](PROTOCOL.md#car-transmit-power-configuration-radio2-v288).
+
+Useful hardware checks after updating the standalone firmware:
+
+1. Compare +3, +6 and +9 dBm at fixed 2 m and 10 m positions, keeping phone/watch
+   orientation and advertising intervals unchanged. Record five reconnect times
+   and both RSSI directions per setting. Check first discovery after at least
+   60 seconds idle too.
+2. Restart the ESP and confirm the saved target and actual advertising/connection
+   power in Device health. Reconnect phone and watch together to check both links.
+3. Refresh health, close it immediately and press once; the command should remain
+   responsive. Toggle phone Bluetooth off/on and verify recovery without an
+   automatically repeated press.
+4. Measure average current at the same supply point and voltage, with the same
+   connected/idle state, for each power setting. Range and current improvements
+   require measurements on the installed antenna and power supply.
+
+BLE modem sleep remains disabled pending a controlled hardware reliability and
+current test. No change in this release claims to solve that limitation.

@@ -10,6 +10,7 @@ data class DeviceHealth(
     val espRssi: Int? = null, val phoneRssi: Int? = null,
     val hasFirmwareHealth: Boolean = true,
     val espSignalSupported: Boolean = false,
+    val advertisingTxDbm: Int? = null, val connectionTxDbm: Int? = null,
 ) {
     fun display(): String {
         val signal = "BLE signal strength\n" +
@@ -37,7 +38,10 @@ data class DeviceHealth(
             else -> resetReason.replace('_', ' ')
         }
         val advertising = radio?.let { "\n\nAdvertising: $advertisingMode\nRecent activity: ${it.recentText()} ms\n" +
-            "Inactive: ${it.inactiveText()} ms\nInactivity before slowing: ${it.idleSeconds}s" }.orEmpty()
+            "Inactive: ${it.inactiveText()} ms\nInactivity before slowing: ${it.idleSeconds}s" +
+            if (it.txPowerDbm == null) "" else "\n\nESP transmit power\nSaved target: ${it.txPowerDbm} dBm\n" +
+                "Advertising: ${advertisingTxDbm?.let { dbm -> "$dbm dBm" } ?: "Unavailable"}\n" +
+                "This connection: ${connectionTxDbm?.let { dbm -> "$dbm dBm" } ?: "Unavailable"}" }.orEmpty()
         return "$signal\n\nFirmware: $firmware\nBuild: $build\nOTA status: $ota\n\n" +
             "Uptime: ${uptimeSeconds / 86400}d ${uptimeSeconds / 3600 % 24}h ${uptimeSeconds / 60 % 60}m ${uptimeSeconds % 60}s\n" +
             "Last reset: $reset\n\n" +
@@ -70,16 +74,23 @@ data class DeviceHealth(
             val build = field("build").also { require(it.matches(Regex("[a-fA-F0-9]{12}"))) }
             val heap = number("heap")
             val minimum = number("minheap").also { require(it <= heap) }
+            fun signed(key: String, range: IntRange): Int? = fields[key]?.let {
+                require(it.matches(Regex("-?[0-9]{1,3}")))
+                it.toInt().also { n -> require(n in range) }
+            }
+            val tx = if ("radio2" in caps) signed("txdbm", -12..9).also { require(it != null) } else null
             val radio = if ("radio1" in caps) RadioSettings(number("fastmin", 3200).toInt(),
                 number("fastmax", 3200).toInt(), number("slowmin", 3200).toInt(),
-                number("slowmax", 3200).toInt(), number("idlesec", 3600).toInt()).also { require(it.valid()) } else null
+                number("slowmax", 3200).toInt(), number("idlesec", 3600).toInt(), tx).also { require(it.valid()) } else null
             val rssi = fields["rssi"]?.let { value ->
                 require(value.matches(Regex("-?[0-9]{1,3}")))
                 value.toInt().also { require(it in -127..20) }
             }
             DeviceHealth(field("fw"), build, field("idf"), number("up", Long.MAX_VALUE),
                 field("reset"), field("ota"), heap, minimum, number("links", 3),
-                number("advrec"), number("ghost"), radio, if (radio == null) "unknown" else field("advmode"), espRssi = rssi)
+                number("advrec"), number("ghost"), radio, if (radio == null) "unknown" else field("advmode"), espRssi = rssi,
+                espSignalSupported = true, advertisingTxDbm = signed("txadv", -24..20),
+                connectionTxDbm = signed("txconn", -24..20))
         }.getOrNull()
     }
 }

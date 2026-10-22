@@ -33,6 +33,8 @@ import android.text.InputType
 import android.text.method.LinkMovementMethod
 import android.view.Gravity
 import android.view.View
+import android.widget.ArrayAdapter
+import android.widget.Spinner
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
@@ -1040,7 +1042,7 @@ class MainActivity : FragmentActivity() {
             .setView(scroll)
             .setPositiveButton("Close", null)
             .setNeutralButton("Refresh", null)
-            .setNegativeButton("Advertising", null)
+            .setNegativeButton("Radio settings", null)
             .create()
         healthDialog = dialog
         healthDeviceId = profile.id
@@ -1125,6 +1127,19 @@ class MainActivity : FragmentActivity() {
         val recent = input("Recent activity interval (ms)", current.recentText())
         val inactive = input("Inactive interval (ms)", current.inactiveText())
         val seconds = input("Inactivity before slowing (seconds)", current.idleSeconds.toString())
+        val power = if (current.txPowerDbm != null) {
+            layout.addView(sectionLabel("ESP transmit power (dBm)"))
+            Spinner(this).apply {
+                adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+                    RadioSettings.TX_POWER_LEVELS.map { if (it == 3) "+3 dBm (default)" else "${if (it > 0) "+" else ""}$it dBm" })
+                setSelection(RadioSettings.TX_POWER_LEVELS.indexOf(current.txPowerDbm))
+                layout.addView(this, LinearLayout.LayoutParams(-1, -2))
+            }
+        } else null
+        layout.addView(text(if (power == null) "Transmit power control requires standalone ESP firmware v2.8.8 or later." else
+            "Higher power can improve ESP-to-phone/watch range and uses more energy while transmitting. " +
+            "Start with +3 dBm; compare +6 or +9 at the same position. This changes the ESP only. " +
+            "Power applies to advertising and all connected devices; lowering it may disconnect a distant phone or watch.", 13f, false))
         layout.addView(text("Use an interval (100) or range (50-100). Higher intervals advertise less often and can delay discovery. " +
             "Intervals: 20-2000 ms, in multiples of 0.625 ms; multiples of 5 ms are easiest. Inactivity: 5-3600 seconds. " +
             "Inactive intervals must be at least as long as recent-activity intervals.\n\n" +
@@ -1133,7 +1148,7 @@ class MainActivity : FragmentActivity() {
         val status = text("", 14f, false).apply { setPadding(0, dp(12), 0, 0) }
         layout.addView(status)
         val dialog = AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
-            .setTitle("${profile.displayName} Advertising")
+            .setTitle("${profile.displayName} Radio settings")
             .setView(ScrollView(this).apply { addView(layout) })
             .setNegativeButton("Cancel", null)
             .setNeutralButton("Restore defaults", null)
@@ -1149,19 +1164,23 @@ class MainActivity : FragmentActivity() {
             recent.setText(RadioSettings.DEFAULT.recentText())
             inactive.setText(RadioSettings.DEFAULT.inactiveText())
             seconds.setText(RadioSettings.DEFAULT.idleSeconds.toString())
+            power?.setSelection(RadioSettings.TX_POWER_LEVELS.indexOf(3))
             status.text = "Defaults selected. Tap Save to ESP to apply."
         }
         save.setOnClickListener {
-            val requested = try { RadioSettings.fromInput(recent.text.toString(), inactive.text.toString(), seconds.text.toString()) }
+            val requested = try {
+                RadioSettings.fromInput(recent.text.toString(), inactive.text.toString(), seconds.text.toString())
+                    .copy(txPowerDbm = power?.let { RadioSettings.TX_POWER_LEVELS[it.selectedItemPosition] })
+            }
             catch (e: IllegalArgumentException) { status.text = e.message; return@setOnClickListener }
             val client = clients[profile.id]
             if (client == null) { status.text = "Device disconnected. Close this view and reconnect first."; return@setOnClickListener }
             save.isEnabled = false; defaults.isEnabled = false; cancel.isEnabled = false
-            recent.isEnabled = false; inactive.isEnabled = false; seconds.isEnabled = false
+            recent.isEnabled = false; inactive.isEnabled = false; seconds.isEnabled = false; power?.isEnabled = false
             dialog.setCancelable(false)
             status.text = "Saving to ESP…"
             client.updateRadioSettings(requested) { success, message ->
-                EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Advertising settings: $message", deviceId = profile.id, deviceName = profile.displayName)
+                EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Radio settings: $message", deviceId = profile.id, deviceName = profile.displayName)
                 if (dialog.isShowing) {
                     if (success) {
                         dialog.dismiss()
@@ -1170,7 +1189,7 @@ class MainActivity : FragmentActivity() {
                     } else {
                         status.text = message
                         save.isEnabled = true; defaults.isEnabled = true; cancel.isEnabled = true
-                        recent.isEnabled = true; inactive.isEnabled = true; seconds.isEnabled = true
+                        recent.isEnabled = true; inactive.isEnabled = true; seconds.isEnabled = true; power?.isEnabled = true
                         dialog.setCancelable(true)
                     }
                 }

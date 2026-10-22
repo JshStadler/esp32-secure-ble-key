@@ -163,3 +163,18 @@ workflow produces APK, AAB, and `app/build/outputs/mapping/release/mapping.txt`
 artifacts. Keep the mapping file for each released build to decode obfuscated
 crash reports; the AAB also includes it for Google Play. Debug builds remain
 unobfuscated.
+
+### Standalone ESP radio settings (2.8.8)
+
+Open **Device health → Radio settings**. With standalone firmware 2.8.8, select
+transmit power from -12 to +9 dBm in 3 dB steps (default +3), alongside advertising
+intervals. Save authenticates and persists the complete configuration, applies
+power to advertising and active links, then explicitly reads health back.
+Device health distinguishes the saved target from the controller's actual
+advertising/connection settings. Earlier firmware retains interval controls.
+Gate ESPHome transmit power continues to be set in its YAML configuration.
+
+Phone RSSI requests are on demand. A timed-out or canceled controller request
+is quarantined until its callback arrives or the GATT connection is discarded;
+late callbacks cannot fulfill a newer measurement. Optional RSSI failure does
+not prevent key commands or the ESP health snapshot.
