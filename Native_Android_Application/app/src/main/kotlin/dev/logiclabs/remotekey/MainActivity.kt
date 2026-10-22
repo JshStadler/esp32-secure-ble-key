@@ -269,7 +269,7 @@ class MainActivity : FragmentActivity() {
         // Start while still visible, before Android's background-start limits apply.
         if (!isFinishing && authenticated && hasPermissions() && clients.isNotEmpty()) {
             val duration = BackgroundConnectionDuration.fromSaved(store.get(BackgroundConnectionDuration.STORE_KEY))
-            val operationActive = { pendingPressId != null || firmwarePickerActive }
+            val operationActive = { pendingPressId != null || firmwarePickerActive || clients.values.any { !it.canRestartConnection } }
             if (duration == BackgroundConnectionDuration.OFF && !operationActive()) stopAllClients()
             else BackgroundConnectionService.begin(this, BackgroundConnectionService.Lease(
                 duration = duration,
