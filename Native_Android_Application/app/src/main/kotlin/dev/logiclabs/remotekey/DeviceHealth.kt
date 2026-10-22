@@ -9,11 +9,12 @@ data class DeviceHealth(
     val radio: RadioSettings? = null, val advertisingMode: String = "unknown",
     val espRssi: Int? = null, val phoneRssi: Int? = null,
     val hasFirmwareHealth: Boolean = true,
+    val espSignalSupported: Boolean = false,
 ) {
     fun display(): String {
         val signal = "BLE signal strength\n" +
             "At phone (ESP → phone): ${phoneRssi?.let { "$it dBm" } ?: "Unavailable"}\n" +
-            "At ESP (phone → ESP): ${espRssi?.let { "$it dBm" } ?: "Unavailable — firmware support required"}\n" +
+            "At ESP (phone → ESP): ${espRssi?.let { "$it dBm" } ?: if (espSignalSupported) "Unavailable — tap Refresh to retry" else "Unavailable — firmware support required"}\n" +
             "Closer to 0 dBm means a stronger received signal. These are connection snapshots, not transmit power."
         if (!hasFirmwareHealth) return "$signal\n\nDetailed ESP health is not supported by this firmware. Tap Refresh for a new phone signal reading."
         val ota = when (otaState) {
@@ -47,8 +48,8 @@ data class DeviceHealth(
     }
 
     companion object {
-        fun signalOnly() = DeviceHealth("", "", "", 0, "", "unknown", 0, 0, 0, 0, 0,
-            hasFirmwareHealth = false)
+        fun signalOnly(espSignalSupported: Boolean = false) = DeviceHealth("", "", "", 0, "", "unknown", 0, 0, 0, 0, 0,
+            hasFirmwareHealth = false, espSignalSupported = espSignalSupported)
         fun capabilities(value: String): List<String> = value.split('|').let {
             if (it.size == 5 && it[0] == "blekey" && it[1] == "2" && it[3] == "car") it[4].split(',') else emptyList()
         }

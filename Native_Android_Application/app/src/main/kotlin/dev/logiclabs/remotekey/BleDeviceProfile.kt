@@ -29,6 +29,7 @@ data class BleDeviceProfile(
 ) {
     val commandPt1Uuid get() = UUID.fromString(commandUuid.toString().dropLast(2) + "95")
     val commandPt2Uuid get() = UUID.fromString(commandUuid.toString().dropLast(2) + "96")
+    val signalUuid get() = UUID.fromString(commandUuid.toString().dropLast(2) + "9c")
     val supportsRemotePskUpdate get() = type == BleDeviceType.CAR
     val supportsBleOta get() = type == BleDeviceType.CAR
     val supportsLiveState get() = type == BleDeviceType.ESPHOME_ACCESS

@@ -12,6 +12,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libmbedtls-dev
       - run: python -m pip install cryptography==46.0.5
       - run: python tools/psk2_vectors.py
+      - run: g++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -IESPHome_Gate_Firmware/tests/stubs -IESPHome_Gate_Firmware/components/gate_ble_signal ESPHome_Gate_Firmware/tests/gate_ble_signal_test.cpp -o /tmp/gate-signal-test && /tmp/gate-signal-test
       - run: gcc -Wall -Wextra -Werror -fsanitize=address,undefined -IESP32-C3_Firmware/main ESP32-C3_Firmware/tests/psk_key_policy_test.c -o /tmp/psk-policy-test && /tmp/psk-policy-test
       - run: gcc -Wall -Wextra -Werror -fsanitize=address,undefined -I. -IESP32-C3_Firmware/main ESP32-C3_Firmware/main/psk_update.c ESP32-C3_Firmware/tests/psk2_test.c -lmbedcrypto -o /tmp/psk2-test && /tmp/psk2-test
       - run: python tools/nvs_test.py

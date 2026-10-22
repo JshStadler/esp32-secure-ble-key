@@ -74,6 +74,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
     private var retryFailures = 0
     private var securePskSupported = false
     private var healthSupported = false
+    private var gateSignalSupported = false
     private var radioSupported = false
     private var healthCallback: ((DeviceHealth?, String?) -> Unit)? = null
     private var healthGeneration = 0
@@ -289,6 +290,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
                 val caps = it.toString(Charsets.UTF_8).split('|').last().split(',')
                 securePskSupported = "psk2" in caps
                 healthSupported = "health1" in caps
+                gateSignalSupported = profile.type == BleDeviceType.ESPHOME_ACCESS && "signal1" in caps
                 radioSupported = "radio1" in caps
                 compactAuthSupported = "auth2" in caps && receipt != null
             }
@@ -370,9 +372,29 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         }
         readPhoneRssi {
             if (generation != healthGeneration) return@readPhoneRssi
-            if (!healthSupported || identity == null) finish(DeviceHealth.signalOnly())
+            if (gateSignalSupported) readGateSignal(generation) { rssi ->
+                finish(DeviceHealth.signalOnly(espSignalSupported = true).copy(espRssi = rssi))
+            }
+            else if (!healthSupported || identity == null) finish(DeviceHealth.signalOnly())
             else read(identity) { finish(DeviceHealth.parse(it.toString(Charsets.UTF_8))) }
         }
+    }
+
+    private fun readGateSignal(generation: Int, done: (Int?) -> Unit) {
+        val signal = gatt?.getService(profile.serviceUuid)?.getCharacteristic(profile.signalUuid)
+        if (signal == null) { done(null); return }
+        val request = GateSignalProtocol.newRequest()
+        fun poll(attempt: Int) {
+            if (generation != healthGeneration || stopped) return
+            read(signal) { value ->
+                if (generation != healthGeneration) return@read
+                val reply = GateSignalProtocol.parse(value, request)
+                if (reply?.pending == true && attempt < 10)
+                    later(250) { poll(attempt + 1) }
+                else done(reply?.rssi)
+            }
+        }
+        write(signal, request) { poll(0) }
     }
 
     // On-demand only: do not poll RSSI or add traffic while the health view is closed.
@@ -724,7 +746,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         otaControl = null; otaData = null; otaStatus = null; deviceState = null
         receipt = null; receiptBusy = false; compactAuth = null; compactAuthSupported = false
         phoneRssi = null; rssiDone = null; rssiGeneration++
-        nonce = null; ready = false; securePskSupported = false; healthSupported = false; radioSupported = false
+        nonce = null; ready = false; securePskSupported = false; healthSupported = false; gateSignalSupported = false; radioSupported = false
         pendingCommand = null; commandWritePending = false; pendingStatus = null; commandGeneration++
         pskRequest?.receiptKey?.fill(0); pskRequest = null; pendingNewPsk = null
         otaImage = null; otaInFlight = false; otaChunkPending = false; otaResponse = null; otaGeneration++
