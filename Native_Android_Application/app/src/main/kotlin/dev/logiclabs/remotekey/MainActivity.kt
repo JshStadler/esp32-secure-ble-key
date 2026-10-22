@@ -1537,6 +1537,12 @@ class MainActivity : FragmentActivity() {
                     .putExtra(Intent.EXTRA_SUBJECT, "Remote Key support"))
             }.onFailure { toast("Email info@6675162.xyz for support") }
         }, LinearLayout.LayoutParams(-1, dp(48)))
+        options.addView(sectionLabel("About"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
+        options.addView(text("App version: ${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE})", 14f, false).apply {
+            setTextIsSelectable(true)
+            setTextColor(Color.rgb(184, 186, 198))
+            setPadding(0, dp(4), 0, dp(16))
+        }, LinearLayout.LayoutParams(-1, -2))
         settingsDialog = AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
             .setTitle("Remote Key Settings")
             .setView(ScrollView(this).apply { addView(options) })

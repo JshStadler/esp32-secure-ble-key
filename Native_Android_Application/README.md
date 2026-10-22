@@ -17,6 +17,8 @@ Privacy and support: `info@6675162.xyz`. The app contains no ads. Read the bundl
 privacy policy from App Settings or the authentication screen. App Settings also
 provides a support email action and optional connection-notification permission
 on Android 13 and later. BLE operation does not depend on notification permission.
+The About section shows the installed app version and build number; its text can
+be selected/copied for support, and test builds retain their `-test` suffix.
 
 Read the [privacy policy](app/src/main/res/raw/privacy_policy.html) for details
 about local storage, optional locations, exports, and deletion.
