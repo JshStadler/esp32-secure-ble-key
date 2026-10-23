@@ -179,15 +179,19 @@ is quarantined until its callback arrives or the GATT connection is discarded;
 late callbacks cannot fulfill a newer measurement. Optional RSSI failure does
 not prevent key commands or the ESP health snapshot.
 
-### Two power levels (2.8.9)
+### Connected links stay high (2.8.10)
 
-Firmware 2.8.9 exposes recent-activity and inactive transmit power independently.
-Both use the existing inactivity duration. Idle must not exceed recent; choosing
-equal values retains fixed power. Existing firmware/settings keep their previous
-behavior on upgrade. Older firmware still shows its fixed power selector.
+Firmware 2.8.10 uses the high power target for default/non-advertising traffic and
+every connected link at all times. The inactive target affects advertising only;
+its timer is shared with the fast/slow advertising intervals. Choose equal targets
+for fixed power. Existing settings are preserved on upgrade.
 
-Boot, connection results, disconnects and authenticated commands restart the
-recent window. The ESP cannot detect passive scanning, so idle power determines
-initial discovery range. Health snapshots do not restart the timer. OTA holds
-recent power until the transfer ends. Health shows both saved targets, the
-intended mode and actual advertising/current-link power separately.
+Boot, connection results, disconnects and authenticated activity restart the
+recent advertising window. Passive scanning cannot trigger it, so inactive
+advertising power determines initial discovery range. Health reads do not extend
+the timer. OTA keeps advertising high until its transfer ends. Health distinguishes
+the two saved targets from actual advertising and current-link power.
+
+The `linkpower1` capability identifies this policy. The earlier 2.8.9 dual-power
+firmware also lowered connected power; the app displays that older behavior and
+requests a firmware update rather than claiming connected links remain high.

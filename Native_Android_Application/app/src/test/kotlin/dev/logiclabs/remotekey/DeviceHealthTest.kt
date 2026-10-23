@@ -101,4 +101,17 @@ class DeviceHealthTest {
             data.replace(",txmode=inactive", "")).forEach { assertNull(it, DeviceHealth.parse(it)) }
     }
 
+    @Test fun connectedLinkPowerPolicyIsOnlyClaimedForCapableFirmware() {
+        val data = snapshot.replace("health1,", "health1,radio1,radio2,radio3,linkpower1,") +
+            ",fastmin=80,fastmax=160,slowmin=320,slowmax=640,idlesec=60,advmode=inactive,txdbm=9,txidle=3,txmode=inactive,txadv=3,txconn=9"
+        val health = DeviceHealth.parse(data)!!
+        assertTrue(health.connectionPowerHeldHigh)
+        assertTrue(health.display().contains("Connected links / recent advertising: 9 dBm"))
+        assertTrue(health.display().contains("Inactive advertising: 3 dBm"))
+        assertTrue(health.display().contains("This connection: 9 dBm"))
+        val old = DeviceHealth.parse(data.replace(",linkpower1", ""))!!
+        assertFalse(old.connectionPowerHeldHigh)
+        assertFalse(old.display().contains("Connected links / recent advertising"))
+    }
+
 }

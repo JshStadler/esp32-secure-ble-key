@@ -12,8 +12,8 @@ android {
         applicationId = "dev.logiclabs.remotekey"
         minSdk = 24
         targetSdk = 36
-        versionCode = 35
-        versionName = "2.8.9"
+        versionCode = 36
+        versionName = "2.8.10"
         manifestPlaceholders["appLabel"] = "Remote Key"
     }
 

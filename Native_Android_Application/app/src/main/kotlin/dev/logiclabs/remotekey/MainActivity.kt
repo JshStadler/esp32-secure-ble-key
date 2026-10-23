@@ -1057,6 +1057,7 @@ class MainActivity : FragmentActivity() {
         val refresh = dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
         val tune = dialog.getButton(AlertDialog.BUTTON_NEGATIVE).apply { isEnabled = false }
         var currentRadio: RadioSettings? = null
+        var connectionsStayHigh = false
         var expectedRadio: RadioSettings? = null
         fun showResult(token: Int, snapshot: DeviceHealth?, error: String?) {
             if (!dialog.isShowing || !healthRequest.complete(token)) return
@@ -1067,6 +1068,7 @@ class MainActivity : FragmentActivity() {
             }
             expectedRadio = null
             currentRadio = snapshot?.radio
+            connectionsStayHigh = snapshot?.connectionPowerHeldHigh == true
             tune.isEnabled = currentRadio != null && snapshot?.otaState != "pending"
             refresh.isEnabled = true
             if (snapshot != null) EventLog.add(this, EventLog.Kind.DIAGNOSTIC,
@@ -1100,7 +1102,7 @@ class MainActivity : FragmentActivity() {
         refresh.setOnClickListener { request() }
         tune.setOnClickListener {
             currentRadio?.let { settings ->
-                showRadioSettings(profile, settings) { saved ->
+                showRadioSettings(profile, settings, connectionsStayHigh) { saved ->
                     expectedRadio = saved
                     request() // Read back only in response to the explicit Save action.
                 }
@@ -1109,7 +1111,7 @@ class MainActivity : FragmentActivity() {
         request() // The only automatic fetch: opening this dialog explicitly requests it.
     }
 
-    private fun showRadioSettings(profile: BleDeviceProfile, current: RadioSettings, onSaved: (RadioSettings) -> Unit) {
+    private fun showRadioSettings(profile: BleDeviceProfile, current: RadioSettings, connectionsStayHigh: Boolean, onSaved: (RadioSettings) -> Unit) {
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24), dp(12), dp(24), dp(12))
@@ -1137,17 +1139,18 @@ class MainActivity : FragmentActivity() {
             }
         }
         val power = current.txPowerDbm?.let {
-            powerInput(if (current.idleTxPowerDbm == null) "ESP transmit power (dBm)" else "Recent-activity transmit power (dBm)", it)
+            powerInput(if (current.idleTxPowerDbm == null) "ESP transmit power (dBm)" else if (connectionsStayHigh) "Connected / recent advertising power (dBm)" else "Recent-activity transmit power (dBm)", it)
         }
-        val idlePower = current.idleTxPowerDbm?.let { powerInput("Inactive transmit power (dBm)", it) }
+        val idlePower = current.idleTxPowerDbm?.let { powerInput(if (connectionsStayHigh) "Inactive advertising power (dBm)" else "Inactive transmit power (dBm)", it) }
         layout.addView(text(when {
             power == null -> "Transmit power control requires standalone ESP firmware v2.8.8 or later."
-            idlePower == null -> "This firmware uses one fixed power level. Update to v2.8.9 for recent and inactive power levels."
-            else -> "Both power levels use the inactivity timer above. Boot, connections, disconnections and authenticated commands restart the recent-activity window. " +
+            idlePower == null -> "This firmware uses one fixed power level. Update to v2.8.10 for connected/recent and inactive advertising power."
+            !connectionsStayHigh -> "Update the standalone ESP firmware to v2.8.10 to keep connected links at high power. This older firmware also lowers connection power after inactivity."
+            else -> "Connected phone/watch links always use the high power level. Only advertising power follows the inactivity timer above. Boot, connections, disconnections and authenticated commands restart the recent-activity window. " +
                 "Initial discovery uses inactive power: the ESP cannot detect a phone or watch passively scanning. " +
                 "Health refreshes do not extend the window. OTA transfers hold recent-activity power."
         } + "\n\nHigher power can improve ESP-to-phone/watch range and uses more energy while transmitting. " +
-            "Power applies to advertising and all connected devices; lowering it may disconnect a distant phone or watch. " +
+            "Lowering the high power level may disconnect a distant phone or watch. Inactive advertising power affects discovery range. " +
             "Inactive power must not exceed recent-activity power. Choose the same value for both to keep fixed power.", 13f, false))
         layout.addView(text("Use an interval (100) or range (50-100). Higher intervals advertise less often and can delay discovery. " +
             "Intervals: 20-2000 ms, in multiples of 0.625 ms; multiples of 5 ms are easiest. Inactivity: 5-3600 seconds. " +

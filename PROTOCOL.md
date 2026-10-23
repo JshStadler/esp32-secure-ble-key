@@ -143,7 +143,7 @@ may poll it while connected. Current values are `Unknown`, `Closed`, `Open`,
 
 The existing read-only identity characteristic `a1b2c3d4-e5f6-7890-abcd-ef1234567897`
 keeps its UUID and handle. A read before authentication returns only
-`blekey|2|car-main|car|press,ota1,psk2,health1,radio1,rcp1,auth2,radio2,radio3`. On an authenticated, non-closing
+`blekey|2|car-main|car|press,ota1,psk2,health1,radio1,rcp1,auth2,radio2,radio3,linkpower1`. On an authenticated, non-closing
 connection, an explicit read appends comma-separated health fields to this
 capability list:
 The two lines below are concatenated without a newline on the wire.
@@ -247,7 +247,7 @@ controller reads omit the actual field rather than reporting a placeholder.
 These values are controller settings, not measured RF output or received RSSI.
 The existing 512-byte health limit is unchanged.
 
-## Recent and inactive transmit power (radio3, v2.8.9)
+## Recent and inactive advertising power (radio3, v2.8.10)
 
 `radio3` adds a second signed power byte to radio2. No GATT handles change.
 
@@ -266,27 +266,34 @@ power assigned to both targets. Radio1 migrates with both at +3 dBm. Older NVS
 records remain available to downgraded firmware. Old radio1 writes preserve both
 power targets; old radio2 writes deliberately select fixed power for both.
 
-The existing recent-advertising deadline also controls default, advertising and
-all connected links' power. Boot, successful/failed connection events, disconnects
+The default (non-advertising) controller power and each connected link always
+use the configured high/recent target. Only advertising power follows the
+existing recent-advertising deadline. Boot, successful/failed connection events, disconnects
 and authenticated commands restart the window. The first exposed connection
 event is its result; this cannot boost the initial advertising packet or first
 connection exchange. A passively scanning phone/watch cannot trigger a boost.
 Initial discovery after the idle deadline must therefore work at inactive power.
 Health reads and ordinary link traffic do not extend the window.
 
-The power transition runs even when all slots are occupied and advertising is
-stopped. OTA transfer holds recent power regardless of deadline. Finishing or
-aborting OTA releases that hold; its authenticated traffic has already refreshed
+Advertising may slow and use inactive power while one or more devices remain
+connected; their connection power stays high. With all connection slots occupied,
+there are no advertising packets to save power on, and every connected link stays
+high. OTA transfer also holds advertising at recent power regardless of deadline.
+Finishing/aborting OTA releases that hold; its authenticated traffic has refreshed
 the shared deadline. No new RSSI polling or periodic advertising bursts are added.
-A failed automatic transition attempts to restore the recent target on every
-link, then retries at most once every five seconds on the existing maintenance
-loop. Actual readback may therefore differ from the intended mode after an error.
+A failed automatic transition attempts to restore high advertising power and
+all high-power links, then retries at most once every five seconds on the existing
+maintenance loop. Actual readback may differ from the intended mode after an error.
 
 New health fields are `txidle` (saved inactive target) and `txmode`
-(`recent`, `inactive`, or `update`). `txdbm` remains the saved recent target for
-old app compatibility; `txadv` / `txconn` remain actual controller readbacks.
+(`recent`, `inactive`, or `update`) for advertising. `txdbm` is the saved high
+connection/recent-advertising target; `txadv` / `txconn` are actual controller
+readbacks. `linkpower1` announces that connected links always use the high target.
+The earlier 2.8.9 radio3 implementation lacks this capability and also reduced
+connected power; updated clients identify that older behavior and request an
+upgrade. The radio3 packet and NVS format are unchanged.
 A configuration save enters the recent window immediately. If saving fails,
-firmware restores the previous mode's target, including its inactive target.
+firmware restores independent previous connection and advertising power levels.
 
 ## Car PSK2 (v2.6.0)
 

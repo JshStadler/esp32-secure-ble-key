@@ -1488,10 +1488,11 @@ static int chr_access_ota_control(uint16_t conn_handle, uint16_t attr_handle,
         unsigned count = 0;
         for (int i = 0; i < MAX_CONNECTIONS; ++i)
             if (clients[i].in_use && !clients[i].closing) handles[count++] = clients[i].conn_handle;
-        const int previous = radio_power_target(&radio_config, now_ms(), fast_adv_until_ms, ota_session.active);
-        radio_update_result_t result = radio_power_update(&requested, previous, handles, count, save_radio_config);
+        const radio_config_t previous = radio_config;
+        const int previous_adv = radio_power_target(&previous, now_ms(), fast_adv_until_ms, ota_session.active);
+        radio_update_result_t result = radio_power_update(&requested, &previous, previous_adv, handles, count, save_radio_config);
         radio_power_state.applied_dbm = result == RADIO_UPDATE_OK ? requested.tx_power_dbm :
-            result == RADIO_UPDATE_RESTORE ? 127 : previous;
+            result == RADIO_UPDATE_RESTORE ? 127 : previous_adv;
         radio_power_state.retry_after_ms = 0;
         if (result != RADIO_UPDATE_OK) {
             set_ota_status(conn_handle, result == RADIO_UPDATE_SAVE ? "ERR:RADIO_SAVE" :

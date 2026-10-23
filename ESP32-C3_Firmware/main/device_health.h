@@ -6,7 +6,7 @@
 #include <inttypes.h>
 #include "radio_config.h"
 
-#define CAR_IDENTITY "blekey|2|car-main|car|press,ota1,psk2,health1,radio1,rcp1,auth2,radio2,radio3"
+#define CAR_IDENTITY "blekey|2|car-main|car|press,ota1,psk2,health1,radio1,rcp1,auth2,radio2,radio3,linkpower1"
 
 typedef struct {
     const char *version, *build, *idf, *reset, *ota;

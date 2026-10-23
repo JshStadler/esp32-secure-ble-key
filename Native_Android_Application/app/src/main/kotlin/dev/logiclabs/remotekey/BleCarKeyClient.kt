@@ -424,7 +424,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
             done(false, "Update the standalone ESP firmware to v2.8.8 for transmit power control."); return
         }
         if (settings.idleTxPowerDbm != null && !radioDualPowerSupported) {
-            done(false, "Update the standalone ESP firmware to v2.8.9 for recent and inactive power levels."); return
+            done(false, "Update the standalone ESP firmware to v2.8.10 for connected/recent and inactive advertising power."); return
         }
         if (!settings.valid() || negotiatedMtu < settings.minimumMtu) { done(false, "Invalid settings or BLE MTU too small; reconnect and try again."); return }
         radioCallback = done

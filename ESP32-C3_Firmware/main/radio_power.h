@@ -49,50 +49,58 @@ static inline bool radio_power_connection(uint16_t handle, int dbm) {
         esp_ble_tx_power_get_enhanced(ESP_BLE_ENHANCED_PWR_TYPE_CONN, handle) == level;
 }
 
-static inline bool radio_power_apply(int dbm, const uint16_t *handles, unsigned count) {
-    esp_power_level_t level = radio_power_level(dbm);
-    if (level == ESP_PWR_LVL_INVALID) return false;
-    bool ok = esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, level) == ESP_OK;
-    if (esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, level) != ESP_OK) ok = false;
-    if (esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_DEFAULT) != level ||
-        esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_ADV) != level) ok = false;
+/* Default/non-advertising traffic and every connection always use high power.
+ * Only the advertising type follows the inactivity timer. */
+static inline bool radio_power_apply_levels(int link_dbm, int advertising_dbm,
+        const uint16_t *handles, unsigned count) {
+    esp_power_level_t link = radio_power_level(link_dbm);
+    esp_power_level_t advertising = radio_power_level(advertising_dbm);
+    if (link == ESP_PWR_LVL_INVALID || advertising == ESP_PWR_LVL_INVALID) return false;
+    bool ok = esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, link) == ESP_OK;
+    if (esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, advertising) != ESP_OK) ok = false;
+    if (esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_DEFAULT) != link ||
+        esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_ADV) != advertising) ok = false;
     for (unsigned i = 0; i < count; ++i)
-        if (!radio_power_connection(handles[i], dbm)) ok = false;
+        if (!radio_power_connection(handles[i], link_dbm)) ok = false;
     return ok;
+}
+
+static inline bool radio_power_apply(int dbm, const uint16_t *handles, unsigned count) {
+    return radio_power_apply_levels(dbm, dbm, handles, count);
 }
 
 /* Never persist a power setting the controller rejected. Restore all links on
  * partial failure; callers explicitly report if that restoration also fails. */
 static inline radio_update_result_t radio_power_update(const radio_config_t *requested,
-        int previous_dbm, const uint16_t *handles, unsigned count,
+        const radio_config_t *previous, int previous_adv_dbm, const uint16_t *handles, unsigned count,
         bool (*save)(const radio_config_t *)) {
     if (!radio_config_valid(requested)) return RADIO_UPDATE_APPLY;
     bool applied = radio_power_apply(requested->tx_power_dbm, handles, count);
     if (applied && save(requested)) return RADIO_UPDATE_OK;
-    if (!radio_power_apply(previous_dbm, handles, count)) return RADIO_UPDATE_RESTORE;
+    if (!radio_power_apply_levels(previous->tx_power_dbm, previous_adv_dbm, handles, count)) return RADIO_UPDATE_RESTORE;
     return applied ? RADIO_UPDATE_SAVE : RADIO_UPDATE_APPLY;
 }
 
 typedef struct {
-    int applied_dbm; // 127 means unknown / needs reconciliation.
+    int applied_dbm; // Advertising level; 127 means unknown / needs reconciliation.
     int64_t retry_after_ms;
 } radio_power_state_t;
 #define RADIO_POWER_STATE_INITIAL {127, 0}
 
 /* Called on the BLE host queue only. No flash writes or background RSSI polling.
- * The same activity deadline drives intervals and power, including when all
- * connection slots are occupied and no advertising procedure is running. */
+ * The same deadline drives advertising intervals and advertising power.
+ * Connected links keep high power regardless of that deadline or slot count. */
 static inline bool radio_power_sync(radio_power_state_t *state, const radio_config_t *config,
         int64_t now, int64_t recent_until, bool updating, const uint16_t *handles,
         unsigned count, bool force) {
     int target = radio_power_target(config, now, recent_until, updating);
     if (!force && (now < state->retry_after_ms || state->applied_dbm == target)) return false;
-    if (radio_power_apply(target, handles, count)) {
+    if (radio_power_apply_levels(config->tx_power_dbm, target, handles, count)) {
         state->applied_dbm = target; state->retry_after_ms = 0;
         return true;
     }
-    // A failed reduction may have touched only some links. Restore the higher
-    // recent target on every link and retry the transition at most every 5s.
+    // On failure restore high advertising power and all high-power links.
+    // Retry at most every 5s; a timer never selects low connection power.
     state->applied_dbm = radio_power_apply(config->tx_power_dbm, handles, count)
         ? config->tx_power_dbm : 127;
     state->retry_after_ms = now + 5000;

@@ -420,24 +420,28 @@ Useful hardware checks after updating the standalone firmware:
 BLE modem sleep remains disabled pending a controlled hardware reliability and
 current test. No change in this release claims to solve that limitation.
 
-### 2.8.9 recent and inactive power
+### 2.8.10 connected and advertising power
 
-Android and standalone firmware 2.8.9 add two transmit power selectors under
-**Device health → Radio settings**. Recent-activity power and inactive power use
-the same inactivity duration as the fast/slow advertising intervals. Power
-switches for advertising and every connected phone/watch. Existing fixed power
-is preserved on upgrade; choose equal values to keep it fixed.
+Android and standalone firmware 2.8.10 expose two power selectors under
+**Device health → Radio settings**:
 
-The ESP boosts at a connection event, then on authenticated activity, and reduces
-power after the shared deadline. Passive scanning is invisible to the ESP: the
-first discovery and initial connection exchange still use inactive power.
-Health refreshes do not extend the window. OTA holds recent power while active.
+- High power: the default for all connected phone/watch traffic, and advertising
+  during the recent-activity window.
+- Inactive advertising power: applies only to advertising after the shared
+  inactivity deadline. Connected links always stay at the high setting.
 
-To check the transition quickly, select recent +9 dBm, inactive +3 dBm and an
-inactivity duration of 10 seconds. Keep the phone connected, confirm +9 in Device
-health, then Refresh after 10 seconds and check +3 for advertising and the current
-connection. Press once to restart the recent window, then refresh promptly to
-confirm +9. Repeat with the watch connected and verify persistence after reboot.
-Restore your preferred inactivity duration afterwards. Also try reconnecting
-from the usual distance after the ESP has been idle: its inactive power must be
-sufficient for that initial discovery.
+The timer controls advertising intervals and advertising power together. Boot,
+connection events, disconnects and authenticated activity restart its window;
+health refreshes do not. OTA holds high advertising power as well. Existing fixed
+power is preserved on upgrade; choose equal levels to keep it fixed.
+
+Initial discovery still uses inactive advertising power after the deadline:
+a passively scanning phone/watch cannot trigger a boost. Inactive power must
+therefore be sufficient to discover the ESP from your usual approach distance.
+
+For a quick check, choose high +9 dBm, inactive advertising +3 dBm and a 10-second
+inactivity duration. Keep the phone connected, confirm both at +9 in Device health,
+then Refresh after 10 seconds. Advertising should show +3 and the current
+connection should still show +9. Press once and refresh promptly to confirm
+advertising returns to +9. Repeat with phone and watch connected and verify
+persistence after reboot. Restore your preferred inactivity duration afterwards.

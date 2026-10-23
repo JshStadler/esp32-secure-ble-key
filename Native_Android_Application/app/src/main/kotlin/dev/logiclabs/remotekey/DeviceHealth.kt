@@ -11,7 +11,7 @@ data class DeviceHealth(
     val hasFirmwareHealth: Boolean = true,
     val espSignalSupported: Boolean = false,
     val advertisingTxDbm: Int? = null, val connectionTxDbm: Int? = null,
-    val powerMode: String = "fixed",
+    val powerMode: String = "fixed", val connectionPowerHeldHigh: Boolean = false,
 ) {
     fun display(): String {
         val signal = "BLE signal strength\n" +
@@ -41,7 +41,9 @@ data class DeviceHealth(
         val advertising = radio?.let { settings ->
             val power = settings.txPowerDbm?.let { recent ->
                 val targets = settings.idleTxPowerDbm?.let { idle ->
-                    "Recent activity: $recent dBm\nInactive: $idle dBm\nPower mode: $powerMode"
+                    if (connectionPowerHeldHigh) "Connected links / recent advertising: $recent dBm\n" +
+                        "Inactive advertising: $idle dBm\nAdvertising power mode: $powerMode"
+                    else "Recent activity: $recent dBm\nInactive: $idle dBm\nPower mode: $powerMode"
                 } ?: "Saved target: $recent dBm"
                 "\n\nESP transmit power\n$targets\n" +
                     "Advertising: ${advertisingTxDbm?.let { "$it dBm" } ?: "Unavailable"}\n" +
@@ -101,7 +103,7 @@ data class DeviceHealth(
                 field("reset"), field("ota"), heap, minimum, number("links", 3),
                 number("advrec"), number("ghost"), radio, if (radio == null) "unknown" else field("advmode"), espRssi = rssi,
                 espSignalSupported = true, advertisingTxDbm = signed("txadv", -24..20),
-                connectionTxDbm = signed("txconn", -24..20), powerMode = powerMode)
+                connectionTxDbm = signed("txconn", -24..20), powerMode = powerMode, connectionPowerHeldHigh = "linkpower1" in caps)
         }.getOrNull()
     }
 }
