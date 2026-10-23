@@ -315,18 +315,9 @@ typedef struct {
 static client_state_t clients[MAX_CONNECTIONS];
 static press_receipt_t press_receipts[RECEIPT_SLOTS];
 static int receipt_button_slot = -1;
-static volatile int receipt_released_slot = -1;
 static struct ble_npl_event receipt_button_event;
 static struct ble_npl_callout receipt_expiry_callout;
-
-static void receipt_button_complete(struct ble_npl_event *event) {
-    (void)event;
-    int completed = receipt_released_slot;
-    if (completed >= 0 && press_receipts[completed].result == RECEIPT_PENDING)
-        press_receipts[completed].result = RECEIPT_PRESSED;
-    if (receipt_button_slot == completed) receipt_button_slot = -1;
-    receipt_released_slot = -1;
-}
+static void receipt_button_complete(struct ble_npl_event *event);
 
 /* Split command buffer for low-MTU clients (Garmin watches) */
 typedef struct {
@@ -426,9 +417,17 @@ static void button_timer_callback(void *arg) {
     gpio_set_level(DEBUG_LED_GPIO, 0);
 #endif
 
-    button_busy = false;
-    receipt_released_slot = receipt_button_slot;
+    /* Only release hardware here. Keep all button/receipt state on the BLE
+     * host queue: a second press must not start before completion is consumed. */
     ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &receipt_button_event);
+}
+
+static void receipt_button_complete(struct ble_npl_event *event) {
+    (void)event;
+    if (receipt_button_slot >= 0 && press_receipts[receipt_button_slot].result == RECEIPT_PENDING)
+        press_receipts[receipt_button_slot].result = RECEIPT_PRESSED;
+    receipt_button_slot = -1;
+    button_busy = false;
 }
 
 static bool press_remote_button(void) {
@@ -448,6 +447,9 @@ static bool press_remote_button(void) {
     if (err != ESP_OK) {
         /* Timer failed — release GPIO immediately to avoid stuck press */
         gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
+#ifdef DEBUG_LED_ENABLED
+        gpio_set_level(DEBUG_LED_GPIO, 0);
+#endif
         button_busy = false;
         LOG_E(TAG, "Button timer start failed: %s", esp_err_to_name(err));
         return false;

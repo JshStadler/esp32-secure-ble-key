@@ -499,7 +499,7 @@ esp32_ble_server:
                       break;
                     }
                   }
-                  if (slot < 0) return;
+                  if (slot < 0 || id(gate_ble_closing)[slot]) return;
                   if (x.size() != 17) {
                     ESP_LOGW("gate_ble", "Garmin part 1 rejected: expected 17 bytes, received %u",
                              static_cast<unsigned>(x.size()));
@@ -531,7 +531,7 @@ esp32_ble_server:
                       break;
                     }
                   }
-                  if (slot < 0) return;
+                  if (slot < 0 || id(gate_ble_closing)[slot]) return;
                   if (x.size() != 16) {
                     ESP_LOGW("gate_ble", "Garmin part 2 rejected: expected 16 bytes, received %u",
                              static_cast<unsigned>(x.size()));

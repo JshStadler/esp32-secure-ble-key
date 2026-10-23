@@ -190,7 +190,7 @@ class MainActivity : FragmentActivity() {
         val profileId = pendingFirmwareProfileId
         pendingFirmwareProfileId = null
         if (uri == null) return@registerForActivityResult
-        val image = runCatching { contentResolver.openInputStream(uri)?.use { it.readBytes() } }.getOrNull()
+        val image = runCatching { contentResolver.openInputStream(uri)?.use(FirmwareImageReader::read) }.getOrNull()
         when {
             image == null -> toast("Could not read firmware file")
             image.isEmpty() || image.size > 0x1e0000 -> toast("Firmware must be 1 byte to 1,966,080 bytes")
