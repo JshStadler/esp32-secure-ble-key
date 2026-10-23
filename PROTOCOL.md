@@ -143,7 +143,7 @@ may poll it while connected. Current values are `Unknown`, `Closed`, `Open`,
 
 The existing read-only identity characteristic `a1b2c3d4-e5f6-7890-abcd-ef1234567897`
 keeps its UUID and handle. A read before authentication returns only
-`blekey|2|car-main|car|press,ota1,psk2,health1,radio1,rcp1,auth2,radio2`. On an authenticated, non-closing
+`blekey|2|car-main|car|press,ota1,psk2,health1,radio1,rcp1,auth2,radio2,radio3`. On an authenticated, non-closing
 connection, an explicit read appends comma-separated health fields to this
 capability list:
 The two lines below are concatenated without a newline on the wire.
@@ -246,6 +246,47 @@ power) and `txconn` (controller power for this connection), all in dBm. Failed
 controller reads omit the actual field rather than reporting a placeholder.
 These values are controller settings, not measured RF output or received RSSI.
 The existing 512-byte health limit is unchanged.
+
+## Recent and inactive transmit power (radio3, v2.8.9)
+
+`radio3` adds a second signed power byte to radio2. No GATT handles change.
+
+```text
+config3 = config[10] || signed_int8(recent_tx_dbm) || signed_int8(idle_tx_dbm)
+transcript = ASCII("BLEKEY-RADIO3") || 0x00 || ASCII("car-main") ||
+             0x00 || nonce[16] || config3        # 51 bytes
+packet = 0x06 || config3 || HMAC-SHA256(PSK, transcript)  # 45 bytes, MTU >= 48
+```
+
+Both levels use the existing -12..+9 dBm / 3 dB step limits; inactive power must
+not exceed recent power. Equal values keep fixed power. The two targets and
+intervals are validated, authenticated and saved together in the version-3
+`radio3` NVS blob. A valid radio2 configuration migrates with its existing fixed
+power assigned to both targets. Radio1 migrates with both at +3 dBm. Older NVS
+records remain available to downgraded firmware. Old radio1 writes preserve both
+power targets; old radio2 writes deliberately select fixed power for both.
+
+The existing recent-advertising deadline also controls default, advertising and
+all connected links' power. Boot, successful/failed connection events, disconnects
+and authenticated commands restart the window. The first exposed connection
+event is its result; this cannot boost the initial advertising packet or first
+connection exchange. A passively scanning phone/watch cannot trigger a boost.
+Initial discovery after the idle deadline must therefore work at inactive power.
+Health reads and ordinary link traffic do not extend the window.
+
+The power transition runs even when all slots are occupied and advertising is
+stopped. OTA transfer holds recent power regardless of deadline. Finishing or
+aborting OTA releases that hold; its authenticated traffic has already refreshed
+the shared deadline. No new RSSI polling or periodic advertising bursts are added.
+A failed automatic transition attempts to restore the recent target on every
+link, then retries at most once every five seconds on the existing maintenance
+loop. Actual readback may therefore differ from the intended mode after an error.
+
+New health fields are `txidle` (saved inactive target) and `txmode`
+(`recent`, `inactive`, or `update`). `txdbm` remains the saved recent target for
+old app compatibility; `txadv` / `txconn` remain actual controller readbacks.
+A configuration save enters the recent window immediately. If saving fails,
+firmware restores the previous mode's target, including its inactive target.
 
 ## Car PSK2 (v2.6.0)
 

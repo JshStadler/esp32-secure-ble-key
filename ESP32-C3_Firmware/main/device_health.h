@@ -6,7 +6,7 @@
 #include <inttypes.h>
 #include "radio_config.h"
 
-#define CAR_IDENTITY "blekey|2|car-main|car|press,ota1,psk2,health1,radio1,rcp1,auth2,radio2"
+#define CAR_IDENTITY "blekey|2|car-main|car|press,ota1,psk2,health1,radio1,rcp1,auth2,radio2,radio3"
 
 typedef struct {
     const char *version, *build, *idf, *reset, *ota;
@@ -17,6 +17,7 @@ typedef struct {
     bool rssi_valid;
     int rssi;
     int tx_adv, tx_conn;
+    const char *power_mode;
 } device_health_t;
 
 /* Extend the existing capability list so old clients and cached GATT handles
@@ -28,10 +29,11 @@ static inline int device_health_format(char *out, size_t size,
     char rssi[16] = "";
     if (h->rssi_valid && h->rssi >= -127 && h->rssi <= 20)
         snprintf(rssi, sizeof(rssi), ",rssi=%d", h->rssi);
-    char power[40] = "", adv[16] = "", conn[16] = "";
+    char power[64] = "", adv[16] = "", conn[16] = "";
     if (h->tx_adv >= -24 && h->tx_adv <= 20) snprintf(adv, sizeof(adv), ",txadv=%d", h->tx_adv);
     if (h->tx_conn >= -24 && h->tx_conn <= 20) snprintf(conn, sizeof(conn), ",txconn=%d", h->tx_conn);
-    snprintf(power, sizeof(power), ",txdbm=%d", h->radio.tx_power_dbm);
+    snprintf(power, sizeof(power), ",txdbm=%d,txidle=%d,txmode=%s",
+        h->radio.tx_power_dbm, h->radio.idle_tx_power_dbm, h->power_mode);
     return snprintf(out, size, CAR_IDENTITY
         ",fw=%s,build=%s,idf=%s,up=%" PRIu64 ",reset=%s,ota=%s"
         ",heap=%" PRIu32 ",minheap=%" PRIu32 ",links=%" PRIu32

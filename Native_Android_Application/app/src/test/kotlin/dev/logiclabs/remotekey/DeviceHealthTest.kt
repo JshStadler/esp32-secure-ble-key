@@ -87,4 +87,18 @@ class DeviceHealthTest {
         assertNull(DeviceHealth.parse(data.substringBefore(",txdbm=")))
     }
 
+    @Test fun dualPowerHealthShowsBothTargetsAndCurrentMode() {
+        val data = snapshot.replace("health1,", "health1,radio1,radio2,radio3,") +
+            ",fastmin=80,fastmax=160,slowmin=320,slowmax=640,idlesec=60,advmode=inactive,txdbm=9,txidle=-3,txmode=inactive,txadv=-3,txconn=-3"
+        val h = DeviceHealth.parse(data)!!
+        assertEquals(9, h.radio!!.txPowerDbm)
+        assertEquals(-3, h.radio.idleTxPowerDbm)
+        assertEquals("inactive", h.powerMode)
+        assertTrue(h.display().contains("Recent activity: 9 dBm\nInactive: -3 dBm\nPower mode: inactive"))
+        assertEquals("update", DeviceHealth.parse(data.replace("txmode=inactive", "txmode=update"))!!.powerMode)
+        listOf(data.replace("txidle=-3", "txidle=10"), data.replace("txdbm=9", "txdbm=-6"),
+            data.replace("txmode=inactive", "txmode=bad"), data.replace(",txidle=-3", ""),
+            data.replace(",txmode=inactive", "")).forEach { assertNull(it, DeviceHealth.parse(it)) }
+    }
+
 }

@@ -11,6 +11,7 @@ data class DeviceHealth(
     val hasFirmwareHealth: Boolean = true,
     val espSignalSupported: Boolean = false,
     val advertisingTxDbm: Int? = null, val connectionTxDbm: Int? = null,
+    val powerMode: String = "fixed",
 ) {
     fun display(): String {
         val signal = "BLE signal strength\n" +
@@ -37,11 +38,18 @@ data class DeviceHealth(
             "ota_health_failure" -> "OTA health check failed"
             else -> resetReason.replace('_', ' ')
         }
-        val advertising = radio?.let { "\n\nAdvertising: $advertisingMode\nRecent activity: ${it.recentText()} ms\n" +
-            "Inactive: ${it.inactiveText()} ms\nInactivity before slowing: ${it.idleSeconds}s" +
-            if (it.txPowerDbm == null) "" else "\n\nESP transmit power\nSaved target: ${it.txPowerDbm} dBm\n" +
-                "Advertising: ${advertisingTxDbm?.let { dbm -> "$dbm dBm" } ?: "Unavailable"}\n" +
-                "This connection: ${connectionTxDbm?.let { dbm -> "$dbm dBm" } ?: "Unavailable"}" }.orEmpty()
+        val advertising = radio?.let { settings ->
+            val power = settings.txPowerDbm?.let { recent ->
+                val targets = settings.idleTxPowerDbm?.let { idle ->
+                    "Recent activity: $recent dBm\nInactive: $idle dBm\nPower mode: $powerMode"
+                } ?: "Saved target: $recent dBm"
+                "\n\nESP transmit power\n$targets\n" +
+                    "Advertising: ${advertisingTxDbm?.let { "$it dBm" } ?: "Unavailable"}\n" +
+                    "This connection: ${connectionTxDbm?.let { "$it dBm" } ?: "Unavailable"}"
+            }.orEmpty()
+            "\n\nAdvertising: $advertisingMode\nRecent activity: ${settings.recentText()} ms\n" +
+                "Inactive: ${settings.inactiveText()} ms\nInactivity before slowing: ${settings.idleSeconds}s$power"
+        }.orEmpty()
         return "$signal\n\nFirmware: $firmware\nBuild: $build\nOTA status: $ota\n\n" +
             "Uptime: ${uptimeSeconds / 86400}d ${uptimeSeconds / 3600 % 24}h ${uptimeSeconds / 60 % 60}m ${uptimeSeconds % 60}s\n" +
             "Last reset: $reset\n\n" +
@@ -79,9 +87,12 @@ data class DeviceHealth(
                 it.toInt().also { n -> require(n in range) }
             }
             val tx = if ("radio2" in caps) signed("txdbm", -12..9).also { require(it != null) } else null
+            val dualPower = "radio3" in caps
+            val idleTx = if (dualPower) signed("txidle", -12..9).also { require(it != null) } else null
+            val powerMode = if (dualPower) field("txmode").also { require(it in listOf("recent", "inactive", "update")) } else "fixed"
             val radio = if ("radio1" in caps) RadioSettings(number("fastmin", 3200).toInt(),
                 number("fastmax", 3200).toInt(), number("slowmin", 3200).toInt(),
-                number("slowmax", 3200).toInt(), number("idlesec", 3600).toInt(), tx).also { require(it.valid()) } else null
+                number("slowmax", 3200).toInt(), number("idlesec", 3600).toInt(), tx, idleTx).also { require(it.valid()) } else null
             val rssi = fields["rssi"]?.let { value ->
                 require(value.matches(Regex("-?[0-9]{1,3}")))
                 value.toInt().also { require(it in -127..20) }
@@ -90,7 +101,7 @@ data class DeviceHealth(
                 field("reset"), field("ota"), heap, minimum, number("links", 3),
                 number("advrec"), number("ghost"), radio, if (radio == null) "unknown" else field("advmode"), espRssi = rssi,
                 espSignalSupported = true, advertisingTxDbm = signed("txadv", -24..20),
-                connectionTxDbm = signed("txconn", -24..20))
+                connectionTxDbm = signed("txconn", -24..20), powerMode = powerMode)
         }.getOrNull()
     }
 }

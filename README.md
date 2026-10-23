@@ -419,3 +419,25 @@ Useful hardware checks after updating the standalone firmware:
 
 BLE modem sleep remains disabled pending a controlled hardware reliability and
 current test. No change in this release claims to solve that limitation.
+
+### 2.8.9 recent and inactive power
+
+Android and standalone firmware 2.8.9 add two transmit power selectors under
+**Device health → Radio settings**. Recent-activity power and inactive power use
+the same inactivity duration as the fast/slow advertising intervals. Power
+switches for advertising and every connected phone/watch. Existing fixed power
+is preserved on upgrade; choose equal values to keep it fixed.
+
+The ESP boosts at a connection event, then on authenticated activity, and reduces
+power after the shared deadline. Passive scanning is invisible to the ESP: the
+first discovery and initial connection exchange still use inactive power.
+Health refreshes do not extend the window. OTA holds recent power while active.
+
+To check the transition quickly, select recent +9 dBm, inactive +3 dBm and an
+inactivity duration of 10 seconds. Keep the phone connected, confirm +9 in Device
+health, then Refresh after 10 seconds and check +3 for advertising and the current
+connection. Press once to restart the recent window, then refresh promptly to
+confirm +9. Repeat with the watch connected and verify persistence after reboot.
+Restore your preferred inactivity duration afterwards. Also try reconnecting
+from the usual distance after the ESP has been idle: its inactive power must be
+sufficient for that initial discovery.

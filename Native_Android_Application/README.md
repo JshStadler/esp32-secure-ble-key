@@ -178,3 +178,16 @@ Phone RSSI requests are on demand. A timed-out or canceled controller request
 is quarantined until its callback arrives or the GATT connection is discarded;
 late callbacks cannot fulfill a newer measurement. Optional RSSI failure does
 not prevent key commands or the ESP health snapshot.
+
+### Two power levels (2.8.9)
+
+Firmware 2.8.9 exposes recent-activity and inactive transmit power independently.
+Both use the existing inactivity duration. Idle must not exceed recent; choosing
+equal values retains fixed power. Existing firmware/settings keep their previous
+behavior on upgrade. Older firmware still shows its fixed power selector.
+
+Boot, connection results, disconnects and authenticated commands restart the
+recent window. The ESP cannot detect passive scanning, so idle power determines
+initial discovery range. Health snapshots do not restart the timer. OTA holds
+recent power until the transfer ends. Health shows both saved targets, the
+intended mode and actual advertising/current-link power separately.

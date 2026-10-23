@@ -61,4 +61,35 @@ class RadioSettingsTest {
         assertEquals(43, settings.copy(txPowerDbm = null).packet(nonce, "test-key").size)
     }
 
+    @Test fun dualPowerAuthenticatesBothTargetsAndRetainsOlderWireVersions() {
+        val settings = RadioSettings.DEFAULT.copy(txPowerDbm = 9, idleTxPowerDbm = -3)
+        val nonce = ByteArray(16) { it.toByte() }
+        val packet = settings.packet(nonce, "test-key")
+        assertTrue(settings.valid())
+        assertEquals(3, settings.wireVersion)
+        assertEquals(48, settings.minimumMtu)
+        assertEquals(45, packet.size)
+        assertEquals(6.toByte(), packet[0])
+        assertEquals(9.toByte(), packet[11])
+        assertEquals((-3).toByte(), packet[12])
+        assertEquals("593a0fc317602662aeb9877d5f8e95ff3ec3e0f01fdaada82035e2ed0b64e280", packet.copyOfRange(13, 45).joinToString("") { "%02x".format(it) })
+        assertFalse(packet.contentEquals(settings.copy(idleTxPowerDbm = 0).packet(nonce, "test-key")))
+        assertFalse(packet.contentEquals(settings.copy(txPowerDbm = 6).packet(nonce, "test-key")))
+        assertFalse(packet.contentEquals(settings.packet(ByteArray(16), "test-key")))
+        assertEquals(2, settings.copy(idleTxPowerDbm = null).wireVersion)
+        assertEquals(47, settings.copy(idleTxPowerDbm = null).minimumMtu)
+        assertEquals(1, RadioSettings.DEFAULT.wireVersion)
+        assertEquals(46, RadioSettings.DEFAULT.minimumMtu)
+    }
+    @Test fun inactivePowerCannotExceedRecentPowerAndEqualPowerStaysValid() {
+        RadioSettings.TX_POWER_LEVELS.forEach { recent ->
+            RadioSettings.TX_POWER_LEVELS.forEach { idle ->
+                assertEquals(idle <= recent, RadioSettings.DEFAULT.copy(txPowerDbm = recent, idleTxPowerDbm = idle).valid())
+            }
+        }
+        assertFalse(RadioSettings.DEFAULT.copy(idleTxPowerDbm = 3).valid())
+        assertFalse(RadioSettings.DEFAULT.copy(txPowerDbm = 9, idleTxPowerDbm = 1).valid())
+        assertTrue(runCatching { RadioSettings.DEFAULT.copy(txPowerDbm = 3, idleTxPowerDbm = 9).encode() }.isFailure)
+    }
+
 }

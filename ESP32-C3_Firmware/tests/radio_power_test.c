@@ -38,23 +38,23 @@ int main(void) {
     const radio_config_t previous = RADIO_DEFAULTS;
     radio_config_t requested = previous; requested.tx_power_dbm = 9;
     reset();
-    assert(radio_power_update(&requested, &previous, handles, 3, save) == RADIO_UPDATE_OK);
+    assert(radio_power_update(&requested, previous.tx_power_dbm, handles, 3, save) == RADIO_UPDATE_OK);
     assert(saves == 1); all(ESP_PWR_LVL_P9);
     for (int failure = 1; failure <= 5; ++failure) {
         reset(); fail_call = failure;
-        assert(radio_power_update(&requested, &previous, handles, 3, save) == RADIO_UPDATE_APPLY);
+        assert(radio_power_update(&requested, previous.tx_power_dbm, handles, 3, save) == RADIO_UPDATE_APPLY);
         assert(saves == 0); all(ESP_PWR_LVL_P3);
     }
     reset(); save_ok = false;
-    assert(radio_power_update(&requested, &previous, handles, 3, save) == RADIO_UPDATE_SAVE);
+    assert(radio_power_update(&requested, previous.tx_power_dbm, handles, 3, save) == RADIO_UPDATE_SAVE);
     assert(saves == 1); all(ESP_PWR_LVL_P3);
     reset(); bad_readback = true;
-    assert(radio_power_update(&requested, &previous, handles, 3, save) == RADIO_UPDATE_APPLY);
+    assert(radio_power_update(&requested, previous.tx_power_dbm, handles, 3, save) == RADIO_UPDATE_APPLY);
     assert(saves == 0); all(ESP_PWR_LVL_P3);
     reset(); save_ok = false; fail_restore = true;
-    assert(radio_power_update(&requested, &previous, handles, 3, save) == RADIO_UPDATE_RESTORE);
+    assert(radio_power_update(&requested, previous.tx_power_dbm, handles, 3, save) == RADIO_UPDATE_RESTORE);
     reset(); requested.tx_power_dbm = 10;
-    assert(radio_power_update(&requested, &previous, handles, 3, save) == RADIO_UPDATE_APPLY);
+    assert(radio_power_update(&requested, previous.tx_power_dbm, handles, 3, save) == RADIO_UPDATE_APPLY);
     assert(calls == 0 && saves == 0);
     for (int dbm = -12; dbm <= 9; dbm += 3) {
         reset(); assert(radio_power_apply(dbm, handles, 3));
@@ -62,5 +62,46 @@ int main(void) {
         assert(radio_power_dbm(levels[4]) == dbm);
     }
     assert(radio_power_dbm(ESP_PWR_LVL_INVALID) == 127);
+    // Shared deadline switches every link even with no advertising procedure.
+    radio_config_t dual = previous; dual.tx_power_dbm = 9; dual.idle_tx_power_dbm = 3;
+    radio_power_state_t state = RADIO_POWER_STATE_INITIAL;
+    reset();
+    assert(radio_power_sync(&state, &dual, 0, 60000, false, handles, 3, false));
+    all(ESP_PWR_LVL_P9); assert(calls == 5);
+    assert(!radio_power_sync(&state, &dual, 59999, 60000, false, handles, 3, false));
+    assert(calls == 5);
+    assert(radio_power_sync(&state, &dual, 60000, 60000, false, handles, 3, false));
+    all(ESP_PWR_LVL_P3);
+    // Activity extends deadline; a callback for the old deadline cannot lower it.
+    assert(radio_power_sync(&state, &dual, 60001, 120001, false, handles, 3, false));
+    assert(!radio_power_sync(&state, &dual, 60002, 120001, false, handles, 3, false));
+    all(ESP_PWR_LVL_P9);
+    // A newly allocated controller handle still needs applying in the same phase.
+    levels[4] = ESP_PWR_LVL_P3;
+    assert(radio_power_sync(&state, &dual, 60002, 120001, false, handles, 3, true));
+    all(ESP_PWR_LVL_P9);
+    // OTA holds high even past deadline; finishing releases it without a reboot.
+    assert(!radio_power_sync(&state, &dual, 120002, 120001, true, handles, 3, false));
+    all(ESP_PWR_LVL_P9);
+    assert(radio_power_sync(&state, &dual, 120003, 120001, false, handles, 3, false));
+    all(ESP_PWR_LVL_P3);
+    // Failed idle transition restores every link to recent power; bounded retry.
+    state = (radio_power_state_t)RADIO_POWER_STATE_INITIAL;
+    reset(); fail_call = 3;
+    assert(!radio_power_sync(&state, &dual, 100, 100, false, handles, 3, false));
+    all(ESP_PWR_LVL_P9); assert(state.retry_after_ms == 5100);
+    int before = calls;
+    assert(!radio_power_sync(&state, &dual, 5099, 100, false, handles, 3, false));
+    assert(calls == before);
+    assert(radio_power_sync(&state, &dual, 5100, 100, false, handles, 3, false));
+    all(ESP_PWR_LVL_P3);
+    reset(); fail_call = 1; bad_readback = true;
+    state = (radio_power_state_t)RADIO_POWER_STATE_INITIAL;
+    assert(!radio_power_sync(&state, &dual, 100, 100, false, handles, 3, false));
+    assert(state.applied_dbm == 127 && state.retry_after_ms == 5100);
+    // Saving during inactive mode restores inactive power if persistence fails.
+    reset(); save_ok = false;
+    assert(radio_power_update(&dual, 0, handles, 3, save) == RADIO_UPDATE_SAVE);
+    all(ESP_PWR_LVL_N0);
     return 0;
 }

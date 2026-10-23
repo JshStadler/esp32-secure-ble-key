@@ -64,11 +64,37 @@ static inline bool radio_power_apply(int dbm, const uint16_t *handles, unsigned 
 /* Never persist a power setting the controller rejected. Restore all links on
  * partial failure; callers explicitly report if that restoration also fails. */
 static inline radio_update_result_t radio_power_update(const radio_config_t *requested,
-        const radio_config_t *previous, const uint16_t *handles, unsigned count,
+        int previous_dbm, const uint16_t *handles, unsigned count,
         bool (*save)(const radio_config_t *)) {
     if (!radio_config_valid(requested)) return RADIO_UPDATE_APPLY;
     bool applied = radio_power_apply(requested->tx_power_dbm, handles, count);
     if (applied && save(requested)) return RADIO_UPDATE_OK;
-    if (!radio_power_apply(previous->tx_power_dbm, handles, count)) return RADIO_UPDATE_RESTORE;
+    if (!radio_power_apply(previous_dbm, handles, count)) return RADIO_UPDATE_RESTORE;
     return applied ? RADIO_UPDATE_SAVE : RADIO_UPDATE_APPLY;
+}
+
+typedef struct {
+    int applied_dbm; // 127 means unknown / needs reconciliation.
+    int64_t retry_after_ms;
+} radio_power_state_t;
+#define RADIO_POWER_STATE_INITIAL {127, 0}
+
+/* Called on the BLE host queue only. No flash writes or background RSSI polling.
+ * The same activity deadline drives intervals and power, including when all
+ * connection slots are occupied and no advertising procedure is running. */
+static inline bool radio_power_sync(radio_power_state_t *state, const radio_config_t *config,
+        int64_t now, int64_t recent_until, bool updating, const uint16_t *handles,
+        unsigned count, bool force) {
+    int target = radio_power_target(config, now, recent_until, updating);
+    if (!force && (now < state->retry_after_ms || state->applied_dbm == target)) return false;
+    if (radio_power_apply(target, handles, count)) {
+        state->applied_dbm = target; state->retry_after_ms = 0;
+        return true;
+    }
+    // A failed reduction may have touched only some links. Restore the higher
+    // recent target on every link and retry the transition at most every 5s.
+    state->applied_dbm = radio_power_apply(config->tx_power_dbm, handles, count)
+        ? config->tx_power_dbm : 127;
+    state->retry_after_ms = now + 5000;
+    return false;
 }

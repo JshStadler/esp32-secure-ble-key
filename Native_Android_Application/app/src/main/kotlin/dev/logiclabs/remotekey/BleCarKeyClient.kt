@@ -76,6 +76,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
     private var gateSignalSupported = false
     private var radioSupported = false
     private var radioPowerSupported = false
+    private var radioDualPowerSupported = false
     private var healthCallback: ((DeviceHealth?, String?) -> Unit)? = null
     private var healthGeneration = 0
     private var radioCallback: ((Boolean, String) -> Unit)? = null
@@ -290,6 +291,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
                 gateSignalSupported = profile.type == BleDeviceType.ESPHOME_ACCESS && "signal1" in caps
                 radioSupported = "radio1" in caps
                 radioPowerSupported = "radio2" in caps
+                radioDualPowerSupported = "radio3" in caps
                 compactAuthSupported = "auth2" in caps && receipt != null
             }
         }
@@ -421,7 +423,10 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         if (settings.txPowerDbm != null && !radioPowerSupported) {
             done(false, "Update the standalone ESP firmware to v2.8.8 for transmit power control."); return
         }
-        if (!settings.valid() || negotiatedMtu < (if (settings.txPowerDbm == null) 46 else 47)) { done(false, "Invalid settings or BLE MTU too small; reconnect and try again."); return }
+        if (settings.idleTxPowerDbm != null && !radioDualPowerSupported) {
+            done(false, "Update the standalone ESP firmware to v2.8.9 for recent and inactive power levels."); return
+        }
+        if (!settings.valid() || negotiatedMtu < settings.minimumMtu) { done(false, "Invalid settings or BLE MTU too small; reconnect and try again."); return }
         radioCallback = done
         radioResponse = null
         radioWritePending = true
@@ -748,7 +753,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         otaControl = null; otaData = null; otaStatus = null; deviceState = null
         receipt = null; receiptBusy = false; compactAuth = null; compactAuthSupported = false
         phoneRssi = null; phoneRssiRequest.reset()
-        nonce = null; ready = false; securePskSupported = false; healthSupported = false; gateSignalSupported = false; radioSupported = false; radioPowerSupported = false
+        nonce = null; ready = false; securePskSupported = false; healthSupported = false; gateSignalSupported = false; radioSupported = false; radioPowerSupported = false; radioDualPowerSupported = false
         pendingCommand = null; commandWritePending = false; pendingStatus = null; commandGeneration++
         pskRequest?.receiptKey?.fill(0); pskRequest = null; pendingNewPsk = null
         otaImage = null; otaInFlight = false; otaChunkPending = false; otaResponse = null; otaGeneration++
