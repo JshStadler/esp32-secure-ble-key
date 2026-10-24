@@ -12,14 +12,16 @@ android {
         applicationId = "dev.logiclabs.remotekey"
         minSdk = 24
         targetSdk = 36
-        versionCode = 38
-        versionName = "2.8.12"
+        versionCode = 39
+        versionName = "2.8.13"
         manifestPlaceholders["appLabel"] = "Remote Key"
     }
 
     buildFeatures {
         buildConfig = true
     }
+
+    testOptions.unitTests.isIncludeAndroidResources = true
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -50,10 +52,15 @@ android {
     }
 }
 
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    systemProperty("blekey.layoutReportsDir", layout.buildDirectory.dir("reports/scaling").get().asFile.absolutePath)
+}
+
 dependencies {
     implementation("androidx.activity:activity:1.12.4")
     implementation("androidx.biometric:biometric:1.1.0")
     implementation("androidx.fragment:fragment:1.8.9")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
+    testImplementation("org.robolectric:robolectric:4.16.1")
 }

@@ -68,6 +68,7 @@ class MainActivity : FragmentActivity() {
         var state: BleCarKeyClient.State = BleCarKeyClient.State.DISCONNECTED,
         var message: String = "Idle",
         var ready: Boolean = false,
+        var hasConnected: Boolean = false,
         var deviceState: String? = null,
         var uncertainOutcome: String? = null,
     )
@@ -361,7 +362,8 @@ class MainActivity : FragmentActivity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(4), 0, dp(4))
         }
-        bar.addView(text("Remote Key", 23f, true), LinearLayout.LayoutParams(0, dp(64), 1f))
+        bar.minimumHeight = dp(72)
+        bar.addView(text("Remote Key", 23f, true), LinearLayout.LayoutParams(0, -2, 1f))
         bar.addView(
             iconButton(R.drawable.ic_logs, "Logs") { startActivity(Intent(this, LogActivity::class.java)) },
             LinearLayout.LayoutParams(dp(48), dp(48)),
@@ -370,7 +372,7 @@ class MainActivity : FragmentActivity() {
             iconButton(R.drawable.ic_settings, "App settings") { showAppSettings() },
             LinearLayout.LayoutParams(dp(48), dp(48)),
         )
-        page.addView(bar, LinearLayout.LayoutParams(-1, dp(72)))
+        page.addView(bar, LinearLayout.LayoutParams(-1, -2))
 
         bluetoothBanner = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -379,14 +381,14 @@ class MainActivity : FragmentActivity() {
         }
         bluetoothBannerText = text("", 15f, true).also { bluetoothBanner!!.addView(it) }
         bluetoothBannerAction = primaryButton("Turn on Bluetooth") { requestBluetoothEnable() }.also {
-            bluetoothBanner!!.addView(it, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(8) })
+            bluetoothBanner!!.addView(it, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
         }
         page.addView(bluetoothBanner, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
         updateBluetoothBanner()
 
         page.addView(sectionLabel("Devices").apply { setPadding(0, dp(8), 0, dp(8)) })
         profiles.forEach { profile ->
-            page.addView(buildDeviceCard(profile, surface), LinearLayout.LayoutParams(-1, dp(108)).apply {
+            page.addView(buildDeviceCard(profile, surface), LinearLayout.LayoutParams(-1, -2).apply {
                 bottomMargin = dp(12)
             })
         }
@@ -396,7 +398,7 @@ class MainActivity : FragmentActivity() {
                 gravity = Gravity.CENTER
                 setPadding(dp(12), dp(24), dp(12), dp(32))
             })
-            page.addView(primaryButton("Add device") { showAddDevice() }, LinearLayout.LayoutParams(-1, dp(48)))
+            page.addView(primaryButton("Add device") { showAddDevice() }, LinearLayout.LayoutParams(-1, -2))
         }
 
         page.addView(text("Nearby devices stay connected while app is open", 13f, false).apply {
@@ -423,9 +425,9 @@ class MainActivity : FragmentActivity() {
                         onAppAuthenticated()
                     }
                 }
-            }, LinearLayout.LayoutParams(dp(180), dp(52)))
+            }, LinearLayout.LayoutParams(-1, -2))
             addView(primaryButton("Privacy policy") { showPrivacyPolicy() },
-                LinearLayout.LayoutParams(dp(180), dp(52)).apply { topMargin = dp(12) })
+                LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
         }
         root.addView(authOverlay, FrameLayout.LayoutParams(-1, -1))
         updateAllDeviceViews()
@@ -433,12 +435,9 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun buildDeviceCard(profile: BleDeviceProfile, surface: Int): View {
-        val card = LinearLayout(this).apply {
+        val details = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(16), dp(12), dp(12), dp(12))
-            background = rounded(surface, 18f)
-            elevation = dp(2).toFloat()
         }
         val statusIcon = ImageButton(this).apply {
             setImageResource(if (profile.type == BleDeviceType.ESPHOME_ACCESS) R.drawable.ic_gate else R.drawable.ic_car)
@@ -448,7 +447,7 @@ class MainActivity : FragmentActivity() {
             background = selectableBorderlessBackground()
             setOnClickListener { showDeviceSettingsAuthenticated(profile) }
         }
-        card.addView(statusIcon, LinearLayout.LayoutParams(dp(48), dp(48)))
+        details.addView(statusIcon, LinearLayout.LayoutParams(dp(48), dp(48)))
 
         val labels = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -457,14 +456,16 @@ class MainActivity : FragmentActivity() {
         labels.addView(text(profile.displayName, 17f, true))
         val status = text("Idle", 13f, false).apply {
             setTextColor(Color.rgb(184, 186, 198))
-            maxLines = 2
         }
         labels.addView(status)
-        card.addView(labels, LinearLayout.LayoutParams(0, -2, 1f))
+        details.addView(labels, LinearLayout.LayoutParams(0, -2, 1f))
 
         val shortAction = profile.actionLabel.substringBefore(' ')
         val action = primaryButton(shortAction) { requestPress(profile) }
-        card.addView(action, LinearLayout.LayoutParams(dp(100), dp(52)))
+        val card = DeviceCardLayout(this, details, action, status).apply {
+            background = rounded(surface, 18f)
+            elevation = dp(2).toFloat()
+        }
         deviceViews[profile.id] = DeviceViews(statusIcon, status, action)
         return card
     }
@@ -646,10 +647,7 @@ class MainActivity : FragmentActivity() {
             EventLog.add(this@MainActivity, EventLog.Kind.DIAGNOSTIC, "${profile.displayName} ${state.name}: $message", deviceId = profile.id, deviceName = profile.displayName)
             val runtime = runtimes.getValue(profile.id)
             runtime.state = state
-            runtime.message = when {
-                state == BleCarKeyClient.State.DISCONNECTED && message == "Disconnected" -> "Idle"
-                else -> message
-            }
+            runtime.message = ConnectionStatusText.label(state, message, runtime.hasConnected)
             if (state != BleCarKeyClient.State.CONNECTED) runtime.ready = false
             updateDeviceView(profile.id)
             if (message.contains("scan fallback")) {
@@ -666,7 +664,10 @@ class MainActivity : FragmentActivity() {
             if (!current()) return@runOnUiThread
             val runtime = runtimes.getValue(profile.id)
             runtime.ready = ready
-            if (ready) runtime.message = "Ready"
+            if (ready) {
+                runtime.hasConnected = true
+                runtime.message = "Ready"
+            }
             updateDeviceView(profile.id)
             if (ready && healthDeviceId == profile.id && pendingPressId == null) healthFetch?.invoke()
             if (ready && pendingPressId == profile.id && !pressDispatched) {
@@ -979,6 +980,7 @@ class MainActivity : FragmentActivity() {
         clients.remove(deviceId)?.stop(true)
         runtimes[deviceId]?.apply {
             ready = false
+            hasConnected = false
             state = BleCarKeyClient.State.DISCONNECTED
             message = "Idle"
         }
@@ -994,19 +996,24 @@ class MainActivity : FragmentActivity() {
     private fun updateDeviceView(deviceId: String) {
         val runtime = runtimes[deviceId] ?: return
         val views = deviceViews[deviceId] ?: return
+        val connected = runtime.state == BleCarKeyClient.State.CONNECTED
+        val pendingTap = pendingPressId == deviceId && !pressDispatched && pendingPskValue == null && pendingOtaImage == null
         views.statusText.text = when {
             bluetoothAvailability != BluetoothAvailability.AVAILABLE ->
                 listOfNotNull(bluetoothAvailability.message, runtime.uncertainOutcome).joinToString("\n")
             runtime.uncertainOutcome != null -> runtime.uncertainOutcome
-            runtime.ready && runtime.deviceState != null -> "${runtime.deviceState} • Connected"
+            pendingTap -> "Connecting (up to 10s)…"
+            connected && pendingPressId == deviceId -> runtime.message
+            connected && runtime.deviceState != null -> "${runtime.deviceState} • Connected"
             runtime.deviceState != null -> "${runtime.message}\nLast state: ${runtime.deviceState}"
             else -> runtime.message
         }
         views.statusIcon.imageTintList = ColorStateList.valueOf(
             when {
                 bluetoothAvailability != BluetoothAvailability.AVAILABLE -> Color.rgb(255, 170, 30)
-                runtime.ready -> Color.rgb(38, 196, 104)
-                runtime.state == BleCarKeyClient.State.SCANNING || runtime.state == BleCarKeyClient.State.CONNECTING -> Color.rgb(255, 170, 30)
+                connected -> Color.rgb(38, 196, 104)
+                runtime.state == BleCarKeyClient.State.SCANNING || runtime.state == BleCarKeyClient.State.CONNECTING ||
+                    runtime.state == BleCarKeyClient.State.RETRYING -> Color.rgb(255, 170, 30)
                 runtime.message == "Command completed" -> Color.rgb(38, 196, 104)
                 runtime.message.contains("failed", true) || runtime.message.contains("timed out", true) -> Color.rgb(219, 68, 75)
                 else -> Color.rgb(132, 136, 153)
@@ -1280,7 +1287,7 @@ class MainActivity : FragmentActivity() {
         if (store.get(pskJournalKey(profile)) != null) {
             layout.addView(primaryButton("Recover interrupted PSK change") {
                 recoverPskChange(profile)
-            }, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dp(8) })
+            }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         }
         val pskActionLabel = when {
             runtime.psk.isEmpty() -> "Set PSK on app"
@@ -1289,13 +1296,13 @@ class MainActivity : FragmentActivity() {
         }
         layout.addView(primaryButton(pskActionLabel) {
             showPskEditor(profile, recovery = false, onSaved)
-        }, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dp(8) })
+        }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         if (runtime.psk.isNotEmpty() && profile.supportsRemotePskUpdate) {
             layout.addView(primaryButton("Change PSK saved on app") {
                 authenticate("Authenticate for PSK recovery") { ok ->
                     if (ok) showPskEditor(profile, recovery = true, onSaved)
                 }
-            }, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dp(8) })
+            }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
             layout.addView(text(
                 "The ESP-and-app change requires the existing PSK. The app-only option replaces this phone's saved copy and does not change the ESP.",
                 12f,
@@ -1316,10 +1323,10 @@ class MainActivity : FragmentActivity() {
             LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         layout.addView(primaryButton("Reconnect") {
             if (restartDeviceConnection(profile, false)) settingsDialog.dismiss()
-        }, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dp(8) })
+        }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         layout.addView(primaryButton("Rescan for this device") {
             if (restartDeviceConnection(profile, true)) settingsDialog.dismiss()
-        }, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dp(8) })
+        }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         layout.addView(sectionLabel("History"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
         layout.addView(locationSwitch, LinearLayout.LayoutParams(-1, -2))
         layout.addView(text(
@@ -1333,7 +1340,7 @@ class MainActivity : FragmentActivity() {
         layout.addView(primaryButton("Device health and BLE signal") {
             settingsDialog.dismiss()
             showDeviceHealth(profile)
-        }, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(4) })
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
         if (profile.supportsBleOta) {
             layout.addView(primaryButton("Update ESP firmware (.bin)") {
                 pendingFirmwareProfileId = profile.id
@@ -1343,7 +1350,7 @@ class MainActivity : FragmentActivity() {
                 // firmware preparation or an active transfer.
                 settingsDialog.dismiss()
                 firmwareFileLauncher.launch(arrayOf("application/octet-stream", "*/*"))
-            }, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(4) })
+            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
         }
         layout.addView(primaryButton("Remove device") {
             AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
@@ -1352,7 +1359,7 @@ class MainActivity : FragmentActivity() {
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Remove") { _, _ -> removeDevice(profile) }
                 .show()
-        }, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(20) })
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(20) })
         val scroll = ScrollView(this).apply {
             isFillViewport = true
             addView(layout, FrameLayout.LayoutParams(-1, -2))
@@ -1431,7 +1438,7 @@ class MainActivity : FragmentActivity() {
             next.setText(generated)
             confirm?.setText(generated)
             showGeneratedPsk(generated)
-        }, LinearLayout.LayoutParams(-1, dp(48)))
+        }, LinearLayout.LayoutParams(-1, -2))
 
         AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
             .setTitle(when {
@@ -1635,7 +1642,7 @@ class MainActivity : FragmentActivity() {
                 .setNegativeButton("Cancel", null)
                 .show()
         }
-        options.addView(durationButton, LinearLayout.LayoutParams(-1, dp(48)))
+        options.addView(durationButton, LinearLayout.LayoutParams(-1, -2))
         options.addView(text("Shorter durations reduce background Bluetooth use. A press, key change, firmware selection or transfer already in progress is allowed to finish.", 12f, false),
             LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
         options.addView(sectionLabel("Devices"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
@@ -1643,18 +1650,18 @@ class MainActivity : FragmentActivity() {
             persistSettings()
             settingsDialog.dismiss()
             showAddDevice()
-        }, LinearLayout.LayoutParams(-1, dp(48)))
+        }, LinearLayout.LayoutParams(-1, -2))
         options.addView(sectionLabel("Privacy and support"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
-        options.addView(primaryButton("Connection notifications") { showConnectionNotifications() }, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dp(8) })
-        options.addView(primaryButton("Privacy policy") { showPrivacyPolicy() }, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dp(8) })
+        options.addView(primaryButton("Connection notifications") { showConnectionNotifications() }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+        options.addView(primaryButton("Privacy policy") { showPrivacyPolicy() }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         options.addView(primaryButton("Contact support") {
             runCatching {
                 startActivity(Intent(Intent.ACTION_SENDTO, "mailto:info@6675162.xyz".toUri())
                     .putExtra(Intent.EXTRA_SUBJECT, "Remote Key support"))
             }.onFailure { toast("Email info@6675162.xyz for support") }
-        }, LinearLayout.LayoutParams(-1, dp(48)))
+        }, LinearLayout.LayoutParams(-1, -2))
         options.addView(primaryButton("Copy support summary") { copySupportSummary() },
-            LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(8) })
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
         options.addView(text("Includes versions, Bluetooth state and the last Device health signal readings, labelled with their age. No keys, device names, addresses, locations or logs.", 12f, false),
             LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
         options.addView(sectionLabel("About"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
@@ -1888,7 +1895,7 @@ class MainActivity : FragmentActivity() {
                 @Suppress("DEPRECATION")
                 manager.requestSingleUpdate(provider, listener, Looper.getMainLooper())
             }
-            } catch (_: SecurityException) {
+        } catch (_: SecurityException) {
             // Android can revoke while-in-use location access after Home/Recents.
             // Optional location must not interrupt an already successful press.
             EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Location not recorded: Android denied location access", deviceId = profile.id, deviceName = profile.displayName)
@@ -1944,9 +1951,10 @@ class MainActivity : FragmentActivity() {
         text = label
         isAllCaps = false
         textSize = 14f
+        minimumHeight = dp(48)
         setTextColor(Color.WHITE)
         background = rounded(Color.rgb(64, 103, 172), 22f)
-        setPadding(dp(10), 0, dp(10), 0)
+        setPadding(dp(12), dp(10), dp(12), dp(10))
         setOnClickListener { action() }
     }
 

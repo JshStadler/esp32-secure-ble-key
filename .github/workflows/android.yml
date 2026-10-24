@@ -32,6 +32,7 @@ jobs:
           name: android-verification-reports
           path: |
             Native_Android_Application/app/build/reports/tests/
+            Native_Android_Application/app/build/reports/scaling/
             Native_Android_Application/app/build/reports/lint-results-debug.html
 
   release:

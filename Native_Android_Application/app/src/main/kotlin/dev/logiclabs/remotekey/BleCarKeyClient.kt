@@ -32,7 +32,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         fun onOtaProgress(sent: Int, total: Int)
         fun onOtaResult(success: Boolean, message: String)
     }
-    enum class State { DISCONNECTED, SCANNING, CONNECTING, CONNECTED }
+    enum class State { DISCONNECTED, SCANNING, CONNECTING, CONNECTED, RETRYING }
     companion object { private val CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb") }
     private val handler = Handler(Looper.getMainLooper())
     private var epoch = 0
@@ -720,7 +720,9 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         if (wasPsk || wasOta || availability != BluetoothAvailability.AVAILABLE) stopped = true
         teardown()
         listener.onReadyChanged(false)
-        listener.onState(State.DISCONNECTED, message)
+        // A recoverable failure is one continuing connection attempt. Keep its
+        // precise cause in Diagnostics rather than flashing an error on the card.
+        listener.onState(if (stopped) State.DISCONNECTED else State.RETRYING, message)
         if (wasPress) listener.onCommandResult(false, "Unable to confirm — check the car")
         if (wasPsk) listener.onPskUpdateResult(false, "PSK update interrupted; confirm the car key before app-only recovery")
         if (wasOta) listener.onOtaResult(false, message)
@@ -729,7 +731,6 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
                 preferDirect = false; reconnectAddress = profile.defaultAddress
                 diagnostic("Cached attempts exhausted; switching to scan")
             }
-            listener.onState(State.DISCONNECTED, "Reconnecting…")
             retryFailures = (retryFailures + 1).coerceAtMost(4)
             val delay = (1_000L shl retryFailures) + (Math.random() * 500).toLong()
             later(delay) { start(psk, reconnectAddress, preferDirect) }
