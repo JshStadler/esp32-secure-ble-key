@@ -10,6 +10,7 @@ using Toybox.Timer;
 class CarKeyProfile {
     static const READ_STATUS = true;
     static const RECEIPTS = false;
+    static const IDENTITY_CHAR_UUID = Ble.longToUuid(0xb1b2c3d4e5f67890l, 0xabcdef1234567897l);
     static const RECEIPT_CHAR_UUID = Ble.longToUuid(0xb1b2c3d4e5f67890l, 0xabcdef123456789cl);
     static const DEVICE_NAME = "centurion-d5-evo";
     static const BINDING = "gate-main";

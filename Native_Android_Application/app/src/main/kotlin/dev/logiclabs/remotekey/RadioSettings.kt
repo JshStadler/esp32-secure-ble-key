@@ -6,28 +6,36 @@ import java.nio.ByteOrder
 
 /** BLE intervals use 0.625ms units; users enter milliseconds. */
 data class RadioSettings(val fastMin: Int, val fastMax: Int, val slowMin: Int,
-    val slowMax: Int, val idleSeconds: Int) {
+    val slowMax: Int, val idleSeconds: Int, val txPowerDbm: Int? = null, val idleTxPowerDbm: Int? = null) {
     fun valid(): Boolean = fastMin in 32..3200 && fastMax in fastMin..3200 &&
-        slowMin in fastMin..3200 && slowMax in maxOf(slowMin, fastMax)..3200 && idleSeconds in 5..3600
+        slowMin in fastMin..3200 && slowMax in maxOf(slowMin, fastMax)..3200 && idleSeconds in 5..3600 && (txPowerDbm == null || txPowerDbm in TX_POWER_LEVELS) &&
+        (idleTxPowerDbm == null || (txPowerDbm != null && idleTxPowerDbm in TX_POWER_LEVELS && idleTxPowerDbm <= txPowerDbm))
+
+    val wireVersion get() = if (idleTxPowerDbm != null) 3 else if (txPowerDbm != null) 2 else 1
+    val minimumMtu get() = 45 + wireVersion
 
     fun encode(): ByteArray {
         require(valid())
-        return ByteBuffer.allocate(10).order(ByteOrder.LITTLE_ENDIAN).apply {
+        return ByteBuffer.allocate(9 + wireVersion).order(ByteOrder.LITTLE_ENDIAN).apply {
             listOf(fastMin, fastMax, slowMin, slowMax, idleSeconds).forEach { putShort(it.toShort()) }
+            txPowerDbm?.let { put(it.toByte()) }
+            idleTxPowerDbm?.let { put(it.toByte()) }
         }.array()
     }
 
     fun packet(nonce: ByteArray, key: String): ByteArray {
         require(nonce.size == 16)
         val data = encode()
-        val transcript = "BLEKEY-RADIO1\u0000car-main\u0000".toByteArray(Charsets.US_ASCII) + nonce + data
-        return byteArrayOf(4) + data + CarKeyProtocol.hmac(transcript, key)
+        val version = wireVersion
+        val transcript = "BLEKEY-RADIO$version\u0000car-main\u0000".toByteArray(Charsets.US_ASCII) + nonce + data
+        return byteArrayOf((3 + version).toByte()) + data + CarKeyProtocol.hmac(transcript, key)
     }
 
     fun recentText() = rangeText(fastMin, fastMax)
     fun inactiveText() = rangeText(slowMin, slowMax)
 
     companion object {
+        val TX_POWER_LEVELS = listOf(-12, -9, -6, -3, 0, 3, 6, 9)
         val DEFAULT = RadioSettings(80, 160, 320, 640, 60)
         private fun ms(units: Int) = BigDecimal(units).multiply(BigDecimal("0.625")).stripTrailingZeros().toPlainString()
         private fun rangeText(min: Int, max: Int) = if (min == max) ms(min) else "${ms(min)}-${ms(max)}"

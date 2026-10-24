@@ -2,7 +2,7 @@ substitutions:
   name: "centurion-d5-evo"
   friendly_name: "Centurion D5 Evo"
   comment: "Control Centurion D5 Evo gate motor remotely. Including Kocom bell ringing"
-  gate_ble_build: "gate-ble-v2.8.0-session-recovery-production"
+  gate_ble_build: "gate-ble-v2.8.11-session-close-guards"
 
   # Gate LED pulse-meter decoder tuning. pulse_meter captures rising edges
   # in its ISR path; the shared binary sensor is only used to determine the
@@ -27,7 +27,7 @@ substitutions:
   gate_ble_key_1_psk: !secret ble_psk
   gate_ble_key_2_name: "BLE Remote 2"
   gate_ble_key_2_event: "ble_remote_2"
-  gate_ble_key_2_psk: ""
+  gate_ble_key_2_psk: !secret ble_psk2
   gate_ble_key_3_name: "BLE Remote 3"
   gate_ble_key_3_event: "ble_remote_3"
   gate_ble_key_3_psk: ""
@@ -42,7 +42,7 @@ esphome:
   name: ${name}
   friendly_name: ${friendly_name}
   comment: ${comment}
-  min_version: 2026.7.3
+  min_version: 2026.10.0
   includes:
     - <esp_bt.h>
   on_boot:
@@ -90,6 +90,16 @@ esphome:
               }
               id(gate_ble_device_state).set_value("ERR:NO_SESSION");
             });
+            id(gate_ble_signal_value).on_read([](uint16_t conn_id) {
+              for (size_t slot = 0; slot < id(gate_ble_conn_ids).size(); ++slot) {
+                if (id(gate_ble_conn_ids)[slot] == conn_id &&
+                    id(gate_ble_authenticated)[slot] && !id(gate_ble_closing)[slot]) {
+                  id(gate_ble_signal_value).set_value(id(gate_signal).read(conn_id));
+                  return;
+                }
+              }
+              id(gate_ble_signal_value).set_value(std::vector<uint8_t>{});
+            });
             ESP_LOGW("gate_ble", "BUILD ${gate_ble_build}: API v2 ready; max BLE clients = 5");
         - delay: 1s
         - lambda: |-
@@ -126,7 +136,7 @@ api:
 
 ota:
   - platform: esphome
-    password: !secret ota_password
+    encryption:
 
 wifi:
   ssid: !secret wifi_ssid
@@ -243,9 +253,23 @@ globals:
 # Five connections each receive independent nonce, status, and Garmin split-write
 # state. Challenge/status are read per connection rather than broadcast.
 esp32_ble:
+  id: gate_ble_stack
   disable_bt_logs: true
   connection_timeout: 20s
   max_connections: 5
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/JshStadler/esp32-secure-ble-key
+      ref: 3516cf15fcbd52c2322b778ae7788487522cb333
+      path: ESPHome_Gate_Firmware/components
+    components: [gate_ble_signal]
+
+gate_ble_signal:
+  id: gate_signal
+  ble_id: gate_ble_stack
+  server_id: gate_ble_server
 
 esp32_ble_server:
   id: gate_ble_server
@@ -475,7 +499,7 @@ esp32_ble_server:
                       break;
                     }
                   }
-                  if (slot < 0) return;
+                  if (slot < 0 || id(gate_ble_closing)[slot]) return;
                   if (x.size() != 17) {
                     ESP_LOGW("gate_ble", "Garmin part 1 rejected: expected 17 bytes, received %u",
                              static_cast<unsigned>(x.size()));
@@ -507,7 +531,7 @@ esp32_ble_server:
                       break;
                     }
                   }
-                  if (slot < 0) return;
+                  if (slot < 0 || id(gate_ble_closing)[slot]) return;
                   if (x.size() != 16) {
                     ESP_LOGW("gate_ble", "Garmin part 2 rejected: expected 16 bytes, received %u",
                              static_cast<unsigned>(x.size()));
@@ -636,8 +660,29 @@ esp32_ble_server:
           uuid: b1b2c3d4-e5f6-7890-abcd-ef1234567897
           read: true
           value:
-            data: "blekey|2|gate-main|gate|press,state"
+            data: "blekey|2|gate-main|gate|press,state,signal1"
             type: string
+
+        # Append diagnostics after existing characteristics so their handles
+        # remain stable for installed phone/watch clients.
+        # Requests: eight random bytes. Replies: state (0 waiting / 1 ready /
+        # 2 unavailable), echoed request, signed RSSI. Fits the default MTU.
+        - id: gate_ble_signal_value
+          uuid: b1b2c3d4-e5f6-7890-abcd-ef123456789c
+          read: true
+          write: true
+          value:
+            data: [2, 0, 0, 0, 0, 0, 0, 0, 0, 127]
+          on_write:
+            - lambda: |-
+                for (size_t slot = 0; slot < id(gate_ble_conn_ids).size(); ++slot) {
+                  if (id(gate_ble_conn_ids)[slot] == id &&
+                      id(gate_ble_authenticated)[slot] && !id(gate_ble_closing)[slot]) {
+                    id(gate_ble_activity_ms)[slot] = millis();
+                    id(gate_signal).request(id, x);
+                    return;
+                  }
+                }
 
 event:
   - platform: template

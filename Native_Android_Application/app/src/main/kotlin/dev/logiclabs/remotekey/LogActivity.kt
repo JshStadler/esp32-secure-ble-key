@@ -96,7 +96,10 @@ class LogActivity : FragmentActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), 0, dp(20), dp(16))
         }
-        val top = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        val largeControls = resources.configuration.fontScale >= 1.3f || resources.configuration.screenWidthDp < 360
+        val top = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL; minimumHeight = dp(64)
+        }
         top.addView(ImageButton(this).apply {
             setImageResource(R.drawable.ic_back)
             imageTintList = ContextCompat.getColorStateList(context, android.R.color.white)
@@ -104,30 +107,32 @@ class LogActivity : FragmentActivity() {
             contentDescription = "Back"
             setOnClickListener { finish() }
         }, LinearLayout.LayoutParams(dp(48), dp(56)))
-        top.addView(label("Logs", 22f, true), LinearLayout.LayoutParams(0, dp(64), 1f))
-        top.addView(Button(this).apply {
+        top.addView(label("Logs", 22f, true), LinearLayout.LayoutParams(0, -2, 1f))
+        val actions = if (largeControls) LinearLayout(this).apply { orientation = LinearLayout.VERTICAL } else top
+        actions.addView(Button(this).apply {
             text = "Export"
             isAllCaps = false
             setTextColor(Color.rgb(142, 180, 255))
             setBackgroundColor(Color.TRANSPARENT)
             setOnClickListener { exportLogs() }
-        })
-        top.addView(Button(this).apply {
+        }, LinearLayout.LayoutParams(if (largeControls) -1 else -2, -2))
+        actions.addView(Button(this).apply {
             text = "Clear"
             isAllCaps = false
             setTextColor(Color.rgb(142, 180, 255))
             setBackgroundColor(Color.TRANSPARENT)
             setOnClickListener { confirmClear() }
-        })
+        }, LinearLayout.LayoutParams(if (largeControls) -1 else -2, -2))
         page.addView(top)
+        if (largeControls) page.addView(actions)
 
-        val tabs = LinearLayout(this)
+        val tabs = LinearLayout(this).apply { orientation = if (largeControls) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL }
         diagnosticButton = tab("Diagnostics") { show(Mode.DIAGNOSTIC) }
         pressesButton = tab("Operations") { show(Mode.PRESSES) }
         locationsButton = tab("Locations") { show(Mode.LOCATIONS) }
-        tabs.addView(diagnosticButton, LinearLayout.LayoutParams(0, dp(48), 1f))
-        tabs.addView(pressesButton, LinearLayout.LayoutParams(0, dp(48), 1f))
-        tabs.addView(locationsButton, LinearLayout.LayoutParams(0, dp(48), 1f))
+        tabs.addView(diagnosticButton, LinearLayout.LayoutParams(if (largeControls) -1 else 0, -2, if (largeControls) 0f else 1f))
+        tabs.addView(pressesButton, LinearLayout.LayoutParams(if (largeControls) -1 else 0, -2, if (largeControls) 0f else 1f))
+        tabs.addView(locationsButton, LinearLayout.LayoutParams(if (largeControls) -1 else 0, -2, if (largeControls) 0f else 1f))
         page.addView(tabs)
 
         deviceFilters = buildDeviceFilters()
@@ -140,17 +145,20 @@ class LogActivity : FragmentActivity() {
             setPadding(dp(8), dp(6), dp(8), dp(6))
             contentDescription = "Filter logs by device"
         }
-        page.addView(filterSpinner, LinearLayout.LayoutParams(-1, dp(52)).apply { topMargin = dp(8) })
+        page.addView(filterSpinner, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
         filterSpinner.setSelection(deviceFilters.indexOfFirst { it.id == selectedDeviceId }.coerceAtLeast(0))
 
-        val dates = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        val dates = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            orientation = if (largeControls) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+        }
         dateButton = tab(if (selectedDay == null) getString(R.string.log_choose_day) else dayLabel()) { pickDay() }
             .apply { contentDescription = "Choose log date" }
-        dates.addView(dateButton, LinearLayout.LayoutParams(0, dp(48), 1f))
+        dates.addView(dateButton, LinearLayout.LayoutParams(if (largeControls) -1 else 0, -2, if (largeControls) 0f else 1f))
         dates.addView(Button(this).apply {
             setText(R.string.log_all_dates); isAllCaps = false
             setOnClickListener { selectedDay = null; dateButton.setText(R.string.log_choose_day); show(selected) }
-        }, LinearLayout.LayoutParams(-2, dp(48)))
+        }, LinearLayout.LayoutParams(if (largeControls) -1 else -2, -2))
         page.addView(dates)
         page.addView(EditText(this).apply {
             hint = "Search logs"; setTextColor(Color.WHITE); setHintTextColor(Color.GRAY)
@@ -161,7 +169,7 @@ class LogActivity : FragmentActivity() {
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) { search = s.toString(); show(selected) }
                 override fun afterTextChanged(s: Editable?) = Unit
             })
-        }, LinearLayout.LayoutParams(-1, dp(48)))
+        }, LinearLayout.LayoutParams(-1, -2))
         countLabel = label("", 12f, false).apply { setTextColor(Color.GRAY) }
         page.addView(countLabel)
 
@@ -169,7 +177,7 @@ class LogActivity : FragmentActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(12), 0, dp(12))
         }
-        page.addView(ScrollView(this).apply { addView(content) }, LinearLayout.LayoutParams(-1, 0, 1f))
+        page.addView(content, LinearLayout.LayoutParams(-1, -2))
         filterSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
                 selectedDeviceId = deviceFilters[position].id
@@ -177,7 +185,7 @@ class LogActivity : FragmentActivity() {
             }
             override fun onNothingSelected(parent: AdapterView<*>?) = Unit
         }
-        root.addView(page, FrameLayout.LayoutParams(-1, -1))
+        root.addView(ScrollView(this).apply { addView(page) }, FrameLayout.LayoutParams(-1, -1))
         return root
     }
 
@@ -393,6 +401,7 @@ class LogActivity : FragmentActivity() {
 
     private fun tab(title: String, action: () -> Unit) = Button(this).apply {
         text = title
+        minimumHeight = dp(48)
         isAllCaps = false
         setTextColor(Color.WHITE)
         setBackgroundColor(Color.rgb(31, 34, 48))
