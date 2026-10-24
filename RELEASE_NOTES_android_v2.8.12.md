@@ -8,6 +8,8 @@ apply. Already-sent commands wait for their result before the connection closes.
 
 The background notification now says Remote Key Bluetooth, so connecting is not
 incorrectly reported as already connected. No ESP or Garmin update is required.
+Optional location recording tolerates missing or denied fixes in the background
+and keeps delayed fixes attached to the original press's history session.
 
 Manual checks: tap Press while connecting, immediately press Home or Recent apps,
 and confirm one device action and one successful history entry. Repeat with

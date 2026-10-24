@@ -1854,33 +1854,46 @@ class MainActivity : FragmentActivity() {
     private fun captureOperationLocation(profile: BleDeviceProfile) {
         if (!runtimes.getValue(profile.id).recordLocation || !hasLocationPermission()) return
         val operationTime = System.currentTimeMillis()
-        val manager = getSystemService(LocationManager::class.java)
-        val provider = when {
-            manager.isProviderEnabled(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER
-            manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER
-            else -> {
-                EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Location not recorded: location services are disabled", deviceId = profile.id, deviceName = profile.displayName)
-                return
-            }
-        }
-        val save: (Location) -> Unit = { location ->
-            EventLog.addLocation(this, location.latitude, location.longitude, location.accuracy, operationSession, operationTime, profile.id, profile.displayName)
-            EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Saved operation location with +/-${location.accuracy.toInt()} m accuracy", deviceId = profile.id, deviceName = profile.displayName)
-        }
-        if (Build.VERSION.SDK_INT >= 30) {
-            manager.getCurrentLocation(provider, CancellationSignal(), mainExecutor, save)
-        } else {
-            val listener = object : LocationListener {
-                override fun onLocationChanged(location: Location) {
-                    manager.removeUpdates(this)
-                    save(location)
+        val locationSession = operationSession
+        try {
+            val manager = getSystemService(LocationManager::class.java)
+            val provider = when {
+                manager.isProviderEnabled(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER
+                manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER
+                else -> {
+                    EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Location not recorded: location services are disabled", deviceId = profile.id, deviceName = profile.displayName)
+                    return
                 }
-                override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) = Unit
-                override fun onProviderEnabled(provider: String) = Unit
-                override fun onProviderDisabled(provider: String) = Unit
             }
-            @Suppress("DEPRECATION")
-            manager.requestSingleUpdate(provider, listener, Looper.getMainLooper())
+            val save: (Location?) -> Unit = { location ->
+                if (location == null) {
+                    EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Location not recorded: no current fix available", deviceId = profile.id, deviceName = profile.displayName)
+                } else {
+                    EventLog.addLocation(this, location.latitude, location.longitude, location.accuracy, locationSession, operationTime, profile.id, profile.displayName)
+                    EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Saved operation location with +/-${location.accuracy.toInt()} m accuracy", deviceId = profile.id, deviceName = profile.displayName)
+                }
+            }
+            if (Build.VERSION.SDK_INT >= 30) {
+                manager.getCurrentLocation(provider, CancellationSignal(), mainExecutor, save)
+            } else {
+                val listener = object : LocationListener {
+                    override fun onLocationChanged(location: Location) {
+                        manager.removeUpdates(this)
+                        save(location)
+                    }
+                    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) = Unit
+                    override fun onProviderEnabled(provider: String) = Unit
+                    override fun onProviderDisabled(provider: String) = Unit
+                }
+                @Suppress("DEPRECATION")
+                manager.requestSingleUpdate(provider, listener, Looper.getMainLooper())
+            }
+            } catch (_: SecurityException) {
+            // Android can revoke while-in-use location access after Home/Recents.
+            // Optional location must not interrupt an already successful press.
+            EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Location not recorded: Android denied location access", deviceId = profile.id, deviceName = profile.displayName)
+        } catch (_: IllegalArgumentException) {
+            EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Location not recorded: provider unavailable", deviceId = profile.id, deviceName = profile.displayName)
         }
     }
 
