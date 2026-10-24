@@ -76,6 +76,14 @@ Off disconnects on leaving the app unless such an operation is active. Returning
 to the app cancels the old lease. These are phone connection preferences, not
 changes to the ESP advertising or sleep configuration.
 
+A button tapped while connecting stays pending after **Home** or **Recent apps**
+is pressed. The background service retains the connection attempt and sends the
+press once ready, within the original ten-second connection deadline. This also
+works with background connections set to Off: the active operation, including its
+receipt, may finish before disconnecting. Returning to the app does not resend it.
+Cancel, Bluetooth off, closing/removing the app task, or activity/process teardown
+revokes an unsent press; commands are never restored or replayed after restart.
+
 **Copy support summary** includes app/build version, Android API, Bluetooth
 state, connection preferences, and last collected health firmware/signal data
 labelled with snapshot age. It does not connect or refresh health on its own.

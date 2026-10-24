@@ -111,7 +111,7 @@ class MainActivity : FragmentActivity() {
         }
     }
     private var pendingPressId: String? = null
-    private var pendingPressDeadline = 0L
+    private var pendingButtonPress: PendingButtonPress? = null
     private var pressDispatched = false
     private var pendingPskValue: String? = null
     private var pendingPskOnSaved: (() -> Unit)? = null
@@ -247,6 +247,8 @@ class MainActivity : FragmentActivity() {
         healthDialog?.dismiss()
         BackgroundConnectionService.finish(this, false)
         operationGeneration++
+        pendingButtonPress?.cancel()
+        pendingButtonPress = null
         pendingPressId = null
         pendingPskValue = null
         pendingPskOnSaved = null
@@ -278,6 +280,14 @@ class MainActivity : FragmentActivity() {
                 busy = operationActive,
                 disconnect = {
                     EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Background connection window ended")
+                    pendingPressId?.let { id ->
+                        if (pendingPskValue == null && pendingOtaImage == null)
+                            profiles.find { it.id == id }?.let { profile ->
+                                finishOperation(profile, false, if (pressDispatched)
+                                    "Unable to confirm — background connection ended. Check the device."
+                                else "Not sent — background connection ended")
+                            }
+                    }
                     stopAllClients()
                 },
             ))
@@ -287,13 +297,15 @@ class MainActivity : FragmentActivity() {
 
     override fun onStop() {
         appForeground = false
-        pendingPressId?.let { id ->
-            if (!pressDispatched && pendingPskValue == null && pendingOtaImage == null)
-                profiles.find { it.id == id }?.let { finishOperation(it, false, "Canceled before sending") }
-        }
+        // Home/Recents hides the UI without revoking an explicit tap. onPause
+        // already started the short foreground-service lease for this operation.
         radioDialog?.dismiss()
         healthDialog?.dismiss()
         if (isFinishing) {
+            pendingPressId?.let { id ->
+                if (!pressDispatched && pendingPskValue == null && pendingOtaImage == null)
+                    profiles.find { it.id == id }?.let { finishOperation(it, false, "Canceled before sending") }
+            }
             BackgroundConnectionService.finish(this, false)
             stopAllClients()
         }
@@ -592,7 +604,7 @@ class MainActivity : FragmentActivity() {
         val generation = operationGeneration
         operationSession = UUID.randomUUID().toString()
         runtime.uncertainOutcome = null
-        pendingPressDeadline = android.os.SystemClock.elapsedRealtime() + 10_000
+        pendingButtonPress = PendingButtonPress(android.os.SystemClock.elapsedRealtime())
         pendingPressId = profile.id
         pendingPskValue = null
         pendingPskOnSaved = null
@@ -601,6 +613,10 @@ class MainActivity : FragmentActivity() {
         setAllActionsEnabled(false)
 
         if (runtime.ready) {
+            if (pendingButtonPress?.claim(android.os.SystemClock.elapsedRealtime()) != true) {
+                finishOperation(profile, false, "Not sent — connection timed out")
+                return
+            }
             pressDispatched = true
             runtime.message = "Pressing…"
             updateDeviceView(profile.id)
@@ -616,11 +632,11 @@ class MainActivity : FragmentActivity() {
             if (generation == operationGeneration && pendingPressId == profile.id) {
                 finishOperation(profile, false, if (pressDispatched) "Unable to confirm — check the car" else "Not sent — connection timed out")
             }
-        }, 18_000)
+        }, PendingButtonPress.RESULT_TIMEOUT_MS)
         mainHandler.postDelayed({
             if (generation == operationGeneration && pendingPressId == profile.id && !pressDispatched)
                 finishOperation(profile, false, "Not sent — connection timed out")
-        }, 10_000)
+        }, PendingButtonPress.CONNECTION_TIMEOUT_MS)
     }
 
     private fun listenerFor(profile: BleDeviceProfile, generation: Int) = object : BleCarKeyClient.Listener {
@@ -653,10 +669,9 @@ class MainActivity : FragmentActivity() {
             if (ready) runtime.message = "Ready"
             updateDeviceView(profile.id)
             if (ready && healthDeviceId == profile.id && pendingPressId == null) healthFetch?.invoke()
-            if (ready && pendingPressId == profile.id && !pressDispatched &&
-                (appForeground || pendingPskValue != null || pendingOtaImage != null)) {
+            if (ready && pendingPressId == profile.id && !pressDispatched) {
                 if (pendingPskValue == null && pendingOtaImage == null &&
-                    android.os.SystemClock.elapsedRealtime() >= pendingPressDeadline) {
+                    pendingButtonPress?.claim(android.os.SystemClock.elapsedRealtime()) != true) {
                     finishOperation(profile, false, "Not sent — connection timed out")
                     return@runOnUiThread
                 }
@@ -718,6 +733,8 @@ class MainActivity : FragmentActivity() {
 
     private fun finishOperation(profile: BleDeviceProfile, success: Boolean, message: String) {
         if (pendingPressId != profile.id) return
+        pendingButtonPress?.cancel()
+        pendingButtonPress = null
         pendingPressId = null
         pressDispatched = false
         operationGeneration++

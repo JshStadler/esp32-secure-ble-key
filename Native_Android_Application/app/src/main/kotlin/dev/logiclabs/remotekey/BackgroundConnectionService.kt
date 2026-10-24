@@ -57,7 +57,7 @@ class BackgroundConnectionService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val notification = NotificationCompat.Builder(this, channel)
             .setSmallIcon(R.drawable.ic_key_notification)
-            .setContentTitle("Remote Key connected")
+            .setContentTitle("Remote Key Bluetooth")
             .setContentText(if (lease?.duration == BackgroundConnectionDuration.OFF) "Finishing a Bluetooth operation" else
                 "Background connection window: ${lease?.duration?.label ?: "a short time"}")
             .setContentIntent(open).setOngoing(true).setSilent(true).build()
