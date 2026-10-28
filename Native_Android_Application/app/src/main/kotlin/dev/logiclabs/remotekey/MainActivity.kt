@@ -1599,6 +1599,7 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun rebuildUi() {
+        PressWidgetProvider.refreshAll(this)
         stopAllClients()
         setContentView(buildUi())
         authOverlay.visibility = if (authenticated) View.GONE else View.VISIBLE

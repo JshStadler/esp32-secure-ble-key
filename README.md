@@ -317,6 +317,22 @@ connections automatically. Each launch authenticates before showing ready;
 actual connection time depends on the watch and radio environment.
 Both watch apps close and disconnect after two minutes without user input.
 
+For a watch connection timeout, first record whether the screen stays at
+Scanning, reaches Connecting, or reaches Authenticating. In the current watch
+state machine, a connection timeout occurs before authentication completes and
+does not by itself indicate a wrong PSK. Capture a baseline before using MENU to
+discard a cached pairing.
+
+To enable watch logs, connect by USB and find the Gate Key application's PRG
+filename under `GARMIN/APPS`. Create an empty file with the same base name and
+the `.TXT` extension under `GARMIN/APPS/LOGS` (for example, `ABC12345.PRG`
+corresponds to `LOGS/ABC12345.TXT`). Disconnect USB, reproduce two or three
+connection attempts, reconnect, and copy the TXT and corresponding BAK if
+present. Logs are not created automatically. `CIQ_LOG.YML` in that folder records
+application crashes, rather than ordinary connection timeouts. Do not delete
+PRG, SET or DAT files to enable logging. Record the watch software/app versions
+and the gate's reported BLE build, and correlate attempts with ESPHome logs.
+
 <img width="360" height="539" alt="image" src="https://github.com/user-attachments/assets/28264123-9bf5-41ac-bad2-cb6732b7731b" />
 
 ## 📡 BLE Service Details

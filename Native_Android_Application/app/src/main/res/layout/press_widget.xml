@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/widget_press"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:orientation="vertical" android:padding="8dp" android:gravity="center"
+    android:background="@drawable/widget_background">
+    <!-- RemoteViews hosts use framework ImageView, which requires android:tint. -->
+    <ImageView android:id="@+id/widget_icon" android:layout_width="40dp" android:layout_height="40dp" tools:ignore="UseAppTint"
+        android:src="@drawable/ic_key_notification" android:tint="#8EB4FF" android:importantForAccessibility="no" android:layout_marginBottom="4dp" />
+    <TextView android:id="@+id/widget_name" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="Remote Key" android:gravity="center" android:textColor="#FFFFFF" android:textSize="14sp" android:textStyle="bold" android:maxLines="2" android:ellipsize="end" />
+    <TextView android:id="@+id/widget_status" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="Tap to press" android:gravity="center" android:textColor="#B8BAC6" android:textSize="12sp" android:maxLines="1" android:ellipsize="end" />
+</LinearLayout>

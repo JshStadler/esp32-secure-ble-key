@@ -31,6 +31,7 @@ about local storage, optional locations, exports, and deletion.
 - Foreground-persistent BLE connections with per-device cached-address retries and scan fallback
 - Continuous Connecting/Reconnecting card status across retry stages, with detailed stages retained in Diagnostics
 - Cards and settings buttons that grow with Android font/display scaling, with stacked actions when space is limited
+- Per-device home-screen press widgets on Android 12+, one-tap command execution and a 30-second reusable connection window
 - Independent encrypted PSK and address settings for each device
 - Authenticated live Open/Closed/Opening/Closing gate state while connected
 - API-v2 HMAC-SHA256 authentication for both Car and Gate

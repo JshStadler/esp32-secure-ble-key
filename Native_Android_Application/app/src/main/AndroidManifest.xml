@@ -30,6 +30,18 @@
             </intent-filter>
         </activity>
         <activity android:name=".LogActivity" android:exported="false" />
+        <activity android:name=".PressWidgetConfigureActivity" android:exported="true"
+            android:theme="@style/Theme.CarKey.Dialog" android:excludeFromRecents="true">
+            <intent-filter><action android:name="android.appwidget.action.APPWIDGET_CONFIGURE" /></intent-filter>
+        </activity>
+        <activity android:name=".WidgetPressActivity" android:exported="false"
+            android:theme="@style/Theme.CarKey.WidgetAction" android:excludeFromRecents="true"
+            android:taskAffinity="${applicationId}.widget" android:launchMode="singleTask" />
+        <receiver android:name=".PressWidgetProvider" android:exported="false" android:label="Remote Key press" android:enabled="@bool/press_widget_supported">
+            <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/press_widget_info" />
+        </receiver>
+        <service android:name=".WidgetPressService" android:exported="false" android:foregroundServiceType="connectedDevice" />
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.logexports"
