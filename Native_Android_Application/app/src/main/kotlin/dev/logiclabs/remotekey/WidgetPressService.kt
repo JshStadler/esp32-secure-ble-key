@@ -22,6 +22,7 @@ class WidgetPressService : Service() {
     private var ready = false
     private var session = ""
     private var message = "Connecting…"
+    private var feedbackReset: Runnable? = null
     private val store by lazy { SecureStore(this) }
     override fun onBind(intent: Intent?) = null
     private fun now() = SystemClock.elapsedRealtime()
@@ -65,6 +66,7 @@ class WidgetPressService : Service() {
         session = requestId!!
         actionWidgetId = widgetId
         actionAuthenticated = intent?.getBooleanExtra("authenticated", false) == true
+        clearFeedback()
         window.tap(now())
         publish(if (ready) "Sending…" else "Connecting…")
         scheduleCheck()
@@ -136,14 +138,30 @@ class WidgetPressService : Service() {
     private fun finishRequest(success: Boolean, result: String) {
         if (!window.busy) return
         val wasSent = window.dispatched
-        window.complete(now())
-        scheduleCheck()
+        val duration = BackgroundConnectionDuration.fromSaved(store.get(BackgroundConnectionDuration.STORE_KEY))
+        window.complete(now(), duration.milliseconds)
         log("Widget action: $result")
         val target = profile ?: return
         if (success && wasSent) {
             EventLog.addSessionPress(this, "${target.displayName} remote button pressed (widget)", session, target.id, target.displayName)
             if (store.get(target.recordLocationStoreKey) == "true") OperationLocationRecorder.capture(this, target, session)
-            publish("Pressed • ready for 30s")
+            if (duration == BackgroundConnectionDuration.OFF) {
+                publish("Pressed • disconnected")
+                // Keep the confirmation visible briefly, but release the radio now.
+                window.cancel()
+                closeClient(message, keepProfile = true)
+            } else {
+                publish("Pressed • ready for ${duration.label}")
+                scheduleCheck()
+            }
+            val owned = generation
+            val completedSession = session
+            feedbackReset = Runnable {
+                feedbackReset = null
+                if (owned != generation || completedSession != session || window.busy) return@Runnable
+                if (duration == BackgroundConnectionDuration.OFF) end("Tap to press")
+                else publish("Ready • ${duration.label}")
+            }.also { handler.postDelayed(it, 3_000) }
         } else end(if (wasSent) "Unable to confirm — check the device" else result)
     }
     private fun log(value: String) {
@@ -172,12 +190,17 @@ class WidgetPressService : Service() {
         }
         return try { startForeground(261, notification.build()); true } catch (_: RuntimeException) { false }
     }
-    private fun closeClient(status: String) {
+    private fun clearFeedback() {
+        feedbackReset?.let { handler.removeCallbacks(it) }
+        feedbackReset = null
+    }
+    private fun closeClient(status: String, keepProfile: Boolean = false) {
+        clearFeedback()
         generation++ // Invalidate ownership before synchronous teardown callbacks.
         val old = client; client = null; ready = false
         old?.stop()
         profile?.let { PressWidgetProvider.publish(this, it.id, status) }
-        profile = null; key = null
+        if (!keepProfile) { profile = null; key = null }
     }
     private fun end(status: String) {
         window.cancel()

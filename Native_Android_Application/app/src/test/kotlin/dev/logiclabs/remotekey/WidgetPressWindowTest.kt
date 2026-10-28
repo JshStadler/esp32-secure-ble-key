@@ -51,6 +51,25 @@ class WidgetPressWindowTest {
         assertFalse(w.complete(29_000))
         assertTrue(w.expired(30_002))
     }
+    @Test fun offDisconnectsAfterTheResultWithoutInterruptingAnActivePress() {
+        val w = WidgetPressWindow()
+        w.tap(0); w.claim(100)
+        assertFalse(w.expired(200))
+        assertTrue(w.complete(200, BackgroundConnectionDuration.OFF.milliseconds))
+        assertTrue(w.expired(200))
+        assertFalse(w.claim(201))
+    }
+    @Test fun eachConfirmedPressCanUseTheCurrentBackgroundPreference() {
+        val w = WidgetPressWindow()
+        w.tap(0); w.claim(100); w.complete(200, BackgroundConnectionDuration.TWO_MINUTES.milliseconds)
+        assertFalse(w.expired(120_199))
+        assertTrue(w.tap(120_199)); w.claim(120_200)
+        w.complete(120_201, BackgroundConnectionDuration.THIRTY_SECONDS.milliseconds)
+        assertFalse(w.expired(150_200))
+        assertTrue(w.expired(150_201))
+        assertFalse(w.complete(160_000, BackgroundConnectionDuration.TWO_MINUTES.milliseconds))
+        assertTrue(w.expired(160_000))
+    }
     @Test fun scheduleFollowsTheCurrentDeadlineWithoutPollingDuringTheLease() {
         val w = WidgetPressWindow()
         w.tap(100)

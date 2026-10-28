@@ -7,6 +7,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.graphics.drawable.Icon
 import android.widget.RemoteViews
 import android.view.View
 
@@ -55,18 +56,28 @@ class PressWidgetProvider : AppWidgetProvider() {
             val options = AppWidgetManager.getInstance(context).getAppWidgetOptions(widgetId)
             val compact = options.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_HEIGHT) < 150 ||
                 options.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_WIDTH) < 150
+            AppWidgetManager.getInstance(context).updateAppWidget(widgetId,
+                views(context, widgetId, profile, displayedMessage, working, compact))
+        }
+        internal fun views(context: Context, widgetId: Int, profile: BleDeviceProfile?, displayedMessage: String,
+            working: Boolean, compact: Boolean): RemoteViews {
+            val tone = WidgetStatusText.tone(displayedMessage)
             val intent = if (profile == null) Intent(context, PressWidgetConfigureActivity::class.java)
                 else Intent(context, WidgetPressActivity::class.java)
             intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, widgetId)
             intent.data = Uri.parse("remotekey://widget/$widgetId/${if (profile == null) "configure" else "press"}")
             val click = PendingIntent.getActivity(context, widgetId, intent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-            val views = RemoteViews(context.packageName, R.layout.press_widget).apply {
+            return RemoteViews(context.packageName, R.layout.press_widget).apply {
+                val compactFeedback = compact && profile != null && WidgetStatusText.replacesCompactName(displayedMessage)
                 setTextViewText(R.id.widget_name, profile?.displayName ?: "Remote Key")
                 setInt(R.id.widget_name, "setMaxLines", if (compact) 1 else 2)
+                setTextViewTextSize(R.id.widget_name, android.util.TypedValue.COMPLEX_UNIT_SP, if (compactFeedback) 12f else 14f)
                 setViewVisibility(R.id.widget_status, if (compact) View.GONE else View.VISIBLE)
-                if (compact && working) setTextViewText(R.id.widget_name, "Working…")
-                setImageViewResource(R.id.widget_icon, icon(context, widgetId, profile?.type).drawable)
+                if (compactFeedback) setTextViewText(R.id.widget_name, WidgetStatusText.compactLabel(displayedMessage))
+                setInt(R.id.widget_press, "setBackgroundResource", tone.background)
+                setImageViewIcon(R.id.widget_icon, Icon.createWithResource(context, icon(context, widgetId, profile?.type).drawable).setTint(tone.accent))
+                setTextColor(R.id.widget_status, tone.accent)
                 setTextViewText(R.id.widget_status, if (profile == null) "Choose a device" else WidgetStatusText.label(displayedMessage))
                 // The launcher caches RemoteViews across process death. A cached
                 // disabled target could otherwise stay unusable after a crash.
@@ -75,7 +86,6 @@ class PressWidgetProvider : AppWidgetProvider() {
                 setOnClickPendingIntent(R.id.widget_press, click)
                 setContentDescription(R.id.widget_press, "${profile?.displayName ?: "Remote Key"}: $displayedMessage. ${if (working) "Working" else "Tap to press"}")
             }
-            AppWidgetManager.getInstance(context).updateAppWidget(widgetId, views)
         }
     }
 }

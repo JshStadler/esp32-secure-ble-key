@@ -1634,7 +1634,7 @@ class MainActivity : FragmentActivity() {
         durationButton = primaryButton("Background connections: ${selectedDuration.label}") {
             val choices = BackgroundConnectionDuration.entries
             AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
-                .setTitle("Keep connections after leaving the app")
+                .setTitle("Background connection duration")
                 .setSingleChoiceItems(choices.map { it.label }.toTypedArray(), choices.indexOf(selectedDuration)) { dialog, index ->
                     selectedDuration = choices[index]
                     durationButton.text = "Background connections: ${selectedDuration.label}"
@@ -1644,7 +1644,7 @@ class MainActivity : FragmentActivity() {
                 .show()
         }
         options.addView(durationButton, LinearLayout.LayoutParams(-1, -2))
-        options.addView(text("Shorter durations reduce background Bluetooth use. A press, key change, firmware selection or transfer already in progress is allowed to finish.", 12f, false),
+        options.addView(text("Applies after leaving the app and after each confirmed widget press. Shorter durations reduce background Bluetooth use. An operation already in progress is allowed to finish.", 12f, false),
             LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
         options.addView(sectionLabel("Devices"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
         options.addView(primaryButton("Add device") {

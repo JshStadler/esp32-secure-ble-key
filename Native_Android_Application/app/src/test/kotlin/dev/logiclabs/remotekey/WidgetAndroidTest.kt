@@ -22,6 +22,38 @@ import org.robolectric.annotation.GraphicsMode
 @Config(sdk = [35])
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class WidgetAndroidTest {
+    @Test fun actualRemoteViewsShowDistinctProgressAndConfirmationOnCompactAndLargeWidgets() {
+        val context = RuntimeEnvironment.getApplication()
+        val phases = listOf("Connecting…", "Sending…", "Pressed • ready for 2 minutes", "Ready • 2 minutes", "Unable to confirm — check the device", "Not sent — connection timed out", "Canceled before sending")
+        listOf(1f, 2f).forEach { scale ->
+            RuntimeEnvironment.setQualifiers("w360dp-h640dp-mdpi")
+            RuntimeEnvironment.setFontScale(scale)
+            listOf(true, false).forEach { compact ->
+                phases.forEachIndexed { index, message ->
+                    val views = PressWidgetProvider.views(context, 123, BleDeviceProfiles.GATE, message, index < 2, compact)
+                    val view = views.apply(context, android.widget.FrameLayout(context))
+                    val width = if (compact) 96 else 180
+                    val height = if (compact) 112 else 160
+                    view.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+                        View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY))
+                    view.layout(0, 0, width, height)
+                    val name = view.findViewById<TextView>(R.id.widget_name)
+                    val status = view.findViewById<TextView>(R.id.widget_status)
+                    assertEquals(if (compact && WidgetStatusText.replacesCompactName(message)) WidgetStatusText.compactLabel(message) else "Gate", name.text.toString())
+                    if (compact) assertEquals("Compact feedback ($message, font $scale) must be readable", 0, name.layout.getEllipsisCount(0))
+                    assertEquals(if (compact) View.GONE else View.VISIBLE, status.visibility)
+                    assertEquals(WidgetStatusText.tone(message).accent, status.currentTextColor)
+                    assertTrue(name.bottom <= height - view.paddingBottom)
+                    if (!compact) assertTrue(status.bottom <= height - view.paddingBottom)
+                    val bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
+                    view.draw(android.graphics.Canvas(bitmap))
+                    val file = java.io.File(System.getProperty("blekey.layoutReportsDir"), "widget-feedback-$compact-$scale-$index.png").apply { parentFile?.mkdirs() }
+                    file.outputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+                    bitmap.recycle()
+                }
+            }
+        }
+    }
     @Test fun launcherCanApplyProductionRemoteViewsAndKeepEachWidgetConfigurationSeparate() {
         val context = RuntimeEnvironment.getApplication()
         val manager = AppWidgetManager.getInstance(context)

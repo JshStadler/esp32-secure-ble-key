@@ -31,7 +31,7 @@ about local storage, optional locations, exports, and deletion.
 - Foreground-persistent BLE connections with per-device cached-address retries and scan fallback
 - Continuous Connecting/Reconnecting card status across retry stages, with detailed stages retained in Diagnostics
 - Cards and settings buttons that grow with Android font/display scaling, with stacked actions when space is limited
-- Per-device home-screen press widgets on Android 12+, one-tap command execution and a 30-second reusable connection window
+- Per-device home-screen press widgets on Android 12+, colour/status feedback and a reusable connection window that follows the app's background duration setting
 - Independent encrypted PSK and address settings for each device
 - Authenticated live Open/Closed/Opening/Closing gate state while connected
 - API-v2 HMAC-SHA256 authentication for both Car and Gate
@@ -78,6 +78,12 @@ is allowed to finish; the original deadline is not extended after it finishes.
 Off disconnects on leaving the app unless such an operation is active. Returning
 to the app cancels the old lease. These are phone connection preferences, not
 changes to the ESP advertising or sleep configuration.
+
+Widgets use the same saved duration after each confirmed press. Another confirmed
+widget press restarts that widget connection's deadline; Off disconnects immediately
+after its result. Connecting is amber, sending is blue, confirmation is green and
+failure/uncertainty is red. Confirmation lasts three seconds before the widget
+returns to its device name and ready status (or idle when Off).
 
 A button tapped while connecting stays pending after **Home** or **Recent apps**
 is pressed. The background service retains the connection attempt and sends the

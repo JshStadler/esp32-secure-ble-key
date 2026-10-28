@@ -2,7 +2,6 @@ package dev.logiclabs.remotekey
 
 /** One explicit tap at a time; a warm connection is never permission to replay a tap. */
 internal class WidgetPressWindow {
-    companion object { const val IDLE_MS = 30_000L }
     private var press: PendingButtonPress? = null
     private var started = 0L
     private var sent = false
@@ -32,10 +31,10 @@ internal class WidgetPressWindow {
         sent && now - started >= PendingButtonPress.RESULT_TIMEOUT_MS -> "Unable to confirm — check the device"
         else -> null
     }
-    fun complete(now: Long): Boolean {
+    fun complete(now: Long, durationMs: Long = 30_000L): Boolean {
         if (!busy) return false
         press?.cancel(); press = null
-        idleUntil = now + IDLE_MS
+        idleUntil = now + durationMs.coerceAtLeast(0)
         return true
     }
     fun expired(now: Long) = active && !busy && now >= idleUntil
