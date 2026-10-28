@@ -20,6 +20,7 @@ import java.util.UUID
 class WidgetPressActivity : FragmentActivity() {
     private var launched = false
     private var authenticating = false
+    private var selectedProfile: BleDeviceProfile? = null
     private val widgetId get() = intent.getIntExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, AppWidgetManager.INVALID_APPWIDGET_ID)
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
         if (result.values.all { it }) authorize() else reject("Not sent — allow Bluetooth in Remote Key")
@@ -32,6 +33,9 @@ class WidgetPressActivity : FragmentActivity() {
         // Recreating a transient action must never recreate its authorization.
         if (Build.VERSION.SDK_INT < 31 || savedInstanceState != null || PressWidgetProvider.deviceId(this, widgetId) == null) { finish(); return }
         if (PressWidgetProvider.isBusy(PressWidgetProvider.deviceId(this, widgetId)!!)) { finish(); return }
+        selectedProfile = DeviceProfileRepository(SecureStore(this)).load()
+            .firstOrNull { it.id == PressWidgetProvider.deviceId(this, widgetId) }
+        if (selectedProfile == null) { reject("Not sent — configure this widget again"); return }
         val required = if (Build.VERSION.SDK_INT >= 31)
             arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
         else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
@@ -48,7 +52,7 @@ class WidgetPressActivity : FragmentActivity() {
             BiometricManager.Authenticators.DEVICE_CREDENTIAL else BiometricManager.Authenticators.BIOMETRIC_STRONG
         fun useCredential() {
             @Suppress("DEPRECATION")
-            val prompt = if (keyguard.isDeviceSecure) keyguard.createConfirmDeviceCredentialIntent("Remote Key", "Authenticate to press the widget device") else null
+            val prompt = if (keyguard.isDeviceSecure) keyguard.createConfirmDeviceCredentialIntent("Remote Key", "Authenticate to press ${selectedProfile?.displayName}") else null
             if (prompt == null) reject("Not sent — set a device PIN or biometric") else credential.launch(prompt)
         }
         when (AppPolicies.authenticationRoute(Build.VERSION.SDK_INT,
@@ -62,13 +66,16 @@ class WidgetPressActivity : FragmentActivity() {
                     else reject("Not sent — authentication canceled")
                 }
             }).authenticate(BiometricPrompt.PromptInfo.Builder().setTitle("Remote Key")
-                .setSubtitle("Authenticate to press the widget device").setAllowedAuthenticators(allowed)
+                .setSubtitle("Authenticate to press ${selectedProfile?.displayName}").setAllowedAuthenticators(allowed)
                 .apply { if (Build.VERSION.SDK_INT < 30) setNegativeButtonText("Use device PIN") }.build())
         }
     }
     private fun send(authenticated: Boolean = false) {
         if (launched) return
         launched = true
+        val current = DeviceProfileRepository(SecureStore(this)).load()
+            .firstOrNull { it.id == PressWidgetProvider.deviceId(this, widgetId) }
+        if (current != selectedProfile || current == null) { reject("Not sent — widget changed; tap again"); return }
         if (BluetoothAvailability.read(this, getSystemService(android.bluetooth.BluetoothManager::class.java)) != BluetoothAvailability.AVAILABLE) {
             reject("Not sent — turn on Bluetooth in Remote Key"); return
         }
@@ -76,6 +83,7 @@ class WidgetPressActivity : FragmentActivity() {
             .putExtra("widget_id", widgetId).putExtra("request_id", UUID.randomUUID().toString())
             .putExtra("requested_at", SystemClock.elapsedRealtime())
             .putExtra("authenticated", authenticated)
+            .putExtra("device_snapshot", current.toString())
         try { ContextCompat.startForegroundService(this, service) }
         catch (_: RuntimeException) { reject("Not sent — unable to start Bluetooth"); return }
         finish()

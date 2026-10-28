@@ -47,6 +47,7 @@ class WidgetPressService : Service() {
         val psk = target?.let { store.get(it.pskStoreKey) }
         val error = when {
             target == null -> "Not sent — configure this widget again"
+            intent?.getStringExtra("device_snapshot") != target.toString() -> "Not sent — widget changed; tap again"
             psk.isNullOrBlank() -> "Not sent — set the device key in Remote Key"
             store.get("${target.pskStoreKey}_pending_change") != null -> "Not sent — recover the key change in Remote Key"
             else -> BluetoothAvailability.read(this, getSystemService(BluetoothManager::class.java)).message
