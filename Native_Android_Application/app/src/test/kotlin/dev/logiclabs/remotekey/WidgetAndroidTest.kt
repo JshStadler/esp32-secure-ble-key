@@ -22,6 +22,33 @@ import org.robolectric.annotation.GraphicsMode
 @Config(sdk = [35])
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class WidgetAndroidTest {
+    @Test fun launcherCanApplyProductionRemoteViewsAndKeepEachWidgetConfigurationSeparate() {
+        val context = RuntimeEnvironment.getApplication()
+        val manager = AppWidgetManager.getInstance(context)
+        val shadow = shadowOf(manager)
+        val first = shadow.createWidget(PressWidgetProvider::class.java, R.layout.press_widget)
+        val second = shadow.createWidget(PressWidgetProvider::class.java, R.layout.press_widget)
+        listOf(first, second).forEach { id ->
+            shadow.putWidgetInfo(id, android.appwidget.AppWidgetProviderInfo().apply {
+                provider = ComponentName(context, PressWidgetProvider::class.java)
+            })
+        }
+        PressWidgetProvider.configure(context, first, "gate", PressWidgetIcon.DOOR)
+        PressWidgetProvider.configure(context, second, "car", PressWidgetIcon.CAR)
+        assertEquals("gate", PressWidgetProvider.deviceId(context, first))
+        assertEquals("car", PressWidgetProvider.deviceId(context, second))
+        assertEquals(PressWidgetIcon.DOOR, PressWidgetProvider.icon(context, first, BleDeviceType.ESPHOME_ACCESS))
+        assertEquals(PressWidgetIcon.CAR, PressWidgetProvider.icon(context, second, BleDeviceType.CAR))
+        manager.updateAppWidgetOptions(first, android.os.Bundle().apply {
+            putInt(AppWidgetManager.OPTION_APPWIDGET_MIN_WIDTH, 180)
+            putInt(AppWidgetManager.OPTION_APPWIDGET_MIN_HEIGHT, 160)
+        })
+        PressWidgetProvider.render(context, first)
+        val view = shadow.getViewFor(first)
+        assertNotNull(view.findViewById<android.widget.ImageView>(R.id.widget_icon).drawable)
+        assertTrue(view.findViewById<View>(R.id.widget_press).isEnabled)
+        assertEquals(View.VISIBLE, view.findViewById<View>(R.id.widget_status).visibility)
+    }
     @Test @Config(sdk = [28]) fun widgetsAreNotOfferedWhereBackgroundScanNeedsAdditionalPermissions() {
         assertFalse(RuntimeEnvironment.getApplication().resources.getBoolean(R.bool.press_widget_supported))
     }
