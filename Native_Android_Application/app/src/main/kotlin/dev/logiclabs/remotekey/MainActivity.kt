@@ -114,9 +114,11 @@ class MainActivity : FragmentActivity() {
             refreshBluetoothState()
         }
     }
-    private var pendingPressId: String? = null
-    private var pendingButtonPress: PendingButtonPress? = null
-    private var pressDispatched = false
+    private var maintenanceDeviceId: String? = null
+    private val presses = DevicePressRequests()
+    private val pressFeedback = mutableMapOf<String, Any>()
+    private val hasPendingOperations get() = maintenanceDeviceId != null || presses.busy
+    private var maintenanceDispatched = false
     private var pendingPskValue: String? = null
     private var pendingPskOnSaved: (() -> Unit)? = null
     private var pendingOtaImage: ByteArray? = null
@@ -124,7 +126,6 @@ class MainActivity : FragmentActivity() {
     private var pendingFirmwareProfileId: String? = null
     private var firmwarePickerActive = false
     private var operationGeneration = 0
-    private var operationSession = UUID.randomUUID().toString()
     private var requireAuthentication = true
     private var authenticated = false
     private var healthDialog: AlertDialog? = null
@@ -252,9 +253,8 @@ class MainActivity : FragmentActivity() {
         healthDialog?.dismiss()
         BackgroundConnectionService.finish(this, false)
         operationGeneration++
-        pendingButtonPress?.cancel()
-        pendingButtonPress = null
-        pendingPressId = null
+        presses.clear()
+        maintenanceDeviceId = null
         pendingPskValue = null
         pendingPskOnSaved = null
         stopAllClients()
@@ -278,20 +278,19 @@ class MainActivity : FragmentActivity() {
         // Start while still visible, before Android's background-start limits apply.
         if (!isFinishing && authenticated && hasPermissions() && clients.isNotEmpty()) {
             val duration = BackgroundConnectionDuration.fromSaved(store.get(BackgroundConnectionDuration.STORE_KEY))
-            val operationActive = { pendingPressId != null || firmwarePickerActive || clients.values.any { !it.canRestartConnection } }
+            val operationActive = { hasPendingOperations || firmwarePickerActive || clients.values.any { !it.canRestartConnection } }
             if (duration == BackgroundConnectionDuration.OFF && !operationActive()) stopAllClients()
             else BackgroundConnectionService.begin(this, BackgroundConnectionService.Lease(
                 duration = duration,
                 busy = operationActive,
                 disconnect = {
                     EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Background connection window ended")
-                    pendingPressId?.let { id ->
-                        if (pendingPskValue == null && pendingOtaImage == null)
-                            profiles.find { it.id == id }?.let { profile ->
-                                finishOperation(profile, false, if (pressDispatched)
-                                    "Unable to confirm — background connection ended. Check the device."
-                                else "Not sent — background connection ended")
-                            }
+                    presses.deviceIds.forEach { id ->
+                        profiles.find { it.id == id }?.let { profile ->
+                            finishOperation(profile, false, if (presses[id]?.dispatched == true)
+                                "Unable to confirm — background connection ended. Check the device."
+                            else "Not sent — background connection ended")
+                        }
                     }
                     stopAllClients()
                 },
@@ -307,8 +306,8 @@ class MainActivity : FragmentActivity() {
         radioDialog?.dismiss()
         healthDialog?.dismiss()
         if (isFinishing) {
-            pendingPressId?.let { id ->
-                if (!pressDispatched && pendingPskValue == null && pendingOtaImage == null)
+            presses.deviceIds.forEach { id ->
+                if (presses[id]?.dispatched == false)
                     profiles.find { it.id == id }?.let { finishOperation(it, false, "Canceled before sending") }
             }
             BackgroundConnectionService.finish(this, false)
@@ -549,13 +548,16 @@ class MainActivity : FragmentActivity() {
         bluetoothAvailability = unavailableState ?: BluetoothAvailability.read(this, bluetoothManager)
         if (bluetoothAvailability != BluetoothAvailability.AVAILABLE) {
             val message = bluetoothAvailability.message ?: "Bluetooth is unavailable"
-            pendingPressId?.let { id -> profiles.firstOrNull { it.id == id }?.let { profile ->
+            maintenanceDeviceId?.let { id -> profiles.firstOrNull { it.id == id }?.let { profile ->
                 when {
                     pendingPskValue != null -> finishPskUpdate(profile, false, "$message — key change interrupted")
                     pendingOtaImage != null -> finishOtaOperation(profile, false, "$message — firmware update interrupted")
-                    pressDispatched -> finishOperation(profile, false, "Unable to confirm — $message. Check the device.")
-                    else -> finishOperation(profile, false, "Not sent — $message")
+                    else -> Unit
                 }
+            } }
+            presses.deviceIds.forEach { id -> profiles.firstOrNull { it.id == id }?.let { profile ->
+                finishOperation(profile, false, if (presses[id]?.dispatched == true)
+                    "Unable to confirm — $message. Check the device." else "Not sent — $message")
             } }
             stopAllClients()
             BackgroundConnectionService.finish(this, false)
@@ -580,7 +582,7 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun requestPress(profile: BleDeviceProfile) {
-        if (pendingPressId == profile.id && !pressDispatched && pendingPskValue == null && pendingOtaImage == null) {
+        if (presses[profile.id]?.dispatched == false) {
             finishOperation(profile, false, "Canceled before sending"); return
         }
         if (!authenticated) {
@@ -600,48 +602,44 @@ class MainActivity : FragmentActivity() {
             showDevicePskDialog(profile) { requestPress(profile) }
             return
         }
-        if (pendingPressId != null) {
+        if (maintenanceDeviceId != null) {
             toast("Another BLE action is already running")
             return
         }
 
-        operationGeneration++
-        val generation = operationGeneration
-        operationSession = UUID.randomUUID().toString()
+        val request = presses.begin(profile.id, android.os.SystemClock.elapsedRealtime()) ?: return
+        pressFeedback.remove(profile.id)
         runtime.uncertainOutcome = null
-        pendingButtonPress = PendingButtonPress(android.os.SystemClock.elapsedRealtime())
-        pendingPressId = profile.id
-        pendingPskValue = null
-        pendingPskOnSaved = null
-        pendingOtaImage = null
-        pressDispatched = false
-        setAllActionsEnabled(false)
+        updateAllDeviceViews()
 
-        if (runtime.ready) {
-            if (pendingButtonPress?.claim(android.os.SystemClock.elapsedRealtime()) != true) {
-                finishOperation(profile, false, "Not sent — connection timed out")
-                return
-            }
-            pressDispatched = true
-            runtime.message = "Pressing…"
-            updateDeviceView(profile.id)
-            clients[profile.id]?.press()
-        } else {
+        if (runtime.ready) dispatchPress(profile)
+        else {
             runtime.state = BleCarKeyClient.State.CONNECTING
             runtime.message = "Connecting (up to 10s)… Tap Cancel to stop."
             updateDeviceView(profile.id)
             ensureClient(profile)
         }
-
         mainHandler.postDelayed({
-            if (generation == operationGeneration && pendingPressId == profile.id) {
-                finishOperation(profile, false, if (pressDispatched) "Unable to confirm — check the car" else "Not sent — connection timed out")
-            }
+            if (presses[profile.id] === request)
+                finishOperation(profile, false, if (request.dispatched)
+                    "Unable to confirm — check the device" else "Not sent — connection timed out")
         }, PendingButtonPress.RESULT_TIMEOUT_MS)
         mainHandler.postDelayed({
-            if (generation == operationGeneration && pendingPressId == profile.id && !pressDispatched)
+            if (presses[profile.id] === request && !request.dispatched)
                 finishOperation(profile, false, "Not sent — connection timed out")
         }, PendingButtonPress.CONNECTION_TIMEOUT_MS)
+    }
+
+    private fun dispatchPress(profile: BleDeviceProfile) {
+        val request = presses[profile.id] ?: return
+        if (request.dispatched) return
+        if (!request.claim(android.os.SystemClock.elapsedRealtime())) {
+            finishOperation(profile, false, "Not sent — connection timed out")
+            return
+        }
+        runtimes.getValue(profile.id).message = "Pressing…"
+        updateDeviceView(profile.id)
+        clients[profile.id]?.press()
     }
 
     private fun listenerFor(profile: BleDeviceProfile, generation: Int) = object : BleCarKeyClient.Listener {
@@ -676,15 +674,10 @@ class MainActivity : FragmentActivity() {
                 runtime.message = "Ready"
             }
             updateDeviceView(profile.id)
-            if (ready && healthDeviceId == profile.id && pendingPressId == null) healthFetch?.invoke()
-            if (ready && pendingPressId == null) firmwareHealthFetch?.invoke()
-            if (ready && pendingPressId == profile.id && !pressDispatched) {
-                if (pendingPskValue == null && pendingOtaImage == null &&
-                    pendingButtonPress?.claim(android.os.SystemClock.elapsedRealtime()) != true) {
-                    finishOperation(profile, false, "Not sent — connection timed out")
-                    return@runOnUiThread
-                }
-                pressDispatched = true
+            if (ready && healthDeviceId == profile.id && !hasPendingOperations) healthFetch?.invoke()
+            if (ready && !hasPendingOperations) firmwareHealthFetch?.invoke()
+            if (ready && maintenanceDeviceId == profile.id && !maintenanceDispatched) {
+                maintenanceDispatched = true
                 runtime.message = when {
                     pendingOtaImage != null -> "Preparing firmware update..."
                     pendingPskValue != null -> "Updating ESP PSK..."
@@ -698,9 +691,10 @@ class MainActivity : FragmentActivity() {
                             finishPskUpdate(profile, false, "ESP firmware does not support PSK updates")
                         }
                     }
-                    else -> clients[profile.id]?.press()
+                    else -> Unit
                 }
             }
+            if (ready) dispatchPress(profile)
         }
 
         override fun onDeviceAddress(address: String) {
@@ -741,17 +735,15 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun finishOperation(profile: BleDeviceProfile, success: Boolean, message: String) {
-        if (pendingPressId != profile.id) return
-        pendingButtonPress?.cancel()
-        pendingButtonPress = null
-        pendingPressId = null
-        pressDispatched = false
-        operationGeneration++
+        val completed = presses.finish(profile.id) ?: return
+        // Discard the old connection's callbacks after an uncertain result before
+        // accepting another tap on this device. Other devices keep their clients.
+        if (!success && completed.dispatched) stopClient(profile.id)
+        val feedback = Any().also { pressFeedback[profile.id] = it }
         val runtime = runtimes.getValue(profile.id)
         runtime.message = message
         runtime.uncertainOutcome = if (message.startsWith("Unable to confirm")) message else null
-        updateDeviceView(profile.id)
-        setAllActionsEnabled(true)
+        updateAllDeviceViews()
 
         EventLog.add(
             this,
@@ -761,15 +753,15 @@ class MainActivity : FragmentActivity() {
             deviceName = profile.displayName,
         )
         if (success && message == "Pressed") {
-            EventLog.addSessionPress(this, "${profile.displayName} remote button pressed", operationSession, profile.id, profile.displayName)
-            captureOperationLocation(profile)
+            EventLog.addSessionPress(this, "${profile.displayName} remote button pressed", completed.session, profile.id, profile.displayName)
+            captureOperationLocation(profile, completed.session)
             vibrateSuccess()
         } else if (!success) {
             vibrateFailure()
         }
 
         mainHandler.postDelayed({
-            if (pendingPressId == null && runtime.ready) {
+            if (pressFeedback[profile.id] === feedback && presses[profile.id] == null && maintenanceDeviceId != profile.id && runtime.ready) {
                 runtime.message = "Ready"
                 updateDeviceView(profile.id)
             }
@@ -782,7 +774,7 @@ class MainActivity : FragmentActivity() {
             return
         }
         if (!requireBluetoothAvailable()) return
-        if (pendingPressId != null) {
+        if (hasPendingOperations) {
             toast("Another BLE action is already running")
             return
         }
@@ -802,17 +794,17 @@ class MainActivity : FragmentActivity() {
         }
         operationGeneration++
         val generation = operationGeneration
-        pendingPressId = profile.id
+        maintenanceDeviceId = profile.id
         pendingPskValue = newPsk
         pendingPskOnSaved = onSaved
         pendingOtaImage = null
-        pressDispatched = false
-        setAllActionsEnabled(false)
+        maintenanceDispatched = false
+        updateAllDeviceViews()
         runtime.message = if (runtime.ready) "Updating device PSK..." else "Connecting to update device PSK..."
         updateDeviceView(profile.id)
 
         if (runtime.ready) {
-            pressDispatched = true
+            maintenanceDispatched = true
             if (clients[profile.id]?.updatePsk(newPsk) != true) {
                 finishPskUpdate(profile, false, "This firmware does not support PSK updates")
                 return
@@ -831,12 +823,12 @@ class MainActivity : FragmentActivity() {
 
     private fun finishPskUpdate(profile: BleDeviceProfile, success: Boolean, message: String) {
         val newPsk = pendingPskValue ?: return
-        if (pendingPressId != profile.id) return
+        if (maintenanceDeviceId != profile.id) return
         val onSaved = pendingPskOnSaved
         pendingPskValue = null
         pendingPskOnSaved = null
-        pendingPressId = null
-        pressDispatched = false
+        maintenanceDeviceId = null
+        maintenanceDispatched = false
         operationGeneration++
 
         var saved = success
@@ -849,7 +841,7 @@ class MainActivity : FragmentActivity() {
         val runtime = runtimes.getValue(profile.id)
         runtime.message = if (saved) message else "PSK recovery required — both keys retained in Device Settings"
         updateDeviceView(profile.id)
-        setAllActionsEnabled(true)
+        updateAllDeviceViews()
         EventLog.add(this, EventLog.Kind.DIAGNOSTIC, message, deviceId = profile.id, deviceName = profile.displayName)
         if (saved) {
             vibrateSuccess()
@@ -872,25 +864,25 @@ class MainActivity : FragmentActivity() {
             showDevicePskDialog(profile) { requestCarOta(profile, image) }
             return
         }
-        if (pendingPressId != null) {
+        if (hasPendingOperations) {
             toast("Another BLE action is already running")
             return
         }
 
         operationGeneration++
         val generation = operationGeneration
-        pendingPressId = profile.id
+        maintenanceDeviceId = profile.id
         pendingPskValue = null
         pendingPskOnSaved = null
         pendingOtaImage = image
-        pressDispatched = false
-        setAllActionsEnabled(false)
+        maintenanceDispatched = false
+        updateAllDeviceViews()
         runtime.state = BleCarKeyClient.State.CONNECTING
         runtime.message = "Connecting for firmware update..."
         updateDeviceView(profile.id)
         val client = clients[profile.id]
         if (runtime.ready && client != null) {
-            pressDispatched = true
+            maintenanceDispatched = true
             runtime.message = "Preparing firmware update..."
             updateDeviceView(profile.id)
             EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "${profile.displayName}: OTA dispatched on ready connection", deviceId = profile.id, deviceName = profile.displayName)
@@ -904,7 +896,7 @@ class MainActivity : FragmentActivity() {
         }
 
         mainHandler.postDelayed({
-            if (generation == operationGeneration && pendingOtaImage != null && !pressDispatched) {
+            if (generation == operationGeneration && pendingOtaImage != null && !maintenanceDispatched) {
                 finishOtaOperation(profile, false, "Could not prepare the BLE firmware connection")
             }
         }, 20_000L)
@@ -920,23 +912,24 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun finishOtaOperation(profile: BleDeviceProfile, success: Boolean, message: String) {
-        if (pendingPressId != profile.id || pendingOtaImage == null) return
+        if (maintenanceDeviceId != profile.id || pendingOtaImage == null) return
         pendingOtaImage = null
-        pendingPressId = null
-        pressDispatched = false
+        maintenanceDeviceId = null
+        maintenanceDispatched = false
         operationGeneration++
         val runtime = runtimes.getValue(profile.id)
         runtime.message = message
         updateDeviceView(profile.id)
-        setAllActionsEnabled(true)
+        updateAllDeviceViews()
         EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "ESP firmware update ${if (success) "completed" else "failed"}: $message", deviceId = profile.id, deviceName = profile.displayName)
         if (success) vibrateSuccess() else vibrateFailure()
         val completedGeneration = operationGeneration
+        val completedFeedback = Any().also { pressFeedback[profile.id] = it }
         mainHandler.postDelayed({
-            if (completedGeneration != operationGeneration) return@postDelayed
+            if (completedGeneration != operationGeneration || pressFeedback[profile.id] !== completedFeedback) return@postDelayed
             stopClient(profile.id)
             if (appForeground) mainHandler.postDelayed({
-                if (completedGeneration == operationGeneration) ensureClient(profile)
+                if (completedGeneration == operationGeneration && pressFeedback[profile.id] === completedFeedback) ensureClient(profile)
             }, 2_000L)
         }, if (success) 300L else 1_500L)
     }
@@ -967,7 +960,7 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun restartDeviceConnection(profile: BleDeviceProfile, rescan: Boolean): Boolean {
-        if (pendingPressId != null || firmwarePickerActive || clients[profile.id]?.canRestartConnection == false) {
+        if (hasPendingOperations || firmwarePickerActive || clients[profile.id]?.canRestartConnection == false) {
             toast("Finish the current Bluetooth operation before reconnecting")
             return false
         }
@@ -1006,13 +999,13 @@ class MainActivity : FragmentActivity() {
         val runtime = runtimes[deviceId] ?: return
         val views = deviceViews[deviceId] ?: return
         val connected = runtime.state == BleCarKeyClient.State.CONNECTED
-        val pendingTap = pendingPressId == deviceId && !pressDispatched && pendingPskValue == null && pendingOtaImage == null
+        val pendingTap = presses[deviceId]?.dispatched == false
         views.statusText.text = when {
             bluetoothAvailability != BluetoothAvailability.AVAILABLE ->
                 listOfNotNull(bluetoothAvailability.message, runtime.uncertainOutcome).joinToString("\n")
             runtime.uncertainOutcome != null -> runtime.uncertainOutcome
             pendingTap -> "Connecting (up to 10s)…"
-            connected && pendingPressId == deviceId -> runtime.message
+            connected && (maintenanceDeviceId == deviceId || presses[deviceId] != null) -> runtime.message
             connected && runtime.deviceState != null -> "${runtime.deviceState} • Connected"
             runtime.deviceState != null -> "${runtime.message}\nLast state: ${runtime.deviceState}"
             else -> runtime.message
@@ -1028,22 +1021,15 @@ class MainActivity : FragmentActivity() {
                 else -> Color.rgb(132, 136, 153)
             },
         )
-        val busy = pendingPressId != null
-        val cancellable = pendingPressId == deviceId && !pressDispatched && pendingPskValue == null && pendingOtaImage == null
+        val busy = maintenanceDeviceId != null || presses[deviceId] != null
+        val cancellable = presses[deviceId]?.dispatched == false
         views.actionButton.text = if (cancellable) "Cancel" else "Press"
         views.actionButton.isEnabled = bluetoothAvailability == BluetoothAvailability.AVAILABLE && (!busy || cancellable)
         views.actionButton.alpha = if (views.actionButton.isEnabled) 1f else 0.5f
     }
 
-    private fun setAllActionsEnabled(enabled: Boolean) {
-        deviceViews.values.forEach { views ->
-            views.actionButton.isEnabled = enabled && bluetoothAvailability == BluetoothAvailability.AVAILABLE
-            views.actionButton.alpha = if (views.actionButton.isEnabled) 1f else 0.5f
-        }
-    }
-
     private fun showDeviceSettingsAuthenticated(profile: BleDeviceProfile) {
-        if (pendingPressId != null) {
+        if (hasPendingOperations) {
             toast(if (pendingOtaImage != null) "Finish the firmware update before changing settings" else "Finish the current BLE action first")
             return
         }
@@ -1108,7 +1094,7 @@ class MainActivity : FragmentActivity() {
                 "Device health snapshot: ${snapshot.display()}", deviceId = profile.id, deviceName = profile.displayName)
         }
         healthFetch = {
-            if (appForeground && dialog.isShowing && runtimes[profile.id]?.ready == true && pendingPressId == null) {
+            if (appForeground && dialog.isShowing && runtimes[profile.id]?.ready == true && !hasPendingOperations) {
                 val token = healthRequest.takeWhenReady()
                 if (token != null) {
                     val client = clients[profile.id]
@@ -1439,7 +1425,7 @@ class MainActivity : FragmentActivity() {
                 dialog.show()
                 firmwarePanel.start()
                 firmwareHealthFetch = {
-                    if (dialog.isShowing && appForeground && runtime.ready && pendingPressId == null && !settingsHealthStarted) {
+                    if (dialog.isShowing && appForeground && runtime.ready && !hasPendingOperations && !settingsHealthStarted) {
                         settingsHealthStarted = true; settingsHealthPending = true
                         clients[profile.id]?.requestDeviceHealth { snapshot, _ ->
                             settingsHealthPending = false
@@ -1652,7 +1638,7 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun showAppSettings() {
-        if (pendingPressId != null) {
+        if (hasPendingOperations) {
             toast(if (pendingOtaImage != null) "Finish the firmware update before changing settings" else "Finish the current BLE action first")
             return
         }
@@ -1904,10 +1890,9 @@ class MainActivity : FragmentActivity() {
             ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
 
     @android.annotation.SuppressLint("MissingPermission")
-    private fun captureOperationLocation(profile: BleDeviceProfile) {
+    private fun captureOperationLocation(profile: BleDeviceProfile, locationSession: String) {
         if (!runtimes.getValue(profile.id).recordLocation || !hasLocationPermission()) return
         val operationTime = System.currentTimeMillis()
-        val locationSession = operationSession
         try {
             val manager = getSystemService(LocationManager::class.java)
             val provider = when {
