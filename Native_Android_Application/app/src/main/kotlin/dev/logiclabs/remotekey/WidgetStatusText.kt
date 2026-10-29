@@ -2,17 +2,19 @@ package dev.logiclabs.remotekey
 
 internal object WidgetStatusText {
     enum class Tone(val background: Int, val accent: Int) {
-        IDLE(R.drawable.widget_background, 0xFF8EB4FF.toInt()),
+        IDLE(R.drawable.widget_background, 0xFFC4C4CC.toInt()),
+        CONNECTED(R.drawable.widget_background_connected, 0xFF9AC5FF.toInt()),
         CONNECTING(R.drawable.widget_background_connecting, 0xFFFFCC80.toInt()),
         SENDING(R.drawable.widget_background_sending, 0xFF9AC5FF.toInt()),
         CONFIRMED(R.drawable.widget_background_confirmed, 0xFF96E6AB.toInt()),
         ERROR(R.drawable.widget_background_error, 0xFFFFB4AB.toInt())
     }
-    fun tone(message: String): Tone = when {
+    fun tone(message: String, connected: Boolean = false): Tone = when {
         message.startsWith("Pressed") -> Tone.CONFIRMED
         message.startsWith("Connecting") -> Tone.CONNECTING
         message.startsWith("Sending") -> Tone.SENDING
         message.startsWith("Unable to confirm") || message.startsWith("Not sent") || message.startsWith("Canceled") -> Tone.ERROR
+        connected -> Tone.CONNECTED
         else -> Tone.IDLE
     }
     fun label(message: String): String = when {
@@ -32,7 +34,7 @@ internal object WidgetStatusText {
             message.startsWith("Canceled") -> "Cancel"
             else -> "Unsent"
         }
-        Tone.IDLE -> label(message)
+        Tone.IDLE, Tone.CONNECTED -> label(message)
     }
     fun replacesCompactName(message: String) = tone(message) != Tone.IDLE
 }

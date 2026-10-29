@@ -18,6 +18,12 @@ separate Car and Gate apps so each watch app keeps one clear target and PSK.
 
 ## Current limitations
 
+Version 2.8.12 (`gate-ble-v2.8.12-update-metadata`) adds `fw` and `build` fields to
+the existing BLE identity descriptor. Android can compare that running revision
+with a published GitHub config and link to its source. This does not change the
+BLE command protocol or install anything through the phone. Older gate configs
+do not report their running revision over BLE; update through ESPHome to enable it.
+
 - The BLE server permits five simultaneous clients, with independent challenge,
   status, and Garmin split-write state for each connection.
 - PSK updates over BLE are not exposed. Change the key slots in the YAML and

@@ -110,6 +110,7 @@ class WidgetPressService : Service() {
             override fun onState(state: BleCarKeyClient.State, message: String) {
                 if (!current()) return
                 log("${state.name}: $message")
+                PressWidgetProvider.connection(this@WidgetPressService, target.id, "widget", state == BleCarKeyClient.State.CONNECTED)
                 if (state != BleCarKeyClient.State.CONNECTED) ready = false
                 if (state == BleCarKeyClient.State.DISCONNECTED) {
                     if (window.busy) finishRequest(false, if (window.dispatched) "Unable to confirm — check the device" else "Not sent — $message")
@@ -216,6 +217,7 @@ class WidgetPressService : Service() {
         generation++ // Invalidate ownership before synchronous teardown callbacks.
         val old = client; client = null; ready = false
         old?.stop()
+        profile?.let { PressWidgetProvider.connection(this, it.id, "widget", false) }
         profile?.let { PressWidgetProvider.publish(this, it.id, status) }
         if (!keepProfile) { profile = null; key = null }
     }

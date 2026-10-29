@@ -18,7 +18,9 @@ data class DeviceHealth(
             "At phone (ESP → phone): ${phoneRssi?.let { "$it dBm" } ?: "Unavailable"}\n" +
             "At ESP (phone → ESP): ${espRssi?.let { "$it dBm" } ?: if (espSignalSupported) "Unavailable — tap Refresh to retry" else "Unavailable — firmware support required"}\n" +
             "Closer to 0 dBm means a stronger received signal. These are connection snapshots, not transmit power."
-        if (!hasFirmwareHealth) return "$signal\n\nDetailed ESP health is not supported by this firmware. Tap Refresh for a new phone signal reading."
+        if (!hasFirmwareHealth) return "$signal" +
+            (if (firmware.isNotEmpty()) "\n\nFirmware: $firmware\nBuild: $build" else "") +
+            "\n\nDetailed ESP health is not supported by this firmware. Tap Refresh for a new phone signal reading."
         val ota = when (otaState) {
             "valid" -> "Validated"
             "pending" -> "Checking BLE health — refresh after one minute"
@@ -62,6 +64,17 @@ data class DeviceHealth(
     }
 
     companion object {
+        fun gateIdentity(value: String): DeviceHealth? = runCatching {
+            require(value.length <= 256)
+            val parts = value.split('|')
+            require(parts.size == 5 && parts.take(4) == listOf("blekey", "2", "gate-main", "gate"))
+            val pairs = parts[4].split(',').filter { '=' in it }.map { it.substringBefore('=') to it.substringAfter('=') }
+            require(pairs.map { it.first }.distinct().size == pairs.size)
+            val fields = pairs.toMap()
+            val version = fields.getValue("fw").also { require(FirmwareVersion.parse(it) != null) }
+            val build = fields.getValue("build").also { require(it.matches(Regex("gate-ble-v${Regex.escape(version)}-[a-z0-9-]{1,64}"))) }
+            signalOnly("signal1" in parts[4].split(',')).copy(firmware = version, build = build)
+        }.getOrNull()
         fun signalOnly(espSignalSupported: Boolean = false) = DeviceHealth("", "", "", 0, "", "unknown", 0, 0, 0, 0, 0,
             hasFirmwareHealth = false, espSignalSupported = espSignalSupported)
         fun capabilities(value: String): List<String> = value.split('|').let {

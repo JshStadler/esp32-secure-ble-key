@@ -1,5 +1,5 @@
 <h1>Remote Key Privacy Policy</h1>
-<p>Last updated: 9 September 2026</p>
+<p>Last updated: 29 October 2026</p>
 <p>Remote Key (Android application ID <b>dev.logiclabs.remotekey</b>) is provided by Logic-Labs. This policy explains how the app handles information when you use it to control compatible Bluetooth Low Energy (BLE) devices.</p>
 <p>For privacy questions, requests, or support, email <a href="mailto:info@6675162.xyz">info@6675162.xyz</a>.</p>
 
@@ -7,6 +7,7 @@
 <p>Remote Key connects directly to compatible ESP devices over Bluetooth. The app has no account registration, advertising, advertising identifiers, analytics SDKs, or automatic developer-operated cloud sync. The app does not send your device settings, keys, logs, or locations to Logic-Labs automatically.</p>
 
 <h2>Information stored on your phone</h2>
+<p>Opening Device Settings checks public firmware release information on GitHub. Selecting a firmware update downloads its signed image from GitHub before you confirm the BLE transfer. These HTTPS requests expose ordinary connection information, such as your IP address, to GitHub; they do not include your keys, Bluetooth addresses, device names, locations or logs. The app does not periodically check for updates while closed. Downloads are checked against the release SHA-256 digest and the ESP verifies the firmware signature before installation.</p>
 <ul>
 <li><b>Device configuration:</b> device names, device types and identifiers, Bluetooth addresses, connection preferences, and per-device location preferences.</li>
 <li><b>Security information:</b> the pre-shared keys (PSKs) you enter or generate, authentication preferences, and recovery information needed to complete interrupted key changes.</li>

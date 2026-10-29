@@ -74,6 +74,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
     private var securePskSupported = false
     private var healthSupported = false
     private var gateSignalSupported = false
+    private var gateFirmware: DeviceHealth? = null
     private var radioSupported = false
     private var radioPowerSupported = false
     private var radioDualPowerSupported = false
@@ -285,6 +286,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         service.getCharacteristic(profile.identityUuid)?.let { identity ->
             // This is before authentication: firmware returns static capabilities only.
             read(identity) {
+                if (profile.type == BleDeviceType.ESPHOME_ACCESS) gateFirmware = DeviceHealth.gateIdentity(it.toString(Charsets.UTF_8))
                 val caps = it.toString(Charsets.UTF_8).split('|').last().split(',')
                 securePskSupported = "psk2" in caps
                 healthSupported = "health1" in caps
@@ -373,9 +375,9 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         readPhoneRssi {
             if (generation != healthGeneration) return@readPhoneRssi
             if (gateSignalSupported) readGateSignal(generation) { rssi ->
-                finish(DeviceHealth.signalOnly(espSignalSupported = true).copy(espRssi = rssi))
+                finish((gateFirmware ?: DeviceHealth.signalOnly(espSignalSupported = true)).copy(espRssi = rssi))
             }
-            else if (!healthSupported || identity == null) finish(DeviceHealth.signalOnly())
+            else if (!healthSupported || identity == null) finish(gateFirmware ?: DeviceHealth.signalOnly())
             else read(identity) { finish(DeviceHealth.parse(it.toString(Charsets.UTF_8))) }
         }
     }
@@ -754,7 +756,7 @@ class BleCarKeyClient(private val context: Context, private val bluetoothManager
         otaControl = null; otaData = null; otaStatus = null; deviceState = null
         receipt = null; receiptBusy = false; compactAuth = null; compactAuthSupported = false
         phoneRssi = null; phoneRssiRequest.reset()
-        nonce = null; ready = false; securePskSupported = false; healthSupported = false; gateSignalSupported = false; radioSupported = false; radioPowerSupported = false; radioDualPowerSupported = false
+        nonce = null; ready = false; securePskSupported = false; healthSupported = false; gateSignalSupported = false; gateFirmware = null; radioSupported = false; radioPowerSupported = false; radioDualPowerSupported = false
         pendingCommand = null; commandWritePending = false; pendingStatus = null; commandGeneration++
         pskRequest?.receiptKey?.fill(0); pskRequest = null; pendingNewPsk = null
         otaImage = null; otaInFlight = false; otaChunkPending = false; otaResponse = null; otaGeneration++

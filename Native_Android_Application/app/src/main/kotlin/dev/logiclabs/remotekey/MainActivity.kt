@@ -88,6 +88,9 @@ class MainActivity : FragmentActivity() {
     private val deviceViews = mutableMapOf<String, DeviceViews>()
     private val clients = mutableMapOf<String, BleCarKeyClient>()
     private val clientGenerations = mutableMapOf<String, Int>()
+    private val firmwarePanels = mutableSetOf<FirmwareUpdatePanel>()
+    private val widgetConnectionOwner = "app:${UUID.randomUUID()}"
+    private var firmwareHealthFetch: (() -> Unit)? = null
     private val profiles = mutableListOf<BleDeviceProfile>()
 
     private var appForeground = false
@@ -242,6 +245,7 @@ class MainActivity : FragmentActivity() {
     }
 
     override fun onDestroy() {
+        firmwarePanels.forEach { it.close() }; firmwarePanels.clear()
         initialSetupDialog?.dismiss()
         if (bluetoothReceiverRegistered) unregisterReceiver(bluetoothReceiver)
         radioDialog?.dismiss()
@@ -644,11 +648,13 @@ class MainActivity : FragmentActivity() {
         private fun current() = clientGenerations[profile.id] == generation && clients.containsKey(profile.id)
         override fun onState(state: BleCarKeyClient.State, message: String) = runOnUiThread {
             if (!current()) return@runOnUiThread
+            PressWidgetProvider.connection(this@MainActivity, profile.id, widgetConnectionOwner, state == BleCarKeyClient.State.CONNECTED)
             EventLog.add(this@MainActivity, EventLog.Kind.DIAGNOSTIC, "${profile.displayName} ${state.name}: $message", deviceId = profile.id, deviceName = profile.displayName)
             val runtime = runtimes.getValue(profile.id)
             runtime.state = state
             runtime.message = ConnectionStatusText.label(state, message, runtime.hasConnected)
             if (state != BleCarKeyClient.State.CONNECTED) runtime.ready = false
+            firmwarePanels.forEach { it.refreshInstalled() }
             updateDeviceView(profile.id)
             if (message.contains("scan fallback")) {
                 mainHandler.post { clients[profile.id]?.scanFallback() }
@@ -664,12 +670,14 @@ class MainActivity : FragmentActivity() {
             if (!current()) return@runOnUiThread
             val runtime = runtimes.getValue(profile.id)
             runtime.ready = ready
+            firmwarePanels.forEach { it.refreshInstalled() }
             if (ready) {
                 runtime.hasConnected = true
                 runtime.message = "Ready"
             }
             updateDeviceView(profile.id)
             if (ready && healthDeviceId == profile.id && pendingPressId == null) healthFetch?.invoke()
+            if (ready && pendingPressId == null) firmwareHealthFetch?.invoke()
             if (ready && pendingPressId == profile.id && !pressDispatched) {
                 if (pendingPskValue == null && pendingOtaImage == null &&
                     pendingButtonPress?.claim(android.os.SystemClock.elapsedRealtime()) != true) {
@@ -976,6 +984,7 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun stopClient(deviceId: String) {
+        PressWidgetProvider.connection(this, deviceId, widgetConnectionOwner, false)
         clientGenerations[deviceId] = (clientGenerations[deviceId] ?: 0) + 1
         clients.remove(deviceId)?.stop(true)
         runtimes[deviceId]?.apply {
@@ -1243,6 +1252,21 @@ class MainActivity : FragmentActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24), dp(8), dp(24), dp(12))
         }
+        var settingsHealthPending = false
+        var settingsHealthStarted = false
+        val firmwarePanel = FirmwareUpdatePanel(this, profile, {
+            lastDeviceHealth[profile.id]?.takeIf { runtime.ready && android.os.SystemClock.elapsedRealtime() - it.capturedAt <= 60_000 }?.health
+        }, { image ->
+            if (!appForeground || !authenticated || profiles.firstOrNull { it.id == profile.id } != profile) {
+                toast("Reopen this device's settings before updating firmware")
+            } else authenticate("Authenticate to update ${profile.displayName}") { ok ->
+                if (ok && appForeground && profiles.firstOrNull { it.id == profile.id } == profile) {
+                    settingsDialog.dismiss()
+                    requestCarOta(profile, image)
+                }
+            }
+        })
+        firmwarePanels.add(firmwarePanel)
         val name = EditText(this).apply {
             hint = "Device name"
             setText(profile.displayName)
@@ -1341,6 +1365,8 @@ class MainActivity : FragmentActivity() {
             settingsDialog.dismiss()
             showDeviceHealth(profile)
         }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+        layout.addView(sectionLabel("Firmware updates"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+        layout.addView(firmwarePanel, LinearLayout.LayoutParams(-1, -2))
         if (profile.supportsBleOta) {
             layout.addView(primaryButton("Update ESP firmware (.bin)") {
                 pendingFirmwareProfileId = profile.id
@@ -1372,6 +1398,11 @@ class MainActivity : FragmentActivity() {
             .setPositiveButton("Save", null)
             .create().also { dialog ->
                 settingsDialog = dialog
+                dialog.setOnDismissListener {
+                    firmwarePanel.close(); firmwarePanels.remove(firmwarePanel)
+                    firmwareHealthFetch = null
+                    if (settingsHealthPending) clients[profile.id]?.cancelDeviceHealth()
+                }
                 dialog.setOnShowListener {
                     dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                         val newName = name.text.toString().trim()
@@ -1406,6 +1437,20 @@ class MainActivity : FragmentActivity() {
                     }
                 }
                 dialog.show()
+                firmwarePanel.start()
+                firmwareHealthFetch = {
+                    if (dialog.isShowing && appForeground && runtime.ready && pendingPressId == null && !settingsHealthStarted) {
+                        settingsHealthStarted = true; settingsHealthPending = true
+                        clients[profile.id]?.requestDeviceHealth { snapshot, _ ->
+                            settingsHealthPending = false
+                            if (dialog.isShowing && snapshot != null) {
+                                lastDeviceHealth[profile.id] = TimedDeviceHealth(snapshot, android.os.SystemClock.elapsedRealtime())
+                                firmwarePanel.refreshInstalled()
+                            }
+                        }
+                    }
+                }
+                firmwareHealthFetch?.invoke()
             }
     }
 

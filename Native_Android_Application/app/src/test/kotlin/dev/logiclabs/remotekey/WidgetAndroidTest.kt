@@ -22,6 +22,47 @@ import org.robolectric.annotation.GraphicsMode
 @Config(sdk = [35])
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class WidgetAndroidTest {
+    @Test fun normalWidgetsUseGreyWhenDisconnectedAndBlueWhenConnected() {
+        val context = RuntimeEnvironment.getApplication()
+        listOf(false, true).forEach { connected ->
+            val message = if (connected) "Connected" else "Tap to press"
+            val view = PressWidgetProvider.views(context, 123, BleDeviceProfiles.GATE, message, false, false, connected = connected)
+                .apply(context, android.widget.FrameLayout(context))
+            view.measure(View.MeasureSpec.makeMeasureSpec(180, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(160, View.MeasureSpec.EXACTLY))
+            view.layout(0, 0, 180, 160)
+            val bitmap = android.graphics.Bitmap.createBitmap(180, 160, android.graphics.Bitmap.Config.ARGB_8888)
+            view.draw(android.graphics.Canvas(bitmap))
+            assertEquals(android.graphics.Color.parseColor(if (connected) "#213854" else "#303036"), bitmap.getPixel(20, 20))
+            val file = java.io.File(System.getProperty("blekey.layoutReportsDir"), "widget-connected-$connected.png").apply { parentFile?.mkdirs() }
+            file.outputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+            bitmap.recycle()
+        }
+    }
+    @Test fun resultsClearAfterThreeSecondsAndTheRemainingConnectionDeterminesTheColour() {
+        val context = RuntimeEnvironment.getApplication()
+        PressWidgetProvider.connection(context, "gate", "app", true)
+        PressWidgetProvider.connection(context, "gate", "widget", true)
+        PressWidgetProvider.publish(context, "gate", "Pressed • ready for 2 minutes")
+        PressWidgetProvider.connection(context, "gate", "widget", false)
+        assertTrue(PressWidgetProvider.currentMessage("gate").startsWith("Pressed"))
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(3))
+        assertEquals("Connected", PressWidgetProvider.currentMessage("gate"))
+        assertEquals(WidgetStatusText.Tone.CONNECTED, WidgetStatusText.tone("Connected", PressWidgetProvider.isConnected("gate")))
+        PressWidgetProvider.connection(context, "gate", "app", false)
+        PressWidgetProvider.publish(context, "gate", "Not sent — connection timed out")
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(3))
+        assertEquals("Tap to press", PressWidgetProvider.currentMessage("gate"))
+        assertEquals(WidgetStatusText.Tone.IDLE, WidgetStatusText.tone("Tap to press", PressWidgetProvider.isConnected("gate")))
+    }
+    @Test fun anOldFeedbackResetCannotClearANewerPendingPress() {
+        val context = RuntimeEnvironment.getApplication()
+        PressWidgetProvider.publish(context, "gate", "Not sent — connection timed out")
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(2))
+        PressWidgetProvider.publish(context, "gate", "Connecting…", true, "new-request")
+        shadowOf(android.os.Looper.getMainLooper()).idleFor(java.time.Duration.ofSeconds(2))
+        assertEquals("Connecting…", PressWidgetProvider.currentMessage("gate"))
+        assertTrue(PressWidgetProvider.isBusy("gate"))
+    }
     @Test fun aCachedWaitingWidgetCanOnlyCancelTheRequestItDisplayed() {
         val context = RuntimeEnvironment.getApplication()
         val host = android.widget.FrameLayout(context)

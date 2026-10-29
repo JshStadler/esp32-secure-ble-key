@@ -2,7 +2,7 @@ substitutions:
   name: "centurion-d5-evo"
   friendly_name: "Centurion D5 Evo"
   comment: "Control Centurion D5 Evo gate motor remotely. Including Kocom bell ringing"
-  gate_ble_build: "gate-ble-v2.8.11-session-close-guards"
+  gate_ble_build: "gate-ble-v2.8.12-update-metadata"
 
   # Gate LED pulse-meter decoder tuning. pulse_meter captures rising edges
   # in its ISR path; the shared binary sensor is only used to determine the
@@ -660,7 +660,7 @@ esp32_ble_server:
           uuid: b1b2c3d4-e5f6-7890-abcd-ef1234567897
           read: true
           value:
-            data: "blekey|2|gate-main|gate|press,state,signal1"
+            data: "blekey|2|gate-main|gate|press,state,signal1,fw=2.8.12,build=${gate_ble_build}"
             type: string
 
         # Append diagnostics after existing characteristics so their handles

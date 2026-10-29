@@ -90,6 +90,26 @@ it cannot be recalled: taps during **Send… / Sending…** are ignored and the 
 waits for its result. Cached widget or notification cancellation actions are bound
 to the original request, so they cannot cancel a newer press or start one.
 
+Widget success, failure and cancellation results clear after three seconds.
+The normal background is gray when disconnected and blue while an app or widget
+client still holds a connection. Connecting/sending retain their progress colours.
+
+Device Settings checks public GitHub firmware releases when opened, with a
+five-minute in-memory metadata cache and an explicit Check again action. There
+is no periodic background update job. Standalone ESP32-C3 releases can be
+downloaded, checked for size, SHA-256 and chip type, then installed through the
+existing authenticated BLE updater after confirmation. The ESP still verifies
+the firmware signature. A known same/newer installed version is not offered as
+an upgrade; the local .bin file picker remains available.
+
+ESPHome devices show the latest published config and link to its versioned source;
+they are installed through ESPHome, not this app. Gate firmware 2.8.12 adds the
+running version/build to the existing BLE identity descriptor. Earlier gate
+firmware shows the latest available config without claiming its installed version
+is known. Published firmware-vX.Y.Z releases may include both device families;
+gate-vX.Y.Z releases contain only the ESPHome config. Pre-releases are labelled beta.
+Only the matching named asset for each family is selected.
+
 A button tapped while connecting stays pending after **Home** or **Recent apps**
 is pressed. The background service retains the connection attempt and sends the
 press once ready, within the original ten-second connection deadline. This also
