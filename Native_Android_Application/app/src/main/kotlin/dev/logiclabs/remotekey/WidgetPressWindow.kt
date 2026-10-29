@@ -5,17 +5,20 @@ internal class WidgetPressWindow {
     private var press: PendingButtonPress? = null
     private var started = 0L
     private var sent = false
+    private var requestId: String? = null
     private var idleUntil = Long.MAX_VALUE
     var active = false
         private set
     val busy get() = press != null
     val dispatched get() = busy && sent
+    val cancellationId get() = requestId?.takeIf { busy && !sent }
 
-    fun tap(now: Long): Boolean {
+    fun tap(now: Long, requestId: String? = null): Boolean {
         if (busy) return false
         press = PendingButtonPress(now)
         started = now
         sent = false
+        this.requestId = requestId
         active = true
         idleUntil = Long.MAX_VALUE
         return true
@@ -46,5 +49,11 @@ internal class WidgetPressWindow {
         }
         return (deadline - now).coerceAtLeast(1)
     }
-    fun cancel() { press?.cancel(); press = null; active = false }
+    /** A delayed launcher/notification tap may cancel only the request it displayed. */
+    fun cancelPending(requestId: String?): Boolean {
+        if (requestId == null || requestId != cancellationId) return false
+        cancel()
+        return true
+    }
+    fun cancel() { press?.cancel(); press = null; requestId = null; active = false }
 }

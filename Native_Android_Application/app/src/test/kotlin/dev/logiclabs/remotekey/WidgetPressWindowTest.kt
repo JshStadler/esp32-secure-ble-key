@@ -4,6 +4,34 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class WidgetPressWindowTest {
+    @Test fun aSecondTapBeforeDispatchRevokesTheCommandEvenIfTheConnectionThenBecomesReady() {
+        val w = WidgetPressWindow()
+        w.tap(0, "request-a")
+        assertEquals("request-a", w.cancellationId)
+        assertTrue(w.cancelPending("request-a"))
+        assertFalse(w.claim(1))
+        assertFalse(w.complete(2))
+        assertFalse(w.active)
+        assertNull(w.cancellationId)
+    }
+    @Test fun cancellationCannotRecallAnAlreadyDispatchedCommandOrHideItsReceipt() {
+        val w = WidgetPressWindow()
+        w.tap(0, "request-a"); assertTrue(w.claim(1))
+        assertNull(w.cancellationId)
+        assertFalse(w.cancelPending("request-a"))
+        assertTrue(w.dispatched)
+        assertTrue(w.complete(2))
+    }
+    @Test fun anOldWaitingTapCannotCancelANewerRequest() {
+        val w = WidgetPressWindow()
+        w.tap(0, "request-a"); w.claim(1); w.complete(2)
+        assertFalse(w.cancelPending("request-a"))
+        w.tap(3, "request-b")
+        assertFalse(w.cancelPending("request-a"))
+        assertFalse(w.cancelPending(null))
+        assertTrue(w.claim(4))
+        assertTrue(w.complete(5))
+    }
     @Test fun oneTapCanOnlyAuthorizeOneCommand() {
         val w = WidgetPressWindow()
         assertTrue(w.tap(100))

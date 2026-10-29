@@ -84,6 +84,11 @@ widget press restarts that widget connection's deadline; Off disconnects immedia
 after its result. Connecting is amber, sending is blue, confirmation is green and
 failure/uncertainty is red. Confirmation lasts three seconds before the widget
 returns to its device name and ready status (or idle when Off).
+Tapping a widget again while it shows **Wait… / Connecting…** cancels that unsent
+request immediately, without an authentication prompt. Once the command is sent,
+it cannot be recalled: taps during **Send… / Sending…** are ignored and the app
+waits for its result. Cached widget or notification cancellation actions are bound
+to the original request, so they cannot cancel a newer press or start one.
 
 A button tapped while connecting stays pending after **Home** or **Recent apps**
 is pressed. The background service retains the connection attempt and sends the

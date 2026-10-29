@@ -4,11 +4,19 @@ import android.app.*
 import android.appwidget.AppWidgetManager
 import android.bluetooth.BluetoothManager
 import android.content.Intent
+import android.content.Context
+import android.net.Uri
 import android.os.*
 import androidx.core.app.NotificationCompat
 
 /** Owns a short-lived widget connection independently of the dashboard activity. */
 class WidgetPressService : Service() {
+    companion object {
+        internal fun cancellationIntent(context: Context, profileId: String, requestId: String) =
+            Intent(context, WidgetPressService::class.java).setAction("cancel")
+                .setData(Uri.parse("remotekey://widget-action/cancel/$requestId"))
+                .putExtra("cancel_profile_id", profileId).putExtra("cancel_request_id", requestId)
+    }
     private val handler = Handler(Looper.getMainLooper())
     private val window = WidgetPressWindow()
     private val requests = WidgetRequestLedger()
@@ -31,7 +39,14 @@ class WidgetPressService : Service() {
         lastStartId = startId
         if (!foreground()) { end("Not sent — unable to start Bluetooth"); return START_NOT_STICKY }
         when (intent?.action) {
-            "cancel" -> { if (window.busy && !window.dispatched) end("Canceled before sending"); return START_NOT_STICKY }
+            "cancel" -> {
+                if (intent.getStringExtra("cancel_profile_id") == profile?.id &&
+                    window.cancelPending(intent.getStringExtra("cancel_request_id"))) {
+                    log("Widget request canceled before sending")
+                    end("Canceled before sending")
+                } else if (!window.active && profile == null) stopSelf(lastStartId)
+                return START_NOT_STICKY
+            }
             "close" -> { if (!window.busy) end("Tap to press"); return START_NOT_STICKY }
         }
         val requestId = intent?.getStringExtra("request_id")
@@ -67,7 +82,7 @@ class WidgetPressService : Service() {
         actionWidgetId = widgetId
         actionAuthenticated = intent?.getBooleanExtra("authenticated", false) == true
         clearFeedback()
-        window.tap(now())
+        window.tap(now(), session)
         publish(if (ready) "Sending…" else "Connecting…")
         scheduleCheck()
         if (client == null) connect(target, psk)
@@ -170,7 +185,7 @@ class WidgetPressService : Service() {
     }
     private fun publish(value: String) {
         message = value
-        profile?.let { PressWidgetProvider.publish(this, it.id, value, window.busy) }
+        profile?.let { PressWidgetProvider.publish(this, it.id, value, window.busy, window.cancellationId) }
         foreground()
     }
     private fun foreground(): Boolean {
@@ -183,8 +198,10 @@ class WidgetPressService : Service() {
             .setContentIntent(open).setOngoing(true).setSilent(true)
         if (!window.dispatched) {
             val action = if (window.busy) "cancel" else "close"
+            val actionIntent = if (window.busy) cancellationIntent(this, profile?.id ?: "", session)
+                else Intent(this, WidgetPressService::class.java).setAction(action)
             val pending = if (Build.VERSION.SDK_INT >= 26) PendingIntent.getForegroundService(this, 1,
-                Intent(this, WidgetPressService::class.java).setAction(action), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+                actionIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
             else PendingIntent.getService(this, 1, Intent(this, WidgetPressService::class.java).setAction(action), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
             notification.addAction(0, if (window.busy) "Cancel" else "Disconnect", pending)
         }

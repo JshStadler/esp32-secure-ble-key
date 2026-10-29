@@ -22,6 +22,32 @@ import org.robolectric.annotation.GraphicsMode
 @Config(sdk = [35])
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class WidgetAndroidTest {
+    @Test fun aCachedWaitingWidgetCanOnlyCancelTheRequestItDisplayed() {
+        val context = RuntimeEnvironment.getApplication()
+        val host = android.widget.FrameLayout(context)
+        val first = PressWidgetProvider.views(context, 123, BleDeviceProfiles.GATE, "Connecting…", true, true, "request-a").apply(context, host)
+        val second = PressWidgetProvider.views(context, 123, BleDeviceProfiles.GATE, "Connecting…", true, true, "request-b").apply(context, host)
+        assertTrue(first.contentDescription.toString().contains("Tap to cancel before sending"))
+        assertTrue(first.performClick())
+        val oldCancel = shadowOf(context).nextStartedService
+        assertEquals("cancel", oldCancel.action)
+        assertEquals("request-a", oldCancel.getStringExtra("cancel_request_id"))
+        assertEquals("gate", oldCancel.getStringExtra("cancel_profile_id"))
+        assertTrue(second.performClick())
+        val newCancel = shadowOf(context).nextStartedService
+        assertEquals("request-b", newCancel.getStringExtra("cancel_request_id"))
+        assertNotEquals(oldCancel.data, newCancel.data)
+        assertNull(shadowOf(context).nextStartedActivity)
+    }
+    @Test fun tappingAnOldWaitingWidgetAfterProcessDeathCannotStartABlePress() {
+        val controller = Robolectric.buildService(WidgetPressService::class.java)
+        try {
+            val service = controller.create().get()
+            assertEquals(Service.START_NOT_STICKY, service.onStartCommand(
+                WidgetPressService.cancellationIntent(service, "gate", "expired-request"), 0, 1))
+            assertTrue(shadowOf(service).isStoppedBySelf)
+        } finally { controller.destroy() }
+    }
     @Test fun actualRemoteViewsShowDistinctProgressAndConfirmationOnCompactAndLargeWidgets() {
         val context = RuntimeEnvironment.getApplication()
         val phases = listOf("Connecting…", "Sending…", "Pressed • ready for 2 minutes", "Ready • 2 minutes", "Unable to confirm — check the device", "Not sent — connection timed out", "Canceled before sending")

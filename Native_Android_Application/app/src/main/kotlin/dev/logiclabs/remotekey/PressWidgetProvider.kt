@@ -24,8 +24,9 @@ class PressWidgetProvider : AppWidgetProvider() {
     }
     companion object {
         private const val PREFS = "press_widgets"
-        private val statuses = mutableMapOf<String, Pair<String, Boolean>>()
-        internal fun isBusy(profileId: String) = statuses[profileId]?.second == true
+        private data class Status(val message: String, val busy: Boolean, val cancellationId: String?)
+        private val statuses = mutableMapOf<String, Status>()
+        internal fun isBusy(profileId: String) = statuses[profileId]?.busy == true
         fun refreshAll(context: Context) {
             AppWidgetManager.getInstance(context).getAppWidgetIds(ComponentName(context, PressWidgetProvider::class.java))
                 .forEach { render(context, it) }
@@ -42,31 +43,35 @@ class PressWidgetProvider : AppWidgetProvider() {
                 .putString(widgetId.toString(), profileId).putString("${widgetId}_icon", icon.name).apply()
             render(context, widgetId)
         }
-        fun publish(context: Context, profileId: String, message: String, busy: Boolean = false) {
-            statuses[profileId] = message to busy
+        fun publish(context: Context, profileId: String, message: String, busy: Boolean = false, cancellationId: String? = null) {
+            statuses[profileId] = Status(message, busy, cancellationId)
             AppWidgetManager.getInstance(context).getAppWidgetIds(ComponentName(context, PressWidgetProvider::class.java))
-                .filter { deviceId(context, it) == profileId }.forEach { render(context, it, message, busy) }
+                .filter { deviceId(context, it) == profileId }.forEach { render(context, it) }
         }
         fun render(context: Context, widgetId: Int, message: String? = null, busy: Boolean? = null) {
             val profileId = deviceId(context, widgetId)
             val profile = DeviceProfileRepository(SecureStore(context)).load().firstOrNull { it.id == profileId }
             val current = statuses[profileId]
-            val displayedMessage = message ?: current?.first ?: "Tap to press"
-            val working = busy ?: current?.second ?: false
+            val displayedMessage = message ?: current?.message ?: "Tap to press"
+            val working = busy ?: current?.busy ?: false
             val options = AppWidgetManager.getInstance(context).getAppWidgetOptions(widgetId)
             val compact = options.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_HEIGHT) < 150 ||
                 options.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_WIDTH) < 150
             AppWidgetManager.getInstance(context).updateAppWidget(widgetId,
-                views(context, widgetId, profile, displayedMessage, working, compact))
+                views(context, widgetId, profile, displayedMessage, working, compact,
+                    if (message == null && working) current?.cancellationId else null))
         }
         internal fun views(context: Context, widgetId: Int, profile: BleDeviceProfile?, displayedMessage: String,
-            working: Boolean, compact: Boolean): RemoteViews {
+            working: Boolean, compact: Boolean, cancellationId: String? = null): RemoteViews {
             val tone = WidgetStatusText.tone(displayedMessage)
             val intent = if (profile == null) Intent(context, PressWidgetConfigureActivity::class.java)
                 else Intent(context, WidgetPressActivity::class.java)
             intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, widgetId)
             intent.data = Uri.parse("remotekey://widget/$widgetId/${if (profile == null) "configure" else "press"}")
-            val click = PendingIntent.getActivity(context, widgetId, intent,
+            val canCancel = working && profile != null && cancellationId != null && android.os.Build.VERSION.SDK_INT >= 26
+            val click = if (canCancel) PendingIntent.getForegroundService(context, widgetId,
+                WidgetPressService.cancellationIntent(context, profile!!.id, cancellationId!!), PendingIntent.FLAG_IMMUTABLE)
+            else PendingIntent.getActivity(context, widgetId, intent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
             return RemoteViews(context.packageName, R.layout.press_widget).apply {
                 val compactFeedback = compact && profile != null && WidgetStatusText.replacesCompactName(displayedMessage)
@@ -81,10 +86,11 @@ class PressWidgetProvider : AppWidgetProvider() {
                 setTextViewText(R.id.widget_status, if (profile == null) "Choose a device" else WidgetStatusText.label(displayedMessage))
                 // The launcher caches RemoteViews across process death. A cached
                 // disabled target could otherwise stay unusable after a crash.
-                // Live busy taps are rejected by the activity and service.
+                // Waiting taps cancel their specific request; sent-command taps are ignored.
                 setBoolean(R.id.widget_press, "setEnabled", true)
                 setOnClickPendingIntent(R.id.widget_press, click)
-                setContentDescription(R.id.widget_press, "${profile?.displayName ?: "Remote Key"}: $displayedMessage. ${if (working) "Working" else "Tap to press"}")
+                val action = if (canCancel) "Tap to cancel before sending" else if (working) "Already sending; cannot cancel" else "Tap to press"
+                setContentDescription(R.id.widget_press, "${profile?.displayName ?: "Remote Key"}: $displayedMessage. $action")
             }
         }
     }
