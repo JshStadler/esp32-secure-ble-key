@@ -146,7 +146,9 @@ class WidgetAndroidTest {
         val view = shadow.getViewFor(first)
         assertNotNull(view.findViewById<android.widget.ImageView>(R.id.widget_icon).drawable)
         assertTrue(view.findViewById<View>(R.id.widget_press).isEnabled)
-        assertEquals(View.VISIBLE, view.findViewById<View>(R.id.widget_status).visibility)
+        // This host applies the smallest responsive fallback before measuring.
+        // Larger layouts and their text are exercised at explicit sizes above.
+        assertEquals(View.GONE, view.findViewById<View>(R.id.widget_status).visibility)
     }
     @Test @Config(sdk = [28]) fun widgetsAreNotOfferedWhereBackgroundScanNeedsAdditionalPermissions() {
         assertFalse(RuntimeEnvironment.getApplication().resources.getBoolean(R.bool.press_widget_supported))
@@ -221,5 +223,45 @@ class WidgetAndroidTest {
         view.layout(0, 0, 72, 96)
         assertTrue(name.bottom <= view.height - view.paddingBottom)
         assertTrue(name.layout.height <= name.height - name.compoundPaddingTop - name.compoundPaddingBottom)
+    }
+    @Test fun singleCellLayoutFitsAt48DpWithLargeTextAndKeepsProgressAndCancellation() {
+        RuntimeEnvironment.setQualifiers("w360dp-h640dp-mdpi")
+        RuntimeEnvironment.setFontScale(2f)
+        val context = RuntimeEnvironment.getApplication()
+        val phases = listOf("Tap to press", "Connected", "Connecting…", "Sending…", "Pressed • ready for 30s", "Not sent — connection timed out")
+        phases.forEachIndexed { index, message ->
+            val waiting = message.startsWith("Connecting")
+            val busy = waiting || message.startsWith("Sending")
+            val view = PressWidgetProvider.views(context, 123, BleDeviceProfiles.GATE, message, busy, true,
+                if (waiting) "one-cell-request" else null, connected = message == "Connected", iconOnly = true)
+                .apply(context, android.widget.FrameLayout(context))
+            view.measure(View.MeasureSpec.makeMeasureSpec(48, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(48, View.MeasureSpec.EXACTLY))
+            view.layout(0, 0, 48, 48)
+            assertEquals(View.GONE, view.findViewById<TextView>(R.id.widget_name).visibility)
+            assertEquals(View.GONE, view.findViewById<TextView>(R.id.widget_status).visibility)
+            val icon = view.findViewById<View>(R.id.widget_icon)
+            assertTrue(icon.left >= view.paddingLeft && icon.right <= 48 - view.paddingRight)
+            assertTrue(icon.top >= view.paddingTop && icon.bottom <= 48 - view.paddingBottom)
+            val badge = view.findViewById<android.widget.ImageView>(R.id.widget_badge)
+            assertEquals(if (index >= 2) View.VISIBLE else View.GONE, badge.visibility)
+            if (badge.visibility == View.VISIBLE) {
+                assertNotNull(badge.drawable)
+                assertTrue(badge.right <= 48 - view.paddingRight && badge.bottom <= 48 - view.paddingBottom)
+            }
+            assertTrue(view.contentDescription.toString().contains(message))
+            if (waiting) {
+                assertTrue(view.performClick())
+                val cancel = shadowOf(context).nextStartedService
+                assertEquals("cancel", cancel.action)
+                assertEquals("gate", cancel.getStringExtra("cancel_profile_id"))
+                assertEquals("one-cell-request", cancel.getStringExtra("cancel_request_id"))
+            }
+            val bitmap = android.graphics.Bitmap.createBitmap(48, 48, android.graphics.Bitmap.Config.ARGB_8888)
+            view.draw(android.graphics.Canvas(bitmap))
+            val file = java.io.File(System.getProperty("blekey.layoutReportsDir"), "widget-1x1-$index.png").apply { parentFile?.mkdirs() }
+            file.outputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+            bitmap.recycle()
+        }
     }
 }

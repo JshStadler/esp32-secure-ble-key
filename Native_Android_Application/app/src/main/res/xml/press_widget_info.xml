@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
-    android:minWidth="72dp" android:minHeight="96dp" android:resizeMode="horizontal|vertical"
-    android:minResizeWidth="72dp" android:minResizeHeight="96dp"
-    android:initialLayout="@layout/press_widget" android:previewLayout="@layout/press_widget"
+    android:targetCellWidth="1" android:targetCellHeight="1"
+    android:minWidth="48dp" android:minHeight="48dp" android:resizeMode="horizontal|vertical"
+    android:minResizeWidth="48dp" android:minResizeHeight="48dp"
+    android:initialLayout="@layout/press_widget_icon" android:previewLayout="@layout/press_widget_icon"
     android:configure="dev.logiclabs.remotekey.PressWidgetConfigureActivity"
     android:widgetFeatures="reconfigurable"
     android:updatePeriodMillis="0" android:widgetCategory="home_screen" />
