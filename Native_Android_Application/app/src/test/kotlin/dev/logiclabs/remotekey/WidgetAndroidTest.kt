@@ -22,7 +22,7 @@ import org.robolectric.annotation.GraphicsMode
 @Config(sdk = [35])
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class WidgetAndroidTest {
-    @Test fun normalWidgetsUseGreyWhenDisconnectedAndBlueWhenConnected() {
+    @Test fun normalWidgetsUseBlackWhenDisconnectedAndBlueWhenConnected() {
         val context = RuntimeEnvironment.getApplication()
         listOf(false, true).forEach { connected ->
             val message = if (connected) "Connected" else "Tap to press"
@@ -32,7 +32,7 @@ class WidgetAndroidTest {
             view.layout(0, 0, 180, 160)
             val bitmap = android.graphics.Bitmap.createBitmap(180, 160, android.graphics.Bitmap.Config.ARGB_8888)
             view.draw(android.graphics.Canvas(bitmap))
-            assertEquals(android.graphics.Color.parseColor(if (connected) "#213854" else "#303036"), bitmap.getPixel(20, 20))
+            assertEquals(android.graphics.Color.parseColor(if (connected) "#213854" else "#000000"), bitmap.getPixel(20, 20))
             val file = java.io.File(System.getProperty("blekey.layoutReportsDir"), "widget-connected-$connected.png").apply { parentFile?.mkdirs() }
             file.outputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
             bitmap.recycle()
