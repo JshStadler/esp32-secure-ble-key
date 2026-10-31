@@ -3,7 +3,6 @@ package dev.logiclabs.remotekey
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
-import android.graphics.Color
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
@@ -23,7 +22,7 @@ internal class FirmwareUpdatePanel(private val activity: Activity, private val p
         private val repository = FirmwareUpdates()
     }
     private val handler = Handler(Looper.getMainLooper())
-    private val status = TextView(activity).apply { setTextColor(Color.LTGRAY); textSize = 14f }
+    private val status = TextView(activity).apply { setTextColor(AppAppearance.colors(activity).secondary); textSize = 14f }
     private val action = Button(activity)
     private val retry = Button(activity).apply { text = "Check again" }
     private var closed = false
@@ -92,7 +91,7 @@ internal class FirmwareUpdatePanel(private val activity: Activity, private val p
                 downloading = false
                 showRelease()
                 result.onSuccess { image ->
-                    confirmation = AlertDialog.Builder(activity, R.style.Theme_CarKey_Dialog)
+                    confirmation = AppAppearance.dialog(activity)
                         .setTitle("Install firmware ${selected.label}?")
                         .setMessage("Transfer ${(image.size + 1023) / 1024} KiB over Bluetooth to ${profile.displayName}. Keep the phone nearby and leave ESP power on. The checksum is verified; the ESP will verify the firmware signature. Settings and keys are preserved." +
                             if (FirmwareVersion.parse(installed()?.firmware) == null) "\n\nThe installed version could not be read. This installs the selected published release." else "")

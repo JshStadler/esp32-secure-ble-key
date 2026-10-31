@@ -21,7 +21,8 @@ class PressWidgetProvider : AppWidgetProvider() {
     }
     override fun onDeleted(context: Context, ids: IntArray) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        ids.forEach { prefs.edit().remove(it.toString()).remove("${it}_icon").apply() }
+        ids.forEach { prefs.edit().remove(it.toString()).remove("${it}_icon")
+            .remove("${it}_background").apply() }
     }
     override fun onAppWidgetOptionsChanged(context: Context, manager: AppWidgetManager, id: Int, options: android.os.Bundle) {
         render(context, id)
@@ -74,9 +75,13 @@ class PressWidgetProvider : AppWidgetProvider() {
         }
         internal fun icon(context: Context, widgetId: Int, type: BleDeviceType?): PressWidgetIcon =
             PressWidgetIcon.saved(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("${widgetId}_icon", null), type)
-        internal fun configure(context: Context, widgetId: Int, profileId: String, icon: PressWidgetIcon) {
+        internal fun background(context: Context, widgetId: Int) = WidgetBackground.normalize(
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("${widgetId}_background", null)) ?: WidgetBackground.DEFAULT
+        internal fun configure(context: Context, widgetId: Int, profileId: String, icon: PressWidgetIcon,
+            background: String = WidgetBackground.DEFAULT) {
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                .putString(widgetId.toString(), profileId).putString("${widgetId}_icon", icon.name).apply()
+                .putString(widgetId.toString(), profileId).putString("${widgetId}_icon", icon.name)
+                .putString("${widgetId}_background", WidgetBackground.normalize(background) ?: WidgetBackground.DEFAULT).apply()
             render(context, widgetId)
         }
         fun publish(context: Context, profileId: String, message: String, busy: Boolean = false, cancellationId: String? = null) {
@@ -114,6 +119,8 @@ class PressWidgetProvider : AppWidgetProvider() {
             working: Boolean, compact: Boolean, cancellationId: String? = null, connected: Boolean = false,
             iconOnly: Boolean = false): RemoteViews {
             val tone = WidgetStatusText.tone(displayedMessage, connected)
+            val idleColor = WidgetBackground.color(background(context, widgetId))
+            val accent = if (tone == WidgetStatusText.Tone.IDLE) WidgetBackground.accent(idleColor) else tone.accent
             val intent = if (profile == null) Intent(context, PressWidgetConfigureActivity::class.java)
                 else Intent(context, WidgetPressActivity::class.java)
             intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, widgetId)
@@ -132,8 +139,11 @@ class PressWidgetProvider : AppWidgetProvider() {
                 setViewVisibility(R.id.widget_status, if (compact || iconOnly) View.GONE else View.VISIBLE)
                 if (compactFeedback) setTextViewText(R.id.widget_name, WidgetStatusText.compactLabel(displayedMessage))
                 setInt(R.id.widget_press, "setBackgroundResource", tone.background)
-                setImageViewIcon(R.id.widget_icon, Icon.createWithResource(context, icon(context, widgetId, profile?.type).drawable).setTint(tone.accent))
-                setTextColor(R.id.widget_status, tone.accent)
+                if (android.os.Build.VERSION.SDK_INT >= 31) setColorStateList(R.id.widget_press, "setBackgroundTintList",
+                    if (tone == WidgetStatusText.Tone.IDLE) android.content.res.ColorStateList.valueOf(idleColor) else null)
+                setTextColor(R.id.widget_name, if (tone == WidgetStatusText.Tone.IDLE) WidgetBackground.foreground(idleColor) else android.graphics.Color.WHITE)
+                setImageViewIcon(R.id.widget_icon, Icon.createWithResource(context, icon(context, widgetId, profile?.type).drawable).setTint(accent))
+                setTextColor(R.id.widget_status, accent)
                 setTextViewText(R.id.widget_status, if (profile == null) "Choose a device" else WidgetStatusText.label(displayedMessage))
                 if (iconOnly) {
                     val badge = when (tone) {

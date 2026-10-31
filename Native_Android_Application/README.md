@@ -20,6 +20,12 @@ on Android 13 and later. BLE operation does not depend on notification permissio
 The About section shows the installed app version and build number; its text can
 be selected/copied for support, and test builds retain their `-test` suffix.
 
+**App Settings → Theme and accent colour** offers Follow system (the default), Light,
+or Dark, plus Blue, Teal, Green, Purple, Orange or Rose accents. The selected theme
+and accent cover the dashboard, settings, dialogs, authentication, logs and widget
+configuration. Applying a change refreshes the app UI; appearance is stored locally
+without keys and does not change widget status colours or radio settings.
+
 Read the [privacy policy](app/src/main/res/raw/privacy_policy.html) for details
 about local storage, optional locations, exports, and deletion.
 
@@ -41,7 +47,7 @@ about local storage, optional locations, exports, and deletion.
 - Shareable 24-hour diagnostic logs with BLE/GATT details
 - All-device or per-device filtering for diagnostics, operations, locations, export, and clearing
 - Seven-day operation history and per-device optional latest-30 location pins
-- AMOLED-black UI and Android adaptive launcher/splash assets
+- System-following light/dark UI, manual theme and six accent choices, with Android adaptive launcher/splash assets
 
 The car uses the `a1b2c3d4-...` API-v2 UUID family and `car-main` security
 binding. The gate uses the distinct `b1b2c3d4-...` API-v2 family and
@@ -91,8 +97,11 @@ waits for its result. Cached widget or notification cancellation actions are bou
 to the original request, so they cannot cancel a newer press or start one.
 
 Widget success, failure and cancellation results clear after three seconds.
-The normal background is gray when disconnected and blue while an app or widget
-client still holds a connection. Connecting/sending retain their progress colours.
+The normal background defaults to black when disconnected and stays blue while an app or widget
+client still holds a connection. Each widget can instead use a preset or custom six-digit RGB
+background colour; text and icons adapt their contrast. Use the launcher's widget settings/Edit
+action to change the device, icon or colour, with the current values preselected. Save applies
+the edit; Cancel leaves the widget unchanged. The widget remains resizable to 1×1 or larger. Connecting/sending retain their progress colours.
 
 Device Settings checks public GitHub firmware releases when opened, with a
 five-minute in-memory metadata cache and an explicit Check again action. There

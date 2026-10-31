@@ -114,8 +114,10 @@ device proof and interrupted PSK-change recovery remain in use. No firmware
 update is needed for the v2.8.1 client changes.
 
 Unsent queued presses expire after ten seconds. Tap **Cancel** on Android, or
-press SELECT again on the watch, to cancel a queued action. Android also cancels
-an unsent press when backgrounded. Gate keeps its existing response protocol.
+press SELECT again on the watch, to cancel a queued action. Android keeps an
+explicit pending press alive after Home or Recents, within its original deadline.
+Cancel, Bluetooth off, closing the app task or activity teardown revokes an unsent
+press. Gate keeps its existing response protocol.
 
 PSK changes now require a connected Car running v2.8.0. The phone durably keeps
 encrypted old/candidate keys until the change is confirmed and saved. After

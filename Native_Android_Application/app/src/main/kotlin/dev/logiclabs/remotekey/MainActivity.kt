@@ -13,7 +13,6 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
-import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.location.Location
@@ -55,10 +54,10 @@ import androidx.core.text.HtmlCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
-import androidx.fragment.app.FragmentActivity
 import java.util.UUID
 
-class MainActivity : FragmentActivity() {
+class MainActivity : ThemedActivity() {
+    private val colors get() = AppAppearance.colors(this)
     private data class DeviceRuntime(
         var psk: String = "",
         var cachedAddress: String? = null,
@@ -205,7 +204,7 @@ class MainActivity : FragmentActivity() {
                     toast("Device is no longer configured")
                     return@registerForActivityResult
                 }
-                AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+                AppAppearance.dialog(this)
                 .setTitle("Update ${profile.displayName} firmware?")
                 .setMessage("Transfer ${(image.size + 1023) / 1024} KiB over BLE. Keep the phone near the car and do not remove car power. Only signed firmware from this project is accepted.")
                 .setNegativeButton("Cancel", null)
@@ -219,8 +218,6 @@ class MainActivity : FragmentActivity() {
         setTheme(R.style.Theme_CarKey)
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        window.statusBarColor = Color.BLACK
-        window.navigationBarColor = Color.BLACK
 
         requireAuthentication = store.get("require_auth") != "false"
         profiles.addAll(profileRepository.load())
@@ -344,8 +341,8 @@ class MainActivity : FragmentActivity() {
 
     private fun buildUi(): View {
         deviceViews.clear()
-        val background = Color.BLACK
-        val surface = Color.rgb(31, 34, 48)
+        val background = colors.background
+        val surface = colors.surface
         val root = FrameLayout(this).apply { setBackgroundColor(background) }
         ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
@@ -380,7 +377,7 @@ class MainActivity : FragmentActivity() {
         bluetoothBanner = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(12), dp(16), dp(12))
-            this.background = rounded(Color.rgb(57, 43, 23), 16f)
+            this.background = rounded(colors.warningSurface, 16f)
         }
         bluetoothBannerText = text("", 15f, true).also { bluetoothBanner!!.addView(it) }
         bluetoothBannerAction = primaryButton("Turn on Bluetooth") { requestBluetoothEnable() }.also {
@@ -397,7 +394,7 @@ class MainActivity : FragmentActivity() {
         }
         if (profiles.isEmpty()) {
             page.addView(text("Add the devices you want to control.", 14f, false).apply {
-                setTextColor(Color.rgb(184, 186, 198))
+                setTextColor(colors.secondary)
                 gravity = Gravity.CENTER
                 setPadding(dp(12), dp(24), dp(12), dp(32))
             })
@@ -405,7 +402,7 @@ class MainActivity : FragmentActivity() {
         }
 
         page.addView(text("Nearby devices stay connected while app is open", 13f, false).apply {
-            setTextColor(Color.rgb(153, 156, 171))
+            setTextColor(colors.muted)
             gravity = Gravity.CENTER
             setPadding(dp(8), dp(8), dp(8), 0)
         })
@@ -415,7 +412,7 @@ class MainActivity : FragmentActivity() {
             gravity = Gravity.CENTER
             setPadding(dp(32), dp(32), dp(32), dp(32))
             setBackgroundColor(background)
-            addView(ImageView(context).apply { setImageResource(R.drawable.ic_lock) }, LinearLayout.LayoutParams(dp(64), dp(64)))
+            addView(ImageView(context).apply { setImageResource(R.drawable.ic_lock); imageTintList = ColorStateList.valueOf(colors.text) }, LinearLayout.LayoutParams(dp(64), dp(64)))
             addView(text("Authentication required", 19f, true).apply {
                 gravity = Gravity.CENTER
                 setPadding(0, dp(20), 0, dp(16))
@@ -445,7 +442,7 @@ class MainActivity : FragmentActivity() {
         val statusIcon = ImageButton(this).apply {
             setImageResource(if (profile.type == BleDeviceType.ESPHOME_ACCESS) R.drawable.ic_gate else R.drawable.ic_car)
             contentDescription = "${profile.displayName} settings"
-            imageTintList = ColorStateList.valueOf(Color.rgb(132, 136, 153))
+            imageTintList = ColorStateList.valueOf(colors.muted)
             setPadding(dp(7), dp(7), dp(7), dp(7))
             background = selectableBorderlessBackground()
             setOnClickListener { showDeviceSettingsAuthenticated(profile) }
@@ -458,7 +455,7 @@ class MainActivity : FragmentActivity() {
         }
         labels.addView(text(profile.displayName, 17f, true))
         val status = text("Idle", 13f, false).apply {
-            setTextColor(Color.rgb(184, 186, 198))
+            setTextColor(colors.secondary)
         }
         labels.addView(status)
         details.addView(labels, LinearLayout.LayoutParams(0, -2, 1f))
@@ -490,7 +487,7 @@ class MainActivity : FragmentActivity() {
         val types = arrayOf(BleDeviceType.CAR, BleDeviceType.ESPHOME_ACCESS)
         val selected = booleanArrayOf(false, false)
         val labels = arrayOf("Standalone device (e.g. car remote)", "ESPHome device (e.g. gate or door)")
-        val dialog = AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        val dialog = AppAppearance.dialog(this)
             .setTitle("Choose your device types")
             .setMultiChoiceItems(labels, selected) { _, which, checked ->
                 selected[which] = checked
@@ -1012,13 +1009,13 @@ class MainActivity : FragmentActivity() {
         }
         views.statusIcon.imageTintList = ColorStateList.valueOf(
             when {
-                bluetoothAvailability != BluetoothAvailability.AVAILABLE -> Color.rgb(255, 170, 30)
-                connected -> Color.rgb(38, 196, 104)
+                bluetoothAvailability != BluetoothAvailability.AVAILABLE -> colors.warning
+                connected -> colors.success
                 runtime.state == BleCarKeyClient.State.SCANNING || runtime.state == BleCarKeyClient.State.CONNECTING ||
-                    runtime.state == BleCarKeyClient.State.RETRYING -> Color.rgb(255, 170, 30)
-                runtime.message == "Command completed" -> Color.rgb(38, 196, 104)
-                runtime.message.contains("failed", true) || runtime.message.contains("timed out", true) -> Color.rgb(219, 68, 75)
-                else -> Color.rgb(132, 136, 153)
+                    runtime.state == BleCarKeyClient.State.RETRYING -> colors.warning
+                runtime.message == "Command completed" -> colors.success
+                runtime.message.contains("failed", true) || runtime.message.contains("timed out", true) -> colors.error
+                else -> colors.muted
             },
         )
         val busy = maintenanceDeviceId != null || presses[deviceId] != null
@@ -1056,7 +1053,7 @@ class MainActivity : FragmentActivity() {
             setTextIsSelectable(true)
         }
         val scroll = ScrollView(this).apply { addView(content) }
-        val dialog = AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        val dialog = AppAppearance.dialog(this)
             .setTitle("${profile.displayName} Health")
             .setView(scroll)
             .setPositiveButton("Close", null)
@@ -1139,7 +1136,7 @@ class MainActivity : FragmentActivity() {
             layout.addView(sectionLabel(label))
             return EditText(this).apply {
                 setText(initial)
-                setTextColor(Color.WHITE)
+                setTextColor(colors.text)
                 inputType = InputType.TYPE_CLASS_TEXT
                 keyListener = android.text.method.DigitsKeyListener.getInstance("0123456789.-")
                 layout.addView(this, LinearLayout.LayoutParams(-1, -2))
@@ -1178,7 +1175,7 @@ class MainActivity : FragmentActivity() {
             "Reading device health does not restart that window. Existing connections keep their connection timing.", 13f, false))
         val status = text("", 14f, false).apply { setPadding(0, dp(12), 0, 0) }
         layout.addView(status)
-        val dialog = AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        val dialog = AppAppearance.dialog(this)
             .setTitle("${profile.displayName} Radio settings")
             .setView(ScrollView(this).apply { addView(layout) })
             .setNegativeButton("Cancel", null)
@@ -1256,38 +1253,38 @@ class MainActivity : FragmentActivity() {
         val name = EditText(this).apply {
             hint = "Device name"
             setText(profile.displayName)
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
+            setTextColor(colors.text)
+            setHintTextColor(colors.muted)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
         }
         val configuredAddress = EditText(this).apply {
             hint = "BLE address (optional)"
             setText(profile.defaultAddress ?: runtime.cachedAddress.orEmpty())
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
+            setTextColor(colors.text)
+            setHintTextColor(colors.muted)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
         }
         val cachedSwitch = Switch(this).apply {
             text = "Use cached device address"
-            setTextColor(Color.WHITE)
+            setTextColor(colors.text)
             isChecked = runtime.preferCached
             isEnabled = runtime.cachedAddress != null || profile.defaultAddress != null
             setPadding(0, dp(6), 0, dp(6))
         }
         val autoConnectSwitch = Switch(this).apply {
             text = "Connect automatically when the app opens"
-            setTextColor(Color.WHITE)
+            setTextColor(colors.text)
             isChecked = runtime.autoConnect
             setPadding(0, dp(6), 0, dp(6))
         }
         val locationSwitch = Switch(this).apply {
             text = "Record location when this device is triggered"
-            setTextColor(Color.WHITE)
+            setTextColor(colors.text)
             isChecked = runtime.recordLocation
             setPadding(0, dp(6), 0, dp(6))
         }
         val address = text("Address: ${runtime.cachedAddress ?: profile.defaultAddress ?: "Not learned yet"}", 12f, false).apply {
-            setTextColor(Color.rgb(184, 186, 198))
+            setTextColor(colors.secondary)
             setPadding(0, dp(2), 0, dp(8))
         }
         layout.addView(sectionLabel("Device"))
@@ -1317,13 +1314,13 @@ class MainActivity : FragmentActivity() {
                 "The ESP-and-app change requires the existing PSK. The app-only option replaces this phone's saved copy and does not change the ESP.",
                 12f,
                 false,
-            ).apply { setTextColor(Color.rgb(184, 186, 198)) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+            ).apply { setTextColor(colors.secondary) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
         } else if (!profile.supportsRemotePskUpdate) {
             layout.addView(text(
                 "PSK changes here affect only this app. Update the matching ESPHome secret and firmware separately.",
                 12f,
                 false,
-            ).apply { setTextColor(Color.rgb(184, 186, 198)) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+            ).apply { setTextColor(colors.secondary) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
         }
         layout.addView(sectionLabel("Connection"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
         layout.addView(autoConnectSwitch, LinearLayout.LayoutParams(-1, -2))
@@ -1344,7 +1341,7 @@ class MainActivity : FragmentActivity() {
             12f,
             false,
         ).apply {
-            setTextColor(Color.rgb(184, 186, 198))
+            setTextColor(colors.secondary)
         }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         layout.addView(sectionLabel("Device health"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
         layout.addView(primaryButton("Device health and BLE signal") {
@@ -1365,7 +1362,7 @@ class MainActivity : FragmentActivity() {
             }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
         }
         layout.addView(primaryButton("Remove device") {
-            AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+            AppAppearance.dialog(this)
                 .setTitle("Remove ${profile.displayName}?")
                 .setMessage("This removes its card, saved PSK, address, and per-device settings from this phone. It does not change the ESP.")
                 .setNegativeButton("Cancel", null)
@@ -1377,7 +1374,7 @@ class MainActivity : FragmentActivity() {
             addView(layout, FrameLayout.LayoutParams(-1, -2))
         }
 
-        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        AppAppearance.dialog(this)
             .setTitle("${profile.displayName} Settings")
             .setView(scroll)
             .setNegativeButton("Cancel", null)
@@ -1458,7 +1455,7 @@ class MainActivity : FragmentActivity() {
             runtime.psk.isEmpty() -> "Enter the PSK already installed on this device."
             profile.supportsRemotePskUpdate -> "The existing PSK is verified locally, then the authenticated car and this phone are updated together."
             else -> "First update ESPHome, then enter the existing and new PSKs here to update this phone's matching copy."
-        }, 13f, false).apply { setTextColor(Color.rgb(184, 186, 198)) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+        }, 13f, false).apply { setTextColor(colors.secondary) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
         if (createsDeviceKey) layout.addView(text(PskKeyPolicy.NEW_KEY_GUIDANCE, 13f, false),
             LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
         current?.let { layout.addView(it, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) }) }
@@ -1471,7 +1468,7 @@ class MainActivity : FragmentActivity() {
             showGeneratedPsk(generated)
         }, LinearLayout.LayoutParams(-1, -2))
 
-        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        AppAppearance.dialog(this)
             .setTitle(when {
                 appOnly -> "PSK saved on app"
                 recovery -> "PSK saved on app"
@@ -1510,7 +1507,7 @@ class MainActivity : FragmentActivity() {
         authenticate("Authenticate to add a BLE device") { ok ->
             if (!ok) return@authenticate
             val labels = arrayOf("ESPHome device", "Standalone device")
-            AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+            AppAppearance.dialog(this)
                 .setTitle("Add device")
                 .setItems(labels) { _, which ->
                     showAddDeviceDetails(if (which == 0) BleDeviceType.ESPHOME_ACCESS else BleDeviceType.CAR)
@@ -1527,25 +1524,25 @@ class MainActivity : FragmentActivity() {
         val name = EditText(this).apply {
             hint = "Name"
             setText(if (type == BleDeviceType.CAR) "Car" else "Access Device")
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
+            setTextColor(colors.text)
+            setHintTextColor(colors.muted)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
         }
         val address = EditText(this).apply {
             hint = "BLE address (optional)"
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
+            setTextColor(colors.text)
+            setHintTextColor(colors.muted)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
         }
         layout.addView(text(
             "The name is your own label and does not need to match the ESP's Bluetooth name. The BLE address uniquely identifies the physical ESP. It is optional for the first device of this type, but required when two devices use the same firmware profile.",
             13f,
             false,
-        ).apply { setTextColor(Color.rgb(184, 186, 198)) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+        ).apply { setTextColor(colors.secondary) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
         layout.addView(name, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         layout.addView(address)
 
-        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        AppAppearance.dialog(this)
             .setTitle(if (type == BleDeviceType.CAR) "Add standalone device" else "Add ESPHome device")
             .setView(layout)
             .setNegativeButton("Cancel", null)
@@ -1648,7 +1645,7 @@ class MainActivity : FragmentActivity() {
         }
         val authSwitch = Switch(this).apply {
             text = "Require device authentication"
-            setTextColor(Color.WHITE)
+            setTextColor(colors.text)
             isChecked = requireAuthentication
             setPadding(0, dp(8), 0, dp(8))
         }
@@ -1660,11 +1657,17 @@ class MainActivity : FragmentActivity() {
             store.put(BackgroundConnectionDuration.STORE_KEY, selectedDuration.name)
         }
         options.addView(authSwitch)
+        options.addView(sectionLabel("Appearance"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+        options.addView(primaryButton("Theme and accent colour") {
+            persistSettings()
+            settingsDialog.dismiss()
+            showAppearanceSettings()
+        }, LinearLayout.LayoutParams(-1, -2))
         options.addView(sectionLabel("Connection"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
         lateinit var durationButton: Button
         durationButton = primaryButton("Background connections: ${selectedDuration.label}") {
             val choices = BackgroundConnectionDuration.entries
-            AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+            AppAppearance.dialog(this)
                 .setTitle("Background connection duration")
                 .setSingleChoiceItems(choices.map { it.label }.toTypedArray(), choices.indexOf(selectedDuration)) { dialog, index ->
                     selectedDuration = choices[index]
@@ -1699,10 +1702,10 @@ class MainActivity : FragmentActivity() {
         options.addView(sectionLabel("About"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
         options.addView(text("App version: ${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE})", 14f, false).apply {
             setTextIsSelectable(true)
-            setTextColor(Color.rgb(184, 186, 198))
+            setTextColor(colors.secondary)
             setPadding(0, dp(4), 0, dp(16))
         }, LinearLayout.LayoutParams(-1, -2))
-        settingsDialog = AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        settingsDialog = AppAppearance.dialog(this)
             .setTitle("Remote Key Settings")
             .setView(ScrollView(this).apply { addView(options) })
             .setPositiveButton("Done") { _, _ ->
@@ -1712,16 +1715,30 @@ class MainActivity : FragmentActivity() {
         settingsDialog.show()
     }
 
+    private fun showAppearanceSettings() {
+        val initial = AppAppearance.read(this)
+        val picker = AppearanceSettingsView(this, initial)
+        AppAppearance.dialog(this).setTitle("Appearance")
+            .setView(ScrollView(this).apply { addView(picker) })
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Apply") { _, _ ->
+                if (picker.selection != initial) {
+                    AppAppearance.save(this, picker.selection)
+                    recreate()
+                }
+            }.show()
+    }
+
     private fun showPrivacyPolicy() {
         val policy = resources.openRawResource(R.raw.privacy_policy).bufferedReader().use { it.readText() }
         val content = text("", 15f, false).apply {
             text = HtmlCompat.fromHtml(policy, HtmlCompat.FROM_HTML_MODE_LEGACY)
             setTextIsSelectable(true)
             movementMethod = LinkMovementMethod.getInstance()
-            setLinkTextColor(Color.rgb(160, 190, 255))
+            setLinkTextColor(colors.accent)
             setPadding(dp(20), dp(12), dp(20), dp(12))
         }
-        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        AppAppearance.dialog(this)
             .setTitle("Privacy policy")
             .setView(ScrollView(this).apply { addView(content) })
             .setPositiveButton("Done", null)
@@ -1729,7 +1746,7 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun showConnectionNotifications() {
-        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        AppAppearance.dialog(this)
             .setTitle("Connection notifications")
             .setMessage("Remote Key can keep Bluetooth connections ready after you leave the app for the duration chosen in App Settings, or while an operation finishes. Allow notifications to see when this is happening. Notifications are optional and never contain ads.")
             .setPositiveButton("Enable / manage") { _, _ ->
@@ -1770,7 +1787,7 @@ class MainActivity : FragmentActivity() {
             gravity = Gravity.CENTER
             setPadding(dp(16), dp(18), dp(16), dp(18))
         }
-        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        AppAppearance.dialog(this)
             .setTitle("Save this PSK now")
             .setMessage("This is the only time Remote Key will display or offer to copy this generated PSK. It remains masked after this dialog closes. Return to the PSK dialog and tap Save to apply it.")
             .setView(value)
@@ -1959,21 +1976,21 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun sectionLabel(value: String) = text(value, 14f, true).apply {
-        setTextColor(Color.rgb(184, 186, 198))
+        setTextColor(colors.secondary)
         setPadding(0, dp(6), 0, dp(8))
     }
 
     private fun pskInput(hintText: String) = EditText(this).apply {
         hint = hintText
         inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-        setTextColor(Color.WHITE)
-        setHintTextColor(Color.GRAY)
+        setTextColor(colors.text)
+        setHintTextColor(colors.muted)
     }
 
     private fun text(value: String, size: Float, bold: Boolean) = TextView(this).apply {
         text = value
         textSize = size
-        setTextColor(Color.WHITE)
+        setTextColor(colors.text)
         gravity = Gravity.CENTER_VERTICAL
         if (bold) setTypeface(typeface, Typeface.BOLD)
     }
@@ -1983,8 +2000,8 @@ class MainActivity : FragmentActivity() {
         isAllCaps = false
         textSize = 14f
         minimumHeight = dp(48)
-        setTextColor(Color.WHITE)
-        background = rounded(Color.rgb(64, 103, 172), 22f)
+        setTextColor(colors.onAccent)
+        background = rounded(colors.accent, 22f)
         setPadding(dp(12), dp(10), dp(12), dp(10))
         setOnClickListener { action() }
     }
@@ -1993,7 +2010,7 @@ class MainActivity : FragmentActivity() {
         setImageResource(icon)
         contentDescription = description
         setPadding(dp(12), dp(12), dp(12), dp(12))
-        imageTintList = ColorStateList.valueOf(Color.WHITE)
+        imageTintList = ColorStateList.valueOf(colors.text)
         background = selectableBorderlessBackground()
         setOnClickListener { action() }
     }

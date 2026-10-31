@@ -18,7 +18,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
-import androidx.fragment.app.FragmentActivity
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -27,7 +26,8 @@ import java.util.UUID
 import java.util.TimeZone
 import java.io.File
 
-class LogActivity : FragmentActivity() {
+class LogActivity : ThemedActivity() {
+    private val colors get() = AppAppearance.colors(this)
     private enum class Mode { DIAGNOSTIC, PRESSES, LOCATIONS }
     private data class DeviceFilter(val id: String?, val label: String)
     private lateinit var content: LinearLayout
@@ -63,8 +63,6 @@ class LogActivity : FragmentActivity() {
         search = savedInstanceState?.getString("search").orEmpty()
         pendingExport = savedInstanceState?.getString("export")
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        window.statusBarColor = Color.BLACK
-        window.navigationBarColor = Color.BLACK
         setContentView(buildUi())
         show(selected)
     }
@@ -86,7 +84,7 @@ class LogActivity : FragmentActivity() {
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
 
     private fun buildUi(): FrameLayout {
-        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val root = FrameLayout(this).apply { setBackgroundColor(colors.background) }
         ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
             view.setPadding(0, bars.top, 0, bars.bottom)
@@ -102,7 +100,7 @@ class LogActivity : FragmentActivity() {
         }
         top.addView(ImageButton(this).apply {
             setImageResource(R.drawable.ic_back)
-            imageTintList = ContextCompat.getColorStateList(context, android.R.color.white)
+            imageTintList = android.content.res.ColorStateList.valueOf(colors.text)
             setBackgroundColor(Color.TRANSPARENT)
             contentDescription = "Back"
             setOnClickListener { finish() }
@@ -112,14 +110,14 @@ class LogActivity : FragmentActivity() {
         actions.addView(Button(this).apply {
             text = "Export"
             isAllCaps = false
-            setTextColor(Color.rgb(142, 180, 255))
+            setTextColor(colors.accent)
             setBackgroundColor(Color.TRANSPARENT)
             setOnClickListener { exportLogs() }
         }, LinearLayout.LayoutParams(if (largeControls) -1 else -2, -2))
         actions.addView(Button(this).apply {
             text = "Clear"
             isAllCaps = false
-            setTextColor(Color.rgb(142, 180, 255))
+            setTextColor(colors.accent)
             setBackgroundColor(Color.TRANSPARENT)
             setOnClickListener { confirmClear() }
         }, LinearLayout.LayoutParams(if (largeControls) -1 else -2, -2))
@@ -161,7 +159,7 @@ class LogActivity : FragmentActivity() {
         }, LinearLayout.LayoutParams(if (largeControls) -1 else -2, -2))
         page.addView(dates)
         page.addView(EditText(this).apply {
-            hint = "Search logs"; setTextColor(Color.WHITE); setHintTextColor(Color.GRAY)
+            hint = "Search logs"; setTextColor(colors.text); setHintTextColor(colors.muted)
             isSingleLine = true; textSize = 14f; setText(search)
             contentDescription = "Search logs"
             addTextChangedListener(object : TextWatcher {
@@ -170,7 +168,7 @@ class LogActivity : FragmentActivity() {
                 override fun afterTextChanged(s: Editable?) = Unit
             })
         }, LinearLayout.LayoutParams(-1, -2))
-        countLabel = label("", 12f, false).apply { setTextColor(Color.GRAY) }
+        countLabel = label("", 12f, false).apply { setTextColor(colors.muted) }
         page.addView(countLabel)
 
         content = LinearLayout(this).apply {
@@ -223,9 +221,11 @@ class LogActivity : FragmentActivity() {
 
     private fun show(mode: Mode) {
         selected = mode
-        diagnosticButton.alpha = if (mode == Mode.DIAGNOSTIC) 1f else 0.55f
-        pressesButton.alpha = if (mode == Mode.PRESSES) 1f else 0.55f
-        locationsButton.alpha = if (mode == Mode.LOCATIONS) 1f else 0.55f
+        listOf(diagnosticButton to Mode.DIAGNOSTIC, pressesButton to Mode.PRESSES, locationsButton to Mode.LOCATIONS).forEach { (button, tab) ->
+            button.setTextColor(if (mode == tab) colors.onAccent else colors.text)
+            button.setBackgroundColor(if (mode == tab) colors.accent else colors.surface)
+            button.isSelected = mode == tab
+        }
         content.removeAllViews()
         val filter = currentFilter()
         visibleEntries = if (mode == Mode.LOCATIONS) emptyList() else
@@ -246,7 +246,7 @@ class LogActivity : FragmentActivity() {
         val entries = visibleEntries
         if (entries.isEmpty()) {
             content.addView(label("No entries match these filters.", 14f, false).apply {
-                setTextColor(Color.GRAY)
+                setTextColor(colors.muted)
                 setPadding(dp(8), dp(24), dp(8), dp(24))
             })
             return
@@ -261,11 +261,11 @@ class LogActivity : FragmentActivity() {
                 addDayDivider(day)
             }
             content.addView(label(timeFormat.format(Date(entry.timestamp)), 12f, false).apply {
-                setTextColor(Color.rgb(142, 180, 255))
+                setTextColor(colors.accent)
                 setPadding(dp(8), dp(12), dp(8), 0)
             })
             content.addView(label(entry.message, 14f, false).apply {
-                setTextColor(Color.LTGRAY)
+                setTextColor(colors.secondary)
                 setPadding(dp(8), dp(3), dp(8), dp(12))
             })
         }
@@ -275,7 +275,7 @@ class LogActivity : FragmentActivity() {
         val entries = visibleLocations
         if (entries.isEmpty()) {
             content.addView(label("No saved locations match these filters. Location recording can be enabled in Device Settings.", 14f, false).apply {
-                setTextColor(Color.GRAY)
+                setTextColor(colors.muted)
                 setPadding(dp(8), dp(24), dp(8), dp(24))
             })
             return
@@ -295,10 +295,11 @@ class LogActivity : FragmentActivity() {
             }
             val devicePrefix = if (selectedDeviceId == null && entry.deviceName != null) "${entry.deviceName} • " else ""
             row.addView(label("$devicePrefix${timeFormat.format(Date(entry.timestamp))}\n${"%.6f".format(entry.latitude)}, ${"%.6f".format(entry.longitude)}  (±${entry.accuracy.toInt()} m)", 14f, false).apply {
-                setTextColor(Color.rgb(142, 180, 255))
+                setTextColor(colors.accent)
             }, LinearLayout.LayoutParams(0, -2, 1f))
             row.addView(ImageButton(this).apply {
                 setImageResource(R.drawable.ic_map)
+                imageTintList = android.content.res.ColorStateList.valueOf(colors.accent)
                 setBackgroundColor(Color.TRANSPARENT)
                 contentDescription = "Open location in Maps"
                 setPadding(dp(12), dp(12), dp(12), dp(12))
@@ -312,8 +313,8 @@ class LogActivity : FragmentActivity() {
 
     private fun addDayDivider(day: String) {
         content.addView(label(day, 13f, true).apply {
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.rgb(31, 34, 48))
+            setTextColor(colors.text)
+            setBackgroundColor(colors.surface)
             setPadding(dp(10), dp(7), dp(10), dp(7))
         }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(10) })
     }
@@ -325,7 +326,7 @@ class LogActivity : FragmentActivity() {
             Mode.LOCATIONS -> "saved locations"
         }
         val filter = currentFilter()
-        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        AppAppearance.dialog(this)
             .setTitle("Clear matching $name?")
             .setMessage("${deviceLabel()} • ${dayLabel()}\nSearch: ${search.ifBlank { "Any text" }}\nOnly matching entries will be removed. This cannot be undone.")
             .setNegativeButton("Cancel", null)
@@ -343,7 +344,7 @@ class LogActivity : FragmentActivity() {
     private fun exportLogs() {
         val snapshot = buildExport()
         val filename = "remote-key-${selected.name.lowercase()}-${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())}.txt"
-        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        AppAppearance.dialog(this)
             .setTitle("Export ${visibleEntries.size + visibleLocations.size} matching entries")
             .setItems(arrayOf("Save text file…", "Share text file…")) { _, choice ->
                 runCatching {
@@ -403,15 +404,15 @@ class LogActivity : FragmentActivity() {
         text = title
         minimumHeight = dp(48)
         isAllCaps = false
-        setTextColor(Color.WHITE)
-        setBackgroundColor(Color.rgb(31, 34, 48))
+        setTextColor(colors.text)
+        setBackgroundColor(colors.surface)
         setOnClickListener { action() }
     }
 
     private fun label(value: String, size: Float, bold: Boolean) = TextView(this).apply {
         text = value
         textSize = size
-        setTextColor(Color.WHITE)
+        setTextColor(colors.text)
         gravity = Gravity.CENTER_VERTICAL
         if (bold) setTypeface(typeface, Typeface.BOLD)
     }

@@ -13,11 +13,10 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
-import androidx.fragment.app.FragmentActivity
 import java.util.UUID
 
 /** A brief authentication/permission surface, never the main dashboard. */
-class WidgetPressActivity : FragmentActivity() {
+class WidgetPressActivity : ThemedActivity() {
     private var launched = false
     private var authenticating = false
     private var selectedProfile: BleDeviceProfile? = null
