@@ -10,16 +10,18 @@ android {
 
     defaultConfig {
         applicationId = "dev.logiclabs.remotekey"
-        minSdk = 23
+        minSdk = 24
         targetSdk = 36
-        versionCode = 25
-        versionName = "2.8.1"
+        versionCode = 47
+        versionName = "2.8.21"
         manifestPlaceholders["appLabel"] = "Remote Key"
     }
 
     buildFeatures {
         buildConfig = true
     }
+
+    testOptions.unitTests.isIncludeAndroidResources = true
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -42,10 +44,16 @@ android {
             manifestPlaceholders["appLabel"] = "Remote Key"
         }
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
             signingConfig = signingConfigs.getByName("release")
         }
     }
+}
+
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    systemProperty("blekey.layoutReportsDir", layout.buildDirectory.dir("reports/scaling").get().asFile.absolutePath)
 }
 
 dependencies {
@@ -53,4 +61,6 @@ dependencies {
     implementation("androidx.biometric:biometric:1.1.0")
     implementation("androidx.fragment:fragment:1.8.9")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
+    testImplementation("org.robolectric:robolectric:4.16.1")
 }

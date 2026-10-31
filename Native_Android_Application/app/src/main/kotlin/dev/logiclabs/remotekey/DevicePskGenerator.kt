@@ -7,9 +7,12 @@ object DevicePskGenerator {
     private val random = SecureRandom()
 
     /** Returns 128 random bits as 32 lowercase hexadecimal characters. */
-    fun generate(): String = ByteArray(DEFAULT_BYTES)
-        .also(random::nextBytes)
-        .toLowercaseHex()
+    fun generate(): String {
+        while (true) {
+            val key = ByteArray(DEFAULT_BYTES).also(random::nextBytes).toLowercaseHex()
+            if (PskKeyPolicy.validNew(key)) return key
+        }
+    }
 
     internal fun ByteArray.toLowercaseHex(): String = joinToString(separator = "") {
         "%02x".format(it.toInt() and 0xff)

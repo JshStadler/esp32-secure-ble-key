@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include "ESP32-C3_Firmware/main/psk_key_policy.h"
 typedef int nvs_handle_t;
 typedef int esp_err_t;
 #define ESP_OK 0
@@ -10,7 +11,7 @@ typedef int esp_err_t;
 #define NVS_READWRITE 1
 #define MAX_PSK_LEN 128
 #ifdef TEST_BOOTSTRAP
-static const char *bootstrap_default = "synthetic-private-bootstrap-key";
+static const char *bootstrap_default = "5e90b1c274a83d6f0a519fbe842c73d6";
 #define DEFAULT_PSK bootstrap_default
 #else
 #define DEFAULT_PSK "CHANGE_ME_before_flashing_32chars!"
@@ -41,13 +42,19 @@ static int nvs_commit(nvs_handle_t h) { (void)h; if (!commit_result) strcpy(stor
 #include "nvs_under_test.inc"
 int main(void) {
 #ifdef TEST_BOOTSTRAP
+    const char *strong_default = bootstrap_default;
+    bootstrap_default = "weak";
+    load_psk(); assert(current_psk[0] == 0 && stored[0] == 0);
+    bootstrap_default = "passwordpasswordpasswordpassword";
+    load_psk(); assert(current_psk[0] == 0 && stored[0] == 0);
+    bootstrap_default = strong_default;
     commit_result = 4;
     load_psk(); assert(current_psk[0] == 0 && stored[0] == 0);
     commit_result = 0;
     load_psk(); assert(!strcmp(stored, bootstrap_default));
     memset(current_psk, 0, sizeof(current_psk));
     bootstrap_default = "CHANGE_ME_before_flashing_32chars!"; /* generic release OTA */
-    load_psk(); assert(!strcmp(current_psk, "synthetic-private-bootstrap-key"));
+    load_psk(); assert(!strcmp(current_psk, strong_default));
     puts("Fresh provisioning persists before generic release OTA; storage failure stays closed");
 #else
     for (int n = 1; n <= 128; n++) {

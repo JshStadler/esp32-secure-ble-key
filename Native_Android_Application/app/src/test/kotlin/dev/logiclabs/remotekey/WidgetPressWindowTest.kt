@@ -1,0 +1,111 @@
+package dev.logiclabs.remotekey
+
+import org.junit.Assert.*
+import org.junit.Test
+
+class WidgetPressWindowTest {
+    @Test fun aSecondTapBeforeDispatchRevokesTheCommandEvenIfTheConnectionThenBecomesReady() {
+        val w = WidgetPressWindow()
+        w.tap(0, "request-a")
+        assertEquals("request-a", w.cancellationId)
+        assertTrue(w.cancelPending("request-a"))
+        assertFalse(w.claim(1))
+        assertFalse(w.complete(2))
+        assertFalse(w.active)
+        assertNull(w.cancellationId)
+    }
+    @Test fun cancellationCannotRecallAnAlreadyDispatchedCommandOrHideItsReceipt() {
+        val w = WidgetPressWindow()
+        w.tap(0, "request-a"); assertTrue(w.claim(1))
+        assertNull(w.cancellationId)
+        assertFalse(w.cancelPending("request-a"))
+        assertTrue(w.dispatched)
+        assertTrue(w.complete(2))
+    }
+    @Test fun anOldWaitingTapCannotCancelANewerRequest() {
+        val w = WidgetPressWindow()
+        w.tap(0, "request-a"); w.claim(1); w.complete(2)
+        assertFalse(w.cancelPending("request-a"))
+        w.tap(3, "request-b")
+        assertFalse(w.cancelPending("request-a"))
+        assertFalse(w.cancelPending(null))
+        assertTrue(w.claim(4))
+        assertTrue(w.complete(5))
+    }
+    @Test fun oneTapCanOnlyAuthorizeOneCommand() {
+        val w = WidgetPressWindow()
+        assertTrue(w.tap(100))
+        assertFalse(w.tap(200))
+        assertTrue(w.claim(300))
+        assertFalse(w.claim(301))
+        assertFalse(w.tap(400))
+    }
+    @Test fun theConnectionLeaseStartsAfterTheResultAndRestartsAfterEachPress() {
+        val w = WidgetPressWindow()
+        w.tap(0); w.claim(9_000); w.complete(10_000)
+        assertFalse(w.expired(39_999))
+        assertTrue(w.tap(39_999))
+        assertFalse(w.expired(40_000))
+        assertTrue(w.claim(40_000))
+        assertTrue(w.complete(41_000))
+        assertFalse(w.expired(70_999))
+        assertTrue(w.expired(71_000))
+    }
+    @Test fun connectionArrivingAfterTheDeadlineCannotSendAStalePress() {
+        val w = WidgetPressWindow()
+        w.tap(1_000)
+        assertNotNull(w.timeout(11_000))
+        assertFalse(w.claim(11_000))
+        assertFalse(w.claim(30_000))
+    }
+    @Test fun waitingForTheReceiptDoesNotExpireTheWarmConnectionTimer() {
+        val w = WidgetPressWindow()
+        w.tap(0); w.claim(9_999)
+        assertNull(w.timeout(17_999))
+        assertEquals("Unable to confirm — check the device", w.timeout(18_000))
+        assertFalse(w.expired(18_000))
+    }
+    @Test fun cancellationMakesLaterReadyCallbacksHarmless() {
+        val w = WidgetPressWindow()
+        w.tap(0); w.cancel()
+        assertFalse(w.claim(1))
+        assertFalse(w.complete(2))
+        assertFalse(w.busy)
+        assertFalse(w.active)
+    }
+    @Test fun duplicateResultsCannotExtendTheConnectionLease() {
+        val w = WidgetPressWindow()
+        w.tap(0); w.claim(1); assertTrue(w.complete(2))
+        assertFalse(w.complete(29_000))
+        assertTrue(w.expired(30_002))
+    }
+    @Test fun offDisconnectsAfterTheResultWithoutInterruptingAnActivePress() {
+        val w = WidgetPressWindow()
+        w.tap(0); w.claim(100)
+        assertFalse(w.expired(200))
+        assertTrue(w.complete(200, BackgroundConnectionDuration.OFF.milliseconds))
+        assertTrue(w.expired(200))
+        assertFalse(w.claim(201))
+    }
+    @Test fun eachConfirmedPressCanUseTheCurrentBackgroundPreference() {
+        val w = WidgetPressWindow()
+        w.tap(0); w.claim(100); w.complete(200, BackgroundConnectionDuration.TWO_MINUTES.milliseconds)
+        assertFalse(w.expired(120_199))
+        assertTrue(w.tap(120_199)); w.claim(120_200)
+        w.complete(120_201, BackgroundConnectionDuration.THIRTY_SECONDS.milliseconds)
+        assertFalse(w.expired(150_200))
+        assertTrue(w.expired(150_201))
+        assertFalse(w.complete(160_000, BackgroundConnectionDuration.TWO_MINUTES.milliseconds))
+        assertTrue(w.expired(160_000))
+    }
+    @Test fun scheduleFollowsTheCurrentDeadlineWithoutPollingDuringTheLease() {
+        val w = WidgetPressWindow()
+        w.tap(100)
+        assertEquals(10_000, w.nextCheckDelay(100))
+        w.claim(1_000)
+        assertEquals(17_100, w.nextCheckDelay(1_000))
+        w.complete(2_000)
+        assertEquals(30_000, w.nextCheckDelay(2_000))
+        assertEquals(1, w.nextCheckDelay(40_000))
+    }
+}

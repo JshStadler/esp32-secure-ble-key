@@ -17,15 +17,27 @@ Privacy and support: `info@6675162.xyz`. The app contains no ads. Read the bundl
 privacy policy from App Settings or the authentication screen. App Settings also
 provides a support email action and optional connection-notification permission
 on Android 13 and later. BLE operation does not depend on notification permission.
+The About section shows the installed app version and build number; its text can
+be selected/copied for support, and test builds retain their `-test` suffix.
+
+**App Settings → Theme and accent colour** offers Follow system (the default), Light,
+or Dark, plus Blue, Teal, Green, Purple, Orange or Rose accents. The selected theme
+and accent cover the dashboard, settings, dialogs, authentication, logs and widget
+configuration. Applying a change refreshes the app UI; appearance is stored locally
+without keys and does not change widget status colours or radio settings.
 
 Read the [privacy policy](app/src/main/res/raw/privacy_policy.html) for details
 about local storage, optional locations, exports, and deletion.
 
 ## Features
 
-- Configurable device-card dashboard, initially populated with Car and Gate
+- First-launch device-type chooser with Standalone, ESPHome, or setup-later options; no pre-created Car/Gate cards
+- Bluetooth availability banner with a system turn-on action, paused connection retries while off, and automatic reconnection when enabled
 - Add, rename, or remove Standalone and ESPHome device cards from app settings
 - Foreground-persistent BLE connections with per-device cached-address retries and scan fallback
+- Continuous Connecting/Reconnecting card status across retry stages, with detailed stages retained in Diagnostics
+- Cards and settings buttons that grow with Android font/display scaling, with stacked actions when space is limited
+- Per-device home-screen press widgets on Android 12+, colour/status feedback and a reusable connection window that follows the app's background duration setting
 - Independent encrypted PSK and address settings for each device
 - Authenticated live Open/Closed/Opening/Closing gate state while connected
 - API-v2 HMAC-SHA256 authentication for both Car and Gate
@@ -35,15 +47,92 @@ about local storage, optional locations, exports, and deletion.
 - Shareable 24-hour diagnostic logs with BLE/GATT details
 - All-device or per-device filtering for diagnostics, operations, locations, export, and clearing
 - Seven-day operation history and per-device optional latest-30 location pins
-- AMOLED-black UI and Android adaptive launcher/splash assets
+- System-following light/dark UI, manual theme and six accent choices, with Android adaptive launcher/splash assets
 
 The car uses the `a1b2c3d4-...` API-v2 UUID family and `car-main` security
 binding. The gate uses the distinct `b1b2c3d4-...` API-v2 family and
 `gate-main`, preventing discovery from selecting the wrong ESP while all
 devices are in range.
+Fresh installations start with no device cards. After app authentication, select
+one or both firmware types, or choose **Set up later**. Selected cards use neutral
+type labels; open their settings to set a name and the installed device's PSK.
+An empty dashboard provides an **Add device** action. Existing saved device lists
+and legacy credentials are retained on upgrade, and removing all cards does not
+restart onboarding.
+
+The dashboard distinguishes Bluetooth off, switching on/off, missing permission,
+and unsupported BLE hardware. Press actions are disabled while Bluetooth is
+unavailable. **Turn on Bluetooth** opens Android's enable prompt; denying it leaves
+the off state visible. Turning Bluetooth back on reconnects configured devices
+while the app is open without replaying interrupted commands. A key change that
+was interrupted keeps its recovery journal; a dispatched press without a receipt
+remains marked as unconfirmed.
+
 Nearby configured devices connect and authenticate when the app is open, making
-card-button presses immediate. Existing connections remain available for up to
-two minutes after the app is backgrounded, or while a firmware update is active.
+card-button presses immediate. Each device's **Connect automatically when the
+app opens** switch defaults to on. Turning it off still permits an explicit
+Press, Device health, Reconnect or Rescan to establish a connection.
+**Reconnect** and **Rescan for this device** use saved settings; Rescan bypasses
+the direct-address shortcut while preserving any explicitly configured target
+address. Neither action is allowed during a pending press, key change, radio
+write, firmware selection or firmware transfer, and neither sends a press.
+
+App Settings provides **Background connections: Off / 30 seconds / 2 minutes**.
+Existing installations default to two minutes. The deadline uses elapsed time,
+including screen-off sleep. An already-started operation or open firmware picker
+is allowed to finish; the original deadline is not extended after it finishes.
+Off disconnects on leaving the app unless such an operation is active. Returning
+to the app cancels the old lease. These are phone connection preferences, not
+changes to the ESP advertising or sleep configuration.
+
+Widgets use the same saved duration after each confirmed press. Another confirmed
+widget press restarts that widget connection's deadline; Off disconnects immediately
+after its result. Connecting is amber, sending is blue, confirmation is green and
+failure/uncertainty is red. Confirmation lasts three seconds before the widget
+returns to its device name and ready status (or idle when Off).
+Tapping a widget again while it shows **Wait… / Connecting…** cancels that unsent
+request immediately, without an authentication prompt. Once the command is sent,
+it cannot be recalled: taps during **Send… / Sending…** are ignored and the app
+waits for its result. Cached widget or notification cancellation actions are bound
+to the original request, so they cannot cancel a newer press or start one.
+
+Widget success, failure and cancellation results clear after three seconds.
+The normal background defaults to black when disconnected and stays blue while an app or widget
+client still holds a connection. Each widget can instead use a preset or custom six-digit RGB
+background colour; text and icons adapt their contrast. Use the launcher's widget settings/Edit
+action to change the device, icon or colour, with the current values preselected. Save applies
+the edit; Cancel leaves the widget unchanged. The widget remains resizable to 1×1 or larger. Connecting/sending retain their progress colours.
+
+Device Settings checks public GitHub firmware releases when opened, with a
+five-minute in-memory metadata cache and an explicit Check again action. There
+is no periodic background update job. Standalone ESP32-C3 releases can be
+downloaded, checked for size, SHA-256 and chip type, then installed through the
+existing authenticated BLE updater after confirmation. The ESP still verifies
+the firmware signature. A known same/newer installed version is not offered as
+an upgrade; the local .bin file picker remains available.
+
+ESPHome devices show the latest published config and link to its versioned source;
+they are installed through ESPHome, not this app. Gate firmware 2.8.12 adds the
+running version/build to the existing BLE identity descriptor. Earlier gate
+firmware shows the latest available config without claiming its installed version
+is known. Published firmware-vX.Y.Z releases may include both device families;
+gate-vX.Y.Z releases contain only the ESPHome config. Pre-releases are labelled beta.
+Only the matching named asset for each family is selected.
+
+A button tapped while connecting stays pending after **Home** or **Recent apps**
+is pressed. The background service retains the connection attempt and sends the
+press once ready, within the original ten-second connection deadline. This also
+works with background connections set to Off: the active operation, including its
+receipt, may finish before disconnecting. Returning to the app does not resend it.
+Cancel, Bluetooth off, closing/removing the app task, or activity/process teardown
+revokes an unsent press; commands are never restored or replayed after restart.
+
+**Copy support summary** includes app/build version, Android API, Bluetooth
+state, connection preferences, and last collected health firmware/signal data
+labelled with snapshot age. It does not connect or refresh health on its own.
+Missing readings are labelled, and PSKs, names, BLE addresses, locations and logs
+are excluded. Device health Refresh collects a new snapshot for the summary.
+
 Normal PSK changes require the existing PSK. Car changes
 securely update the car ESP over BLE and save the phone copy only after the ESP
 confirms persistence; ESPHome access-device changes update the app copy after
@@ -58,6 +147,13 @@ PSK. A newly generated PSK is revealed with a Copy action only in the generation
 dialog; after it is saved, the app masks it and does not provide a later reveal
 or copy action. Store the copied value in a password manager before closing the
 dialog, then configure the matching ESP with that same value.
+
+New Car key replacements require 32–128 UTF-8 bytes, at least eight distinct
+byte values, and no repeating pattern of 1–16 bytes. Use the generator rather
+than a memorable password: validation cannot establish randomness. Firmware
+enforces the same rule on BLE updates and fresh customized bootstrap keys.
+Existing keys still work; setup, ESPHome key import, and app-only recovery
+accept the installed device's original key without forcing a remote change.
 
 When two cards use the same firmware type and service UUID, configure a fixed
 BLE address for each. The app requires an address for the additional card and
@@ -113,4 +209,40 @@ To build an Android App Bundle using the configured signing key:
 ```
 
 The bundle is written to `app/build/outputs/bundle/release/app-release.aab`.
-The release workflow produces both APK and AAB artifacts.
+Release builds enable R8 code optimization and resource shrinking. The release
+workflow produces APK, AAB, and `app/build/outputs/mapping/release/mapping.txt`
+artifacts. Keep the mapping file for each released build to decode obfuscated
+crash reports; the AAB also includes it for Google Play. Debug builds remain
+unobfuscated.
+
+### Standalone ESP radio settings (2.8.8)
+
+Open **Device health → Radio settings**. With standalone firmware 2.8.8, select
+transmit power from -12 to +9 dBm in 3 dB steps (default +3), alongside advertising
+intervals. Save authenticates and persists the complete configuration, applies
+power to advertising and active links, then explicitly reads health back.
+Device health distinguishes the saved target from the controller's actual
+advertising/connection settings. Earlier firmware retains interval controls.
+Gate ESPHome transmit power continues to be set in its YAML configuration.
+
+Phone RSSI requests are on demand. A timed-out or canceled controller request
+is quarantined until its callback arrives or the GATT connection is discarded;
+late callbacks cannot fulfill a newer measurement. Optional RSSI failure does
+not prevent key commands or the ESP health snapshot.
+
+### Connected links stay high (2.8.10)
+
+Firmware 2.8.10 uses the high power target for default/non-advertising traffic and
+every connected link at all times. The inactive target affects advertising only;
+its timer is shared with the fast/slow advertising intervals. Choose equal targets
+for fixed power. Existing settings are preserved on upgrade.
+
+Boot, connection results, disconnects and authenticated activity restart the
+recent advertising window. Passive scanning cannot trigger it, so inactive
+advertising power determines initial discovery range. Health reads do not extend
+the timer. OTA keeps advertising high until its transfer ends. Health distinguishes
+the two saved targets from actual advertising and current-link power.
+
+The `linkpower1` capability identifies this policy. The earlier 2.8.9 dual-power
+firmware also lowered connected power; the app displays that older behavior and
+requests a firmware update rather than claiming connected links remain high.

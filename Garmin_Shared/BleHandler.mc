@@ -37,6 +37,9 @@ class BleHandler extends Ble.BleDelegate {
     var _receiptStage = 0;
     var _uncertainOutcome = false;
     var _queuedAt = 0;
+    var _compactAuth = false;
+    var _earlyProof = null;
+    var _phaseStarted = 0;
 
     function initialize() {
         BleDelegate.initialize();
@@ -68,7 +71,7 @@ class BleHandler extends Ble.BleDelegate {
     function cleanup() {
         _stopped = true;
         _timer.stop(); _operationTimer.stop(); _connectionTimer.stop(); _windowTimer.stop();
-        _intentTimer.stop(); _receiptOp = 0; _receiptStage = 0;
+        _intentTimer.stop(); _receiptOp = 0; _receiptStage = 0; _earlyProof = null;
         stopScan();
         _pendingCommand = null; _part2 = null; _earlyStatus = null; _hasPendingPress = false;
         // Retain a healthy cached pairing, but discard one with unfinished ATT work.
@@ -100,6 +103,11 @@ class BleHandler extends Ble.BleDelegate {
     private function startScan() {
         if (_stopped || !_registered || _state == STATE_SCANNING || _state == STATE_CONNECTING) { return; }
         // Reuse a live pairing on a clean app launch, then authenticate it again.
+        if (_device != null && _device.isConnected()) {
+            _state = STATE_CONNECTING;
+            onConnectedStateChanged(_device, Ble.CONNECTION_STATE_CONNECTED);
+            return;
+        }
         if (_retries == 0 && _device == null) {
             try {
                 var paired = Ble.getPairedDevices();
@@ -107,6 +115,7 @@ class BleHandler extends Ble.BleDelegate {
                     if (!(d instanceof Ble.Device)) { continue; }
                     if (d.isConnected() && d.getService(CarKeyProfile.SERVICE_UUID) != null) {
                         _device = d;
+                        _state = STATE_CONNECTING;
                         onConnectedStateChanged(d, Ble.CONNECTION_STATE_CONNECTED);
                         return;
                     }
@@ -114,6 +123,7 @@ class BleHandler extends Ble.BleDelegate {
             } catch (e) { System.println("Cached pairing: " + e.getErrorMessage()); }
         }
         _state = STATE_SCANNING;
+        _phaseStarted = System.getTimer();
         show("Scanning");
         try {
             Ble.setScanState(Ble.SCAN_STATE_SCANNING);
@@ -143,6 +153,8 @@ class BleHandler extends Ble.BleDelegate {
             var name = result.getDeviceName();
             if (!match && !(name != null && name.equals(CarKeyProfile.DEVICE_NAME))) { continue; }
             _state = STATE_CONNECTING; // Before stopping scan: ignore its OFF callback.
+            System.println("BLE scan ms=" + (System.getTimer() - _phaseStarted));
+            _phaseStarted = System.getTimer();
             stopScan();
             _connectionTimer.stop();
             show("Connecting");
@@ -159,7 +171,10 @@ class BleHandler extends Ble.BleDelegate {
         if (state != Ble.CONNECTION_STATE_CONNECTED) { recover("Disconnected", _pendingCommand == null || _pendingCommand == CarKeyProfile.CMD_AUTH_ONLY); return; }
         if (_state != STATE_CONNECTING && _state != STATE_IDLE) { return; }
         _timer.stop(); _connectionTimer.stop();
+        System.println("BLE connect ms=" + (System.getTimer() - _phaseStarted));
+        _phaseStarted = System.getTimer();
         _state = STATE_CONNECTED; _authenticated = false;
+        _compactAuth = false; _earlyProof = null;
         show("Authenticating");
         if (CarKeyProfile.READ_STATUS) { beginAuthentication(); }
         else {
@@ -185,6 +200,17 @@ class BleHandler extends Ble.BleDelegate {
         beginAuthentication();
     }
     private function beginAuthentication() {
+        // Read capability only on Car; Gate keeps its established read protocol.
+        var identity = CarKeyProfile.RECEIPTS ? characteristic(CarKeyProfile.IDENTITY_CHAR_UUID) : null;
+        if (identity != null) {
+            armOperation();
+            try { identity.requestRead(); }
+            catch (e) { recover("Identity read failed", false); }
+            return;
+        }
+        authenticateWithCapabilities();
+    }
+    private function authenticateWithCapabilities() {
         if (CarKeyProfile.RECEIPTS && characteristic(CarKeyProfile.RECEIPT_CHAR_UUID) != null) {
             beginReceipt(1, Cryptography.randomBytes(16));
         } else {
@@ -236,7 +262,14 @@ class BleHandler extends Ble.BleDelegate {
     function onCharacteristicRead(c, status, value) {
         if (!ownsCharacteristic(c)) { return; }
         var uuid = c.getUuid();
-        if (uuid.equals(CarKeyProfile.CHALLENGE_CHAR_UUID) && _state == STATE_READING_CHALLENGE) {
+        if (CarKeyProfile.RECEIPTS && uuid.equals(CarKeyProfile.IDENTITY_CHAR_UUID) && _state == STATE_CONNECTED && !_authenticated) {
+            if (status != Ble.STATUS_SUCCESS || !(value instanceof Lang.ByteArray)) { recover("Identity read failed", false); return; }
+            _operationTimer.stop();
+            // Match a complete comma-delimited capability, never a substring.
+            var identity = byteArrayToString(value);
+            _compactAuth = (identity + ",").find(",auth2,") != null;
+            authenticateWithCapabilities();
+        } else if (uuid.equals(CarKeyProfile.CHALLENGE_CHAR_UUID) && _state == STATE_READING_CHALLENGE) {
             if (status != Ble.STATUS_SUCCESS || !(value instanceof Lang.ByteArray) || value.size() != 16) { recover("Invalid challenge", false); return; }
             _operationTimer.stop();
             if (_receiptOp != 0) { sendReceipt(value); } else { sendCommand(value); }
@@ -302,6 +335,11 @@ class BleHandler extends Ble.BleDelegate {
     }
     function onCharacteristicChanged(c, value) {
         if (CarKeyProfile.READ_STATUS || !ownsCharacteristic(c) || !c.getUuid().equals(CarKeyProfile.STATUS_CHAR_UUID)) { return; }
+        if (_compactAuth && _receiptOp == 1) {
+            if (_receiptStage < 4) { _earlyProof = value; }
+            else { finishReceipt(value); }
+            return;
+        }
         if (_state == STATE_SENDING_COMMAND && _writeStage == 2) { _earlyStatus = value; }
         else if (_state == STATE_WAITING_STATUS) { finishStatus(value); }
     }
@@ -327,7 +365,7 @@ class BleHandler extends Ble.BleDelegate {
     }
     private function armOperation() { _operationTimer.stop(); _operationTimer.start(method(:onOperationTimeout), 5000, false); }
     function onOperationTimeout() as Void {
-        if (!_stopped && (_subscribing || _pendingCommand != null || _receiptOp != 0)) { recover("No confirmation", false); }
+        if (!_stopped && (_subscribing || _pendingCommand != null || _receiptOp != 0 || (_state == STATE_CONNECTED && !_authenticated))) { recover("No confirmation", false); }
     }
     function onConnectionTimeout() as Void {
         if (!_stopped && (_state == STATE_SCANNING || _state == STATE_CONNECTING)) { recover("Connection timed out", true); }
@@ -351,7 +389,7 @@ class BleHandler extends Ble.BleDelegate {
         _timer.stop(); _operationTimer.stop(); _connectionTimer.stop();
         stopScan(); releaseDevice();
         _authenticated = false; _subscribing = false;
-        _receiptOp = 0; _receiptStage = 0; _receiptMac = null;
+        _receiptOp = 0; _receiptStage = 0; _receiptMac = null; _earlyProof = null;
         _pendingCommand = null; _part2 = null; _earlyStatus = null; _writeStage = 0;
         if (!preserveQueued || uncertainPress) { _hasPendingPress = false; }
         if (uncertainPress) { _uncertainOutcome = true; vibrateFailure(); }
@@ -391,9 +429,14 @@ class BleHandler extends Ble.BleDelegate {
         try {
             var c = characteristic(CarKeyProfile.RECEIPT_CHAR_UUID);
             if (c == null) { recover("Receipt unavailable", false); return; }
-            if (_receiptStage == 4) { c.requestRead(); return; }
+            if (_receiptStage == 4) {
+                if (_compactAuth) {
+                    if (_earlyProof != null) { var proof = _earlyProof; _earlyProof = null; finishReceipt(proof); }
+                } else { c.requestRead(); }
+                return;
+            }
             var packet = new [_receiptStage == 2 ? 18 : 17]b;
-            packet[0] = _receiptStage == 1 ? 0xf0 : (_receiptStage == 2 ? 0xf1 : 0xf2);
+            packet[0] = _receiptStage == 1 ? 0xf0 : (_receiptStage == 2 ? (_compactAuth ? 0xf4 : 0xf1) : 0xf2);
             if (_receiptStage == 2) { packet[1] = _receiptOp; }
             for (var i = 0; i < 16; i++) {
                 if (_receiptStage == 1) { packet[i + 1] = _receiptRequestId[i]; }
@@ -416,6 +459,7 @@ class BleHandler extends Ble.BleDelegate {
         _receiptOp = 0; _receiptStage = 0; _pendingCommand = null; _state = STATE_CONNECTED;
         if (op != 1 || result != 6) { recover("Device proof failed", false); return; }
         _authenticated = true; _retries = 0;
+        System.println("BLE auth ms=" + (System.getTimer() - _phaseStarted) + " compact=" + _compactAuth);
         show(_uncertainOutcome ? "Unable to confirm" : "Authenticated");
         vibrateConnected();
         if (_hasPendingPress) { dispatchPress(); }

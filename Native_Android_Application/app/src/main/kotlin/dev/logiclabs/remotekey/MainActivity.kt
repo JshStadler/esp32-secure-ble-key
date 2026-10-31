@@ -3,14 +3,16 @@ package dev.logiclabs.remotekey
 import android.Manifest
 import android.app.AlertDialog
 import android.app.KeyguardManager
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
-import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.location.Location
@@ -30,6 +32,8 @@ import android.text.InputType
 import android.text.method.LinkMovementMethod
 import android.view.Gravity
 import android.view.View
+import android.widget.ArrayAdapter
+import android.widget.Spinner
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
@@ -50,18 +54,20 @@ import androidx.core.text.HtmlCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
-import androidx.fragment.app.FragmentActivity
 import java.util.UUID
 
-class MainActivity : FragmentActivity() {
+class MainActivity : ThemedActivity() {
+    private val colors get() = AppAppearance.colors(this)
     private data class DeviceRuntime(
         var psk: String = "",
         var cachedAddress: String? = null,
         var preferCached: Boolean = false,
+        var autoConnect: Boolean = true,
         var recordLocation: Boolean = false,
         var state: BleCarKeyClient.State = BleCarKeyClient.State.DISCONNECTED,
         var message: String = "Idle",
         var ready: Boolean = false,
+        var hasConnected: Boolean = false,
         var deviceState: String? = null,
         var uncertainOutcome: String? = null,
     )
@@ -77,15 +83,41 @@ class MainActivity : FragmentActivity() {
     private val bluetoothManager by lazy { getSystemService(BluetoothManager::class.java) }
     private val mainHandler = Handler(Looper.getMainLooper())
     private val runtimes = mutableMapOf<String, DeviceRuntime>()
+    private val lastDeviceHealth = mutableMapOf<String, TimedDeviceHealth>()
     private val deviceViews = mutableMapOf<String, DeviceViews>()
     private val clients = mutableMapOf<String, BleCarKeyClient>()
     private val clientGenerations = mutableMapOf<String, Int>()
+    private val firmwarePanels = mutableSetOf<FirmwareUpdatePanel>()
+    private val widgetConnectionOwner = "app:${UUID.randomUUID()}"
+    private var firmwareHealthFetch: (() -> Unit)? = null
     private val profiles = mutableListOf<BleDeviceProfile>()
 
     private var appForeground = false
-    private var pendingPressId: String? = null
-    private var pendingPressDeadline = 0L
-    private var pressDispatched = false
+    private var initialSetupPending = false
+    private var initialSetupDialog: AlertDialog? = null
+    private var bluetoothAvailability = BluetoothAvailability.PERMISSION_REQUIRED
+    private var bluetoothBanner: LinearLayout? = null
+    private var bluetoothBannerText: TextView? = null
+    private var bluetoothBannerAction: Button? = null
+    private var bluetoothReceiverRegistered = false
+    private var pendingBluetoothEnable = false
+    private val bluetoothReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+            // A queued off broadcast must still cancel an action if the adapter
+            // has already been switched back on before this callback runs.
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                BluetoothAdapter.STATE_OFF, BluetoothAdapter.STATE_TURNING_OFF ->
+                    refreshBluetoothState(BluetoothAvailability.OFF)
+            }
+            refreshBluetoothState()
+        }
+    }
+    private var maintenanceDeviceId: String? = null
+    private val presses = DevicePressRequests()
+    private val pressFeedback = mutableMapOf<String, Any>()
+    private val hasPendingOperations get() = maintenanceDeviceId != null || presses.busy
+    private var maintenanceDispatched = false
     private var pendingPskValue: String? = null
     private var pendingPskOnSaved: (() -> Unit)? = null
     private var pendingOtaImage: ByteArray? = null
@@ -93,7 +125,6 @@ class MainActivity : FragmentActivity() {
     private var pendingFirmwareProfileId: String? = null
     private var firmwarePickerActive = false
     private var operationGeneration = 0
-    private var operationSession = UUID.randomUUID().toString()
     private var requireAuthentication = true
     private var authenticated = false
     private var healthDialog: AlertDialog? = null
@@ -120,9 +151,17 @@ class MainActivity : FragmentActivity() {
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
-    ) { result ->
-        if (result.values.all { it }) startOrConfigure()
-        else toast("Bluetooth permission is required")
+    ) {
+        val enableRequested = pendingBluetoothEnable
+        pendingBluetoothEnable = false
+        refreshBluetoothState()
+        if (hasPermissions()) {
+            if (enableRequested) requestBluetoothEnable() else startOrConfigure()
+        } else toast("Bluetooth permission is required")
+    }
+
+    private val bluetoothEnableLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        refreshBluetoothState()
     }
 
     private val locationPermissionLauncher = registerForActivityResult(
@@ -155,7 +194,7 @@ class MainActivity : FragmentActivity() {
         val profileId = pendingFirmwareProfileId
         pendingFirmwareProfileId = null
         if (uri == null) return@registerForActivityResult
-        val image = runCatching { contentResolver.openInputStream(uri)?.use { it.readBytes() } }.getOrNull()
+        val image = runCatching { contentResolver.openInputStream(uri)?.use(FirmwareImageReader::read) }.getOrNull()
         when {
             image == null -> toast("Could not read firmware file")
             image.isEmpty() || image.size > 0x1e0000 -> toast("Firmware must be 1 byte to 1,966,080 bytes")
@@ -165,7 +204,7 @@ class MainActivity : FragmentActivity() {
                     toast("Device is no longer configured")
                     return@registerForActivityResult
                 }
-                AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+                AppAppearance.dialog(this)
                 .setTitle("Update ${profile.displayName} firmware?")
                 .setMessage("Transfer ${(image.size + 1023) / 1024} KiB over BLE. Keep the phone near the car and do not remove car power. Only signed firmware from this project is accepted.")
                 .setNegativeButton("Cancel", null)
@@ -179,33 +218,40 @@ class MainActivity : FragmentActivity() {
         setTheme(R.style.Theme_CarKey)
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        window.statusBarColor = Color.BLACK
-        window.navigationBarColor = Color.BLACK
 
         requireAuthentication = store.get("require_auth") != "false"
         profiles.addAll(profileRepository.load())
+        initialSetupPending = profileRepository.needsInitialSetup()
+        bluetoothAvailability = BluetoothAvailability.read(this, bluetoothManager)
         loadDeviceSettings()
         setContentView(buildUi())
-        requestPermissionsAndStart()
+        ContextCompat.registerReceiver(this, bluetoothReceiver,
+            IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED), ContextCompat.RECEIVER_EXPORTED)
+        bluetoothReceiverRegistered = true
 
         if (requireAuthentication) {
             authenticate("Authenticate to access Remote Key") { ok ->
                 authenticated = ok
                 authOverlay.visibility = if (ok) View.GONE else View.VISIBLE
-                if (ok) startForegroundClients()
+                if (ok) onAppAuthenticated()
             }
         } else {
             authenticated = true
             authOverlay.visibility = View.GONE
+            onAppAuthenticated()
         }
     }
 
     override fun onDestroy() {
+        firmwarePanels.forEach { it.close() }; firmwarePanels.clear()
+        initialSetupDialog?.dismiss()
+        if (bluetoothReceiverRegistered) unregisterReceiver(bluetoothReceiver)
         radioDialog?.dismiss()
         healthDialog?.dismiss()
         BackgroundConnectionService.finish(this, false)
         operationGeneration++
-        pendingPressId = null
+        presses.clear()
+        maintenanceDeviceId = null
         pendingPskValue = null
         pendingPskOnSaved = null
         stopAllClients()
@@ -222,16 +268,27 @@ class MainActivity : FragmentActivity() {
     override fun onResume() {
         super.onResume()
         BackgroundConnectionService.finish(this, true)
-        startForegroundClients()
+        refreshBluetoothState()
     }
 
     override fun onPause() {
         // Start while still visible, before Android's background-start limits apply.
         if (!isFinishing && authenticated && hasPermissions() && clients.isNotEmpty()) {
-            BackgroundConnectionService.begin(this, BackgroundConnectionService.Lease(
-                busy = { pendingOtaImage != null },
+            val duration = BackgroundConnectionDuration.fromSaved(store.get(BackgroundConnectionDuration.STORE_KEY))
+            val operationActive = { hasPendingOperations || firmwarePickerActive || clients.values.any { !it.canRestartConnection } }
+            if (duration == BackgroundConnectionDuration.OFF && !operationActive()) stopAllClients()
+            else BackgroundConnectionService.begin(this, BackgroundConnectionService.Lease(
+                duration = duration,
+                busy = operationActive,
                 disconnect = {
                     EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Background connection window ended")
+                    presses.deviceIds.forEach { id ->
+                        profiles.find { it.id == id }?.let { profile ->
+                            finishOperation(profile, false, if (presses[id]?.dispatched == true)
+                                "Unable to confirm — background connection ended. Check the device."
+                            else "Not sent — background connection ended")
+                        }
+                    }
                     stopAllClients()
                 },
             ))
@@ -241,13 +298,15 @@ class MainActivity : FragmentActivity() {
 
     override fun onStop() {
         appForeground = false
-        pendingPressId?.let { id ->
-            if (!pressDispatched && pendingPskValue == null && pendingOtaImage == null)
-                profiles.find { it.id == id }?.let { finishOperation(it, false, "Canceled before sending") }
-        }
+        // Home/Recents hides the UI without revoking an explicit tap. onPause
+        // already started the short foreground-service lease for this operation.
         radioDialog?.dismiss()
         healthDialog?.dismiss()
         if (isFinishing) {
+            presses.deviceIds.forEach { id ->
+                if (presses[id]?.dispatched == false)
+                    profiles.find { it.id == id }?.let { finishOperation(it, false, "Canceled before sending") }
+            }
             BackgroundConnectionService.finish(this, false)
             stopAllClients()
         }
@@ -269,6 +328,7 @@ class MainActivity : FragmentActivity() {
                     ?: if (profile.id == "car") legacyPreferCached else profile.defaultAddress != null,
                 recordLocation = store.get(profile.recordLocationStoreKey)?.toBooleanStrictOrNull()
                     ?: (profile.id == "car" && legacyRecordLocation),
+                autoConnect = ConnectionPreferences.shouldAutoConnect(store.get(profile.autoConnectStoreKey), true),
             )
             if (runtime.psk.isEmpty()) runtime.message = "PSK required"
             runtimes[profile.id] = runtime
@@ -281,8 +341,8 @@ class MainActivity : FragmentActivity() {
 
     private fun buildUi(): View {
         deviceViews.clear()
-        val background = Color.BLACK
-        val surface = Color.rgb(31, 34, 48)
+        val background = colors.background
+        val surface = colors.surface
         val root = FrameLayout(this).apply { setBackgroundColor(background) }
         ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
             val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
@@ -302,7 +362,8 @@ class MainActivity : FragmentActivity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(4), 0, dp(4))
         }
-        bar.addView(text("Remote Key", 23f, true), LinearLayout.LayoutParams(0, dp(64), 1f))
+        bar.minimumHeight = dp(72)
+        bar.addView(text("Remote Key", 23f, true), LinearLayout.LayoutParams(0, -2, 1f))
         bar.addView(
             iconButton(R.drawable.ic_logs, "Logs") { startActivity(Intent(this, LogActivity::class.java)) },
             LinearLayout.LayoutParams(dp(48), dp(48)),
@@ -311,24 +372,37 @@ class MainActivity : FragmentActivity() {
             iconButton(R.drawable.ic_settings, "App settings") { showAppSettings() },
             LinearLayout.LayoutParams(dp(48), dp(48)),
         )
-        page.addView(bar, LinearLayout.LayoutParams(-1, dp(72)))
+        page.addView(bar, LinearLayout.LayoutParams(-1, -2))
+
+        bluetoothBanner = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            this.background = rounded(colors.warningSurface, 16f)
+        }
+        bluetoothBannerText = text("", 15f, true).also { bluetoothBanner!!.addView(it) }
+        bluetoothBannerAction = primaryButton("Turn on Bluetooth") { requestBluetoothEnable() }.also {
+            bluetoothBanner!!.addView(it, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        }
+        page.addView(bluetoothBanner, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+        updateBluetoothBanner()
 
         page.addView(sectionLabel("Devices").apply { setPadding(0, dp(8), 0, dp(8)) })
         profiles.forEach { profile ->
-            page.addView(buildDeviceCard(profile, surface), LinearLayout.LayoutParams(-1, dp(108)).apply {
+            page.addView(buildDeviceCard(profile, surface), LinearLayout.LayoutParams(-1, -2).apply {
                 bottomMargin = dp(12)
             })
         }
         if (profiles.isEmpty()) {
-            page.addView(text("No devices configured. Open Settings to add one.", 14f, false).apply {
-                setTextColor(Color.rgb(184, 186, 198))
+            page.addView(text("Add the devices you want to control.", 14f, false).apply {
+                setTextColor(colors.secondary)
                 gravity = Gravity.CENTER
                 setPadding(dp(12), dp(24), dp(12), dp(32))
             })
+            page.addView(primaryButton("Add device") { showAddDevice() }, LinearLayout.LayoutParams(-1, -2))
         }
 
         page.addView(text("Nearby devices stay connected while app is open", 13f, false).apply {
-            setTextColor(Color.rgb(153, 156, 171))
+            setTextColor(colors.muted)
             gravity = Gravity.CENTER
             setPadding(dp(8), dp(8), dp(8), 0)
         })
@@ -338,7 +412,7 @@ class MainActivity : FragmentActivity() {
             gravity = Gravity.CENTER
             setPadding(dp(32), dp(32), dp(32), dp(32))
             setBackgroundColor(background)
-            addView(ImageView(context).apply { setImageResource(R.drawable.ic_lock) }, LinearLayout.LayoutParams(dp(64), dp(64)))
+            addView(ImageView(context).apply { setImageResource(R.drawable.ic_lock); imageTintList = ColorStateList.valueOf(colors.text) }, LinearLayout.LayoutParams(dp(64), dp(64)))
             addView(text("Authentication required", 19f, true).apply {
                 gravity = Gravity.CENTER
                 setPadding(0, dp(20), 0, dp(16))
@@ -348,12 +422,12 @@ class MainActivity : FragmentActivity() {
                     authenticated = ok
                     if (ok) {
                         authOverlay.visibility = View.GONE
-                        startForegroundClients()
+                        onAppAuthenticated()
                     }
                 }
-            }, LinearLayout.LayoutParams(dp(180), dp(52)))
+            }, LinearLayout.LayoutParams(-1, -2))
             addView(primaryButton("Privacy policy") { showPrivacyPolicy() },
-                LinearLayout.LayoutParams(dp(180), dp(52)).apply { topMargin = dp(12) })
+                LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
         }
         root.addView(authOverlay, FrameLayout.LayoutParams(-1, -1))
         updateAllDeviceViews()
@@ -361,22 +435,19 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun buildDeviceCard(profile: BleDeviceProfile, surface: Int): View {
-        val card = LinearLayout(this).apply {
+        val details = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(16), dp(12), dp(12), dp(12))
-            background = rounded(surface, 18f)
-            elevation = dp(2).toFloat()
         }
         val statusIcon = ImageButton(this).apply {
             setImageResource(if (profile.type == BleDeviceType.ESPHOME_ACCESS) R.drawable.ic_gate else R.drawable.ic_car)
             contentDescription = "${profile.displayName} settings"
-            imageTintList = ColorStateList.valueOf(Color.rgb(132, 136, 153))
+            imageTintList = ColorStateList.valueOf(colors.muted)
             setPadding(dp(7), dp(7), dp(7), dp(7))
             background = selectableBorderlessBackground()
             setOnClickListener { showDeviceSettingsAuthenticated(profile) }
         }
-        card.addView(statusIcon, LinearLayout.LayoutParams(dp(48), dp(48)))
+        details.addView(statusIcon, LinearLayout.LayoutParams(dp(48), dp(48)))
 
         val labels = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -384,15 +455,17 @@ class MainActivity : FragmentActivity() {
         }
         labels.addView(text(profile.displayName, 17f, true))
         val status = text("Idle", 13f, false).apply {
-            setTextColor(Color.rgb(184, 186, 198))
-            maxLines = 2
+            setTextColor(colors.secondary)
         }
         labels.addView(status)
-        card.addView(labels, LinearLayout.LayoutParams(0, -2, 1f))
+        details.addView(labels, LinearLayout.LayoutParams(0, -2, 1f))
 
         val shortAction = profile.actionLabel.substringBefore(' ')
         val action = primaryButton(shortAction) { requestPress(profile) }
-        card.addView(action, LinearLayout.LayoutParams(dp(100), dp(52)))
+        val card = DeviceCardLayout(this, details, action, status).apply {
+            background = rounded(surface, 18f)
+            elevation = dp(2).toFloat()
+        }
         deviceViews[profile.id] = DeviceViews(statusIcon, status, action)
         return card
     }
@@ -401,12 +474,112 @@ class MainActivity : FragmentActivity() {
         if (hasPermissions()) startOrConfigure() else permissionLauncher.launch(requiredPermissions())
     }
 
+    private fun onAppAuthenticated() {
+        when {
+            initialSetupPending -> showInitialSetup()
+            profiles.isNotEmpty() -> requestPermissionsAndStart()
+            else -> refreshBluetoothState()
+        }
+    }
+
+    private fun showInitialSetup() {
+        if (initialSetupDialog != null || isFinishing || isDestroyed) return
+        val types = arrayOf(BleDeviceType.CAR, BleDeviceType.ESPHOME_ACCESS)
+        val selected = booleanArrayOf(false, false)
+        val labels = arrayOf("Standalone device (e.g. car remote)", "ESPHome device (e.g. gate or door)")
+        val dialog = AppAppearance.dialog(this)
+            .setTitle("Choose your device types")
+            .setMultiChoiceItems(labels, selected) { _, which, checked ->
+                selected[which] = checked
+                initialSetupDialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.isEnabled = selected.any { it }
+            }
+            .setNegativeButton("Set up later") { _, _ -> completeInitialSetup(emptyList()) }
+            .setPositiveButton("Continue") { _, _ ->
+                completeInitialSetup(types.filterIndexed { index, _ -> selected[index] }.map { type ->
+                    BleDeviceProfiles.create(type, displayName = if (type == BleDeviceType.CAR) "Standalone device" else "ESPHome device")
+                })
+            }
+            .setCancelable(false)
+            .create()
+        initialSetupDialog = dialog
+        dialog.setOnDismissListener { initialSetupDialog = null }
+        dialog.show()
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = false
+    }
+
+    private fun completeInitialSetup(selectedProfiles: List<BleDeviceProfile>) {
+        profileRepository.save(selectedProfiles)
+        initialSetupPending = false
+        profiles.addAll(selectedProfiles)
+        loadDeviceSettings()
+        rebuildUi()
+        if (profiles.isNotEmpty()) toast("Open a device's settings to name it and enter its PSK")
+        if (profiles.isNotEmpty()) requestPermissionsAndStart() else refreshBluetoothState()
+    }
+
+    private fun updateBluetoothBanner() {
+        bluetoothBanner?.visibility = if (bluetoothAvailability == BluetoothAvailability.AVAILABLE) View.GONE else View.VISIBLE
+        bluetoothBannerText?.text = bluetoothAvailability.message
+        bluetoothBannerAction?.apply {
+            text = bluetoothAvailability.actionLabel
+            visibility = if (bluetoothAvailability.actionLabel == null) View.GONE else View.VISIBLE
+        }
+    }
+
+    private fun requestBluetoothEnable() {
+        if (!hasPermissions()) {
+            pendingBluetoothEnable = true
+            permissionLauncher.launch(requiredPermissions())
+            return
+        }
+        refreshBluetoothState()
+        if (bluetoothAvailability != BluetoothAvailability.OFF) return
+        runCatching { bluetoothEnableLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)) }
+            .onFailure {
+                runCatching { startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }
+                    .onFailure { toast("Turn on Bluetooth in Android settings") }
+            }
+    }
+
+    private fun refreshBluetoothState(unavailableState: BluetoothAvailability? = null) {
+        bluetoothAvailability = unavailableState ?: BluetoothAvailability.read(this, bluetoothManager)
+        if (bluetoothAvailability != BluetoothAvailability.AVAILABLE) {
+            val message = bluetoothAvailability.message ?: "Bluetooth is unavailable"
+            maintenanceDeviceId?.let { id -> profiles.firstOrNull { it.id == id }?.let { profile ->
+                when {
+                    pendingPskValue != null -> finishPskUpdate(profile, false, "$message — key change interrupted")
+                    pendingOtaImage != null -> finishOtaOperation(profile, false, "$message — firmware update interrupted")
+                    else -> Unit
+                }
+            } }
+            presses.deviceIds.forEach { id -> profiles.firstOrNull { it.id == id }?.let { profile ->
+                finishOperation(profile, false, if (presses[id]?.dispatched == true)
+                    "Unable to confirm — $message. Check the device." else "Not sent — $message")
+            } }
+            stopAllClients()
+            BackgroundConnectionService.finish(this, false)
+        }
+        updateBluetoothBanner()
+        updateAllDeviceViews()
+        if (bluetoothAvailability == BluetoothAvailability.AVAILABLE) {
+            clients.filterValues { !it.isRunning }.keys.toList().forEach(::stopClient)
+            startForegroundClients()
+        }
+    }
+
+    private fun requireBluetoothAvailable(): Boolean {
+        refreshBluetoothState()
+        if (bluetoothAvailability == BluetoothAvailability.AVAILABLE) return true
+        toast(bluetoothAvailability.message ?: "Bluetooth is unavailable")
+        return false
+    }
+
     private fun startOrConfigure() {
         startForegroundClients()
     }
 
     private fun requestPress(profile: BleDeviceProfile) {
-        if (pendingPressId == profile.id && !pressDispatched && pendingPskValue == null && pendingOtaImage == null) {
+        if (presses[profile.id]?.dispatched == false) {
             finishOperation(profile, false, "Canceled before sending"); return
         }
         if (!authenticated) {
@@ -417,6 +590,7 @@ class MainActivity : FragmentActivity() {
             permissionLauncher.launch(requiredPermissions())
             return
         }
+        if (!requireBluetoothAvailable()) return
         val runtime = runtimes.getValue(profile.id)
         if (store.get(pskJournalKey(profile)) != null) {
             toast("Recover the interrupted PSK change in Device Settings first"); return
@@ -425,58 +599,57 @@ class MainActivity : FragmentActivity() {
             showDevicePskDialog(profile) { requestPress(profile) }
             return
         }
-        if (pendingPressId != null) {
+        if (maintenanceDeviceId != null) {
             toast("Another BLE action is already running")
             return
         }
 
-        operationGeneration++
-        val generation = operationGeneration
-        operationSession = UUID.randomUUID().toString()
+        val request = presses.begin(profile.id, android.os.SystemClock.elapsedRealtime()) ?: return
+        pressFeedback.remove(profile.id)
         runtime.uncertainOutcome = null
-        pendingPressDeadline = android.os.SystemClock.elapsedRealtime() + 10_000
-        pendingPressId = profile.id
-        pendingPskValue = null
-        pendingPskOnSaved = null
-        pendingOtaImage = null
-        pressDispatched = false
-        setAllActionsEnabled(false)
+        updateAllDeviceViews()
 
-        if (runtime.ready) {
-            pressDispatched = true
-            runtime.message = "Pressing…"
-            updateDeviceView(profile.id)
-            clients[profile.id]?.press()
-        } else {
+        if (runtime.ready) dispatchPress(profile)
+        else {
             runtime.state = BleCarKeyClient.State.CONNECTING
             runtime.message = "Connecting (up to 10s)… Tap Cancel to stop."
             updateDeviceView(profile.id)
             ensureClient(profile)
         }
-
         mainHandler.postDelayed({
-            if (generation == operationGeneration && pendingPressId == profile.id) {
-                finishOperation(profile, false, if (pressDispatched) "Unable to confirm — check the car" else "Not sent — connection timed out")
-            }
-        }, 18_000)
+            if (presses[profile.id] === request)
+                finishOperation(profile, false, if (request.dispatched)
+                    "Unable to confirm — check the device" else "Not sent — connection timed out")
+        }, PendingButtonPress.RESULT_TIMEOUT_MS)
         mainHandler.postDelayed({
-            if (generation == operationGeneration && pendingPressId == profile.id && !pressDispatched)
+            if (presses[profile.id] === request && !request.dispatched)
                 finishOperation(profile, false, "Not sent — connection timed out")
-        }, 10_000)
+        }, PendingButtonPress.CONNECTION_TIMEOUT_MS)
+    }
+
+    private fun dispatchPress(profile: BleDeviceProfile) {
+        val request = presses[profile.id] ?: return
+        if (request.dispatched) return
+        if (!request.claim(android.os.SystemClock.elapsedRealtime())) {
+            finishOperation(profile, false, "Not sent — connection timed out")
+            return
+        }
+        runtimes.getValue(profile.id).message = "Pressing…"
+        updateDeviceView(profile.id)
+        clients[profile.id]?.press()
     }
 
     private fun listenerFor(profile: BleDeviceProfile, generation: Int) = object : BleCarKeyClient.Listener {
         private fun current() = clientGenerations[profile.id] == generation && clients.containsKey(profile.id)
         override fun onState(state: BleCarKeyClient.State, message: String) = runOnUiThread {
             if (!current()) return@runOnUiThread
+            PressWidgetProvider.connection(this@MainActivity, profile.id, widgetConnectionOwner, state == BleCarKeyClient.State.CONNECTED)
             EventLog.add(this@MainActivity, EventLog.Kind.DIAGNOSTIC, "${profile.displayName} ${state.name}: $message", deviceId = profile.id, deviceName = profile.displayName)
             val runtime = runtimes.getValue(profile.id)
             runtime.state = state
-            runtime.message = when {
-                state == BleCarKeyClient.State.DISCONNECTED && message == "Disconnected" -> "Idle"
-                else -> message
-            }
+            runtime.message = ConnectionStatusText.label(state, message, runtime.hasConnected)
             if (state != BleCarKeyClient.State.CONNECTED) runtime.ready = false
+            firmwarePanels.forEach { it.refreshInstalled() }
             updateDeviceView(profile.id)
             if (message.contains("scan fallback")) {
                 mainHandler.post { clients[profile.id]?.scanFallback() }
@@ -492,17 +665,16 @@ class MainActivity : FragmentActivity() {
             if (!current()) return@runOnUiThread
             val runtime = runtimes.getValue(profile.id)
             runtime.ready = ready
-            if (ready) runtime.message = "Ready"
+            firmwarePanels.forEach { it.refreshInstalled() }
+            if (ready) {
+                runtime.hasConnected = true
+                runtime.message = "Ready"
+            }
             updateDeviceView(profile.id)
-            if (ready && healthDeviceId == profile.id && pendingPressId == null) healthFetch?.invoke()
-            if (ready && pendingPressId == profile.id && !pressDispatched &&
-                (appForeground || pendingPskValue != null || pendingOtaImage != null)) {
-                if (pendingPskValue == null && pendingOtaImage == null &&
-                    android.os.SystemClock.elapsedRealtime() >= pendingPressDeadline) {
-                    finishOperation(profile, false, "Not sent — connection timed out")
-                    return@runOnUiThread
-                }
-                pressDispatched = true
+            if (ready && healthDeviceId == profile.id && !hasPendingOperations) healthFetch?.invoke()
+            if (ready && !hasPendingOperations) firmwareHealthFetch?.invoke()
+            if (ready && maintenanceDeviceId == profile.id && !maintenanceDispatched) {
+                maintenanceDispatched = true
                 runtime.message = when {
                     pendingOtaImage != null -> "Preparing firmware update..."
                     pendingPskValue != null -> "Updating ESP PSK..."
@@ -516,9 +688,10 @@ class MainActivity : FragmentActivity() {
                             finishPskUpdate(profile, false, "ESP firmware does not support PSK updates")
                         }
                     }
-                    else -> clients[profile.id]?.press()
+                    else -> Unit
                 }
             }
+            if (ready) dispatchPress(profile)
         }
 
         override fun onDeviceAddress(address: String) {
@@ -559,15 +732,15 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun finishOperation(profile: BleDeviceProfile, success: Boolean, message: String) {
-        if (pendingPressId != profile.id) return
-        pendingPressId = null
-        pressDispatched = false
-        operationGeneration++
+        val completed = presses.finish(profile.id) ?: return
+        // Discard the old connection's callbacks after an uncertain result before
+        // accepting another tap on this device. Other devices keep their clients.
+        if (!success && completed.dispatched) stopClient(profile.id)
+        val feedback = Any().also { pressFeedback[profile.id] = it }
         val runtime = runtimes.getValue(profile.id)
         runtime.message = message
         runtime.uncertainOutcome = if (message.startsWith("Unable to confirm")) message else null
-        updateDeviceView(profile.id)
-        setAllActionsEnabled(true)
+        updateAllDeviceViews()
 
         EventLog.add(
             this,
@@ -577,15 +750,15 @@ class MainActivity : FragmentActivity() {
             deviceName = profile.displayName,
         )
         if (success && message == "Pressed") {
-            EventLog.addSessionPress(this, "${profile.displayName} remote button pressed", operationSession, profile.id, profile.displayName)
-            captureOperationLocation(profile)
+            EventLog.addSessionPress(this, "${profile.displayName} remote button pressed", completed.session, profile.id, profile.displayName)
+            captureOperationLocation(profile, completed.session)
             vibrateSuccess()
         } else if (!success) {
             vibrateFailure()
         }
 
         mainHandler.postDelayed({
-            if (pendingPressId == null && runtime.ready) {
+            if (pressFeedback[profile.id] === feedback && presses[profile.id] == null && maintenanceDeviceId != profile.id && runtime.ready) {
                 runtime.message = "Ready"
                 updateDeviceView(profile.id)
             }
@@ -597,7 +770,8 @@ class MainActivity : FragmentActivity() {
             toast("Bluetooth permission is required")
             return
         }
-        if (pendingPressId != null) {
+        if (!requireBluetoothAvailable()) return
+        if (hasPendingOperations) {
             toast("Another BLE action is already running")
             return
         }
@@ -617,17 +791,17 @@ class MainActivity : FragmentActivity() {
         }
         operationGeneration++
         val generation = operationGeneration
-        pendingPressId = profile.id
+        maintenanceDeviceId = profile.id
         pendingPskValue = newPsk
         pendingPskOnSaved = onSaved
         pendingOtaImage = null
-        pressDispatched = false
-        setAllActionsEnabled(false)
+        maintenanceDispatched = false
+        updateAllDeviceViews()
         runtime.message = if (runtime.ready) "Updating device PSK..." else "Connecting to update device PSK..."
         updateDeviceView(profile.id)
 
         if (runtime.ready) {
-            pressDispatched = true
+            maintenanceDispatched = true
             if (clients[profile.id]?.updatePsk(newPsk) != true) {
                 finishPskUpdate(profile, false, "This firmware does not support PSK updates")
                 return
@@ -646,12 +820,12 @@ class MainActivity : FragmentActivity() {
 
     private fun finishPskUpdate(profile: BleDeviceProfile, success: Boolean, message: String) {
         val newPsk = pendingPskValue ?: return
-        if (pendingPressId != profile.id) return
+        if (maintenanceDeviceId != profile.id) return
         val onSaved = pendingPskOnSaved
         pendingPskValue = null
         pendingPskOnSaved = null
-        pendingPressId = null
-        pressDispatched = false
+        maintenanceDeviceId = null
+        maintenanceDispatched = false
         operationGeneration++
 
         var saved = success
@@ -664,7 +838,7 @@ class MainActivity : FragmentActivity() {
         val runtime = runtimes.getValue(profile.id)
         runtime.message = if (saved) message else "PSK recovery required — both keys retained in Device Settings"
         updateDeviceView(profile.id)
-        setAllActionsEnabled(true)
+        updateAllDeviceViews()
         EventLog.add(this, EventLog.Kind.DIAGNOSTIC, message, deviceId = profile.id, deviceName = profile.displayName)
         if (saved) {
             vibrateSuccess()
@@ -681,30 +855,31 @@ class MainActivity : FragmentActivity() {
             toast("Bluetooth permission is required")
             return
         }
+        if (!requireBluetoothAvailable()) return
         val runtime = runtimes.getValue(profile.id)
         if (runtime.psk.isEmpty()) {
             showDevicePskDialog(profile) { requestCarOta(profile, image) }
             return
         }
-        if (pendingPressId != null) {
+        if (hasPendingOperations) {
             toast("Another BLE action is already running")
             return
         }
 
         operationGeneration++
         val generation = operationGeneration
-        pendingPressId = profile.id
+        maintenanceDeviceId = profile.id
         pendingPskValue = null
         pendingPskOnSaved = null
         pendingOtaImage = image
-        pressDispatched = false
-        setAllActionsEnabled(false)
+        maintenanceDispatched = false
+        updateAllDeviceViews()
         runtime.state = BleCarKeyClient.State.CONNECTING
         runtime.message = "Connecting for firmware update..."
         updateDeviceView(profile.id)
         val client = clients[profile.id]
         if (runtime.ready && client != null) {
-            pressDispatched = true
+            maintenanceDispatched = true
             runtime.message = "Preparing firmware update..."
             updateDeviceView(profile.id)
             EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "${profile.displayName}: OTA dispatched on ready connection", deviceId = profile.id, deviceName = profile.displayName)
@@ -718,7 +893,7 @@ class MainActivity : FragmentActivity() {
         }
 
         mainHandler.postDelayed({
-            if (generation == operationGeneration && pendingOtaImage != null && !pressDispatched) {
+            if (generation == operationGeneration && pendingOtaImage != null && !maintenanceDispatched) {
                 finishOtaOperation(profile, false, "Could not prepare the BLE firmware connection")
             }
         }, 20_000L)
@@ -734,32 +909,40 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun finishOtaOperation(profile: BleDeviceProfile, success: Boolean, message: String) {
-        if (pendingPressId != profile.id || pendingOtaImage == null) return
+        if (maintenanceDeviceId != profile.id || pendingOtaImage == null) return
         pendingOtaImage = null
-        pendingPressId = null
-        pressDispatched = false
+        maintenanceDeviceId = null
+        maintenanceDispatched = false
         operationGeneration++
         val runtime = runtimes.getValue(profile.id)
         runtime.message = message
         updateDeviceView(profile.id)
-        setAllActionsEnabled(true)
+        updateAllDeviceViews()
         EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "ESP firmware update ${if (success) "completed" else "failed"}: $message", deviceId = profile.id, deviceName = profile.displayName)
         if (success) vibrateSuccess() else vibrateFailure()
+        val completedGeneration = operationGeneration
+        val completedFeedback = Any().also { pressFeedback[profile.id] = it }
         mainHandler.postDelayed({
+            if (completedGeneration != operationGeneration || pressFeedback[profile.id] !== completedFeedback) return@postDelayed
             stopClient(profile.id)
-            if (appForeground) mainHandler.postDelayed({ ensureClient(profile) }, 2_000L)
+            if (appForeground) mainHandler.postDelayed({
+                if (completedGeneration == operationGeneration && pressFeedback[profile.id] === completedFeedback) ensureClient(profile)
+            }, 2_000L)
         }, if (success) 300L else 1_500L)
     }
 
     private fun startForegroundClients() {
-        if (!appForeground || !authenticated || !hasPermissions()) return
+        if (!appForeground || !authenticated || initialSetupPending || !hasPermissions() ||
+            BluetoothAvailability.read(this, bluetoothManager) != BluetoothAvailability.AVAILABLE) return
         profiles.forEach { profile ->
-            if (runtimes.getValue(profile.id).psk.isNotEmpty()) ensureClient(profile)
+            val runtime = runtimes.getValue(profile.id)
+            if (runtime.autoConnect && runtime.psk.isNotEmpty()) ensureClient(profile)
         }
     }
 
-    private fun ensureClient(profile: BleDeviceProfile) {
-        if (!appForeground || !authenticated || !hasPermissions() || clients.containsKey(profile.id)) return
+    private fun ensureClient(profile: BleDeviceProfile, forceScan: Boolean = false) {
+        if (!appForeground || !authenticated || !hasPermissions() || clients.containsKey(profile.id) ||
+            BluetoothAvailability.read(this, bluetoothManager) != BluetoothAvailability.AVAILABLE) return
         if (store.get(pskJournalKey(profile)) != null && pendingPskValue == null) return
         val runtime = runtimes.getValue(profile.id)
         if (runtime.psk.isEmpty()) return
@@ -770,14 +953,33 @@ class MainActivity : FragmentActivity() {
         clientGenerations[profile.id] = generation
         val client = BleCarKeyClient(this, bluetoothManager, profile, listenerFor(profile, generation))
         clients[profile.id] = client
-        client.start(runtime.psk, runtime.cachedAddress ?: profile.defaultAddress, runtime.preferCached)
+        client.start(runtime.psk, runtime.cachedAddress ?: profile.defaultAddress, runtime.preferCached && !forceScan)
+    }
+
+    private fun restartDeviceConnection(profile: BleDeviceProfile, rescan: Boolean): Boolean {
+        if (hasPendingOperations || firmwarePickerActive || clients[profile.id]?.canRestartConnection == false) {
+            toast("Finish the current Bluetooth operation before reconnecting")
+            return false
+        }
+        if (!requireBluetoothAvailable()) return false
+        if (runtimes.getValue(profile.id).psk.isEmpty()) { toast("Set this device's PSK first"); return false }
+        if (store.get(pskJournalKey(profile)) != null) { toast("Recover the interrupted PSK change first"); return false }
+        stopClient(profile.id)
+        EventLog.add(this, EventLog.Kind.DIAGNOSTIC, if (rescan) "Manual rescan requested" else "Manual reconnect requested",
+            deviceId = profile.id, deviceName = profile.displayName)
+        // Rescan bypasses the direct-connect shortcut; explicit target addresses
+        // remain pinned so another device using the same service cannot be selected.
+        ensureClient(profile, forceScan = rescan)
+        return clients.containsKey(profile.id)
     }
 
     private fun stopClient(deviceId: String) {
+        PressWidgetProvider.connection(this, deviceId, widgetConnectionOwner, false)
         clientGenerations[deviceId] = (clientGenerations[deviceId] ?: 0) + 1
         clients.remove(deviceId)?.stop(true)
         runtimes[deviceId]?.apply {
             ready = false
+            hasConnected = false
             state = BleCarKeyClient.State.DISCONNECTED
             message = "Idle"
         }
@@ -793,37 +995,38 @@ class MainActivity : FragmentActivity() {
     private fun updateDeviceView(deviceId: String) {
         val runtime = runtimes[deviceId] ?: return
         val views = deviceViews[deviceId] ?: return
+        val connected = runtime.state == BleCarKeyClient.State.CONNECTED
+        val pendingTap = presses[deviceId]?.dispatched == false
         views.statusText.text = when {
+            bluetoothAvailability != BluetoothAvailability.AVAILABLE ->
+                listOfNotNull(bluetoothAvailability.message, runtime.uncertainOutcome).joinToString("\n")
             runtime.uncertainOutcome != null -> runtime.uncertainOutcome
-            runtime.ready && runtime.deviceState != null -> "${runtime.deviceState} • Connected"
+            pendingTap -> "Connecting (up to 10s)…"
+            connected && (maintenanceDeviceId == deviceId || presses[deviceId] != null) -> runtime.message
+            connected && runtime.deviceState != null -> "${runtime.deviceState} • Connected"
             runtime.deviceState != null -> "${runtime.message}\nLast state: ${runtime.deviceState}"
             else -> runtime.message
         }
         views.statusIcon.imageTintList = ColorStateList.valueOf(
             when {
-                runtime.ready -> Color.rgb(38, 196, 104)
-                runtime.state == BleCarKeyClient.State.SCANNING || runtime.state == BleCarKeyClient.State.CONNECTING -> Color.rgb(255, 170, 30)
-                runtime.message == "Command completed" -> Color.rgb(38, 196, 104)
-                runtime.message.contains("failed", true) || runtime.message.contains("timed out", true) -> Color.rgb(219, 68, 75)
-                else -> Color.rgb(132, 136, 153)
+                bluetoothAvailability != BluetoothAvailability.AVAILABLE -> colors.warning
+                connected -> colors.success
+                runtime.state == BleCarKeyClient.State.SCANNING || runtime.state == BleCarKeyClient.State.CONNECTING ||
+                    runtime.state == BleCarKeyClient.State.RETRYING -> colors.warning
+                runtime.message == "Command completed" -> colors.success
+                runtime.message.contains("failed", true) || runtime.message.contains("timed out", true) -> colors.error
+                else -> colors.muted
             },
         )
-        val busy = pendingPressId != null
-        val cancellable = pendingPressId == deviceId && !pressDispatched && pendingPskValue == null && pendingOtaImage == null
+        val busy = maintenanceDeviceId != null || presses[deviceId] != null
+        val cancellable = presses[deviceId]?.dispatched == false
         views.actionButton.text = if (cancellable) "Cancel" else "Press"
-        views.actionButton.isEnabled = !busy || cancellable
-        views.actionButton.alpha = if (busy && !cancellable) 0.5f else 1f
-    }
-
-    private fun setAllActionsEnabled(enabled: Boolean) {
-        deviceViews.values.forEach { views ->
-            views.actionButton.isEnabled = enabled
-            views.actionButton.alpha = if (enabled) 1f else 0.5f
-        }
+        views.actionButton.isEnabled = bluetoothAvailability == BluetoothAvailability.AVAILABLE && (!busy || cancellable)
+        views.actionButton.alpha = if (views.actionButton.isEnabled) 1f else 0.5f
     }
 
     private fun showDeviceSettingsAuthenticated(profile: BleDeviceProfile) {
-        if (pendingPressId != null) {
+        if (hasPendingOperations) {
             toast(if (pendingOtaImage != null) "Finish the firmware update before changing settings" else "Finish the current BLE action first")
             return
         }
@@ -843,18 +1046,19 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun showDeviceHealth(profile: BleDeviceProfile) {
+        if (!requireBluetoothAvailable()) return
         healthDialog?.dismiss()
         val content = text("Connecting for device health…", 15f, false).apply {
             setPadding(dp(24), dp(16), dp(24), dp(16))
             setTextIsSelectable(true)
         }
         val scroll = ScrollView(this).apply { addView(content) }
-        val dialog = AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        val dialog = AppAppearance.dialog(this)
             .setTitle("${profile.displayName} Health")
             .setView(scroll)
             .setPositiveButton("Close", null)
             .setNeutralButton("Refresh", null)
-            .setNegativeButton("Advertising", null)
+            .setNegativeButton("Radio settings", null)
             .create()
         healthDialog = dialog
         healthDeviceId = profile.id
@@ -869,22 +1073,25 @@ class MainActivity : FragmentActivity() {
         val refresh = dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
         val tune = dialog.getButton(AlertDialog.BUTTON_NEGATIVE).apply { isEnabled = false }
         var currentRadio: RadioSettings? = null
+        var connectionsStayHigh = false
         var expectedRadio: RadioSettings? = null
         fun showResult(token: Int, snapshot: DeviceHealth?, error: String?) {
             if (!dialog.isShowing || !healthRequest.complete(token)) return
+            if (snapshot != null) lastDeviceHealth[profile.id] = TimedDeviceHealth(snapshot, android.os.SystemClock.elapsedRealtime())
             content.text = snapshot?.display() ?: error ?: "Health data unavailable"
             if (snapshot != null && expectedRadio != null && snapshot.radio != expectedRadio) {
                 content.text = "The ESP reports different advertising settings. Review the current values below.\n\n${content.text}"
             }
             expectedRadio = null
             currentRadio = snapshot?.radio
+            connectionsStayHigh = snapshot?.connectionPowerHeldHigh == true
             tune.isEnabled = currentRadio != null && snapshot?.otaState != "pending"
             refresh.isEnabled = true
             if (snapshot != null) EventLog.add(this, EventLog.Kind.DIAGNOSTIC,
                 "Device health snapshot: ${snapshot.display()}", deviceId = profile.id, deviceName = profile.displayName)
         }
         healthFetch = {
-            if (appForeground && dialog.isShowing && runtimes[profile.id]?.ready == true && pendingPressId == null) {
+            if (appForeground && dialog.isShowing && runtimes[profile.id]?.ready == true && !hasPendingOperations) {
                 val token = healthRequest.takeWhenReady()
                 if (token != null) {
                     val client = clients[profile.id]
@@ -911,7 +1118,7 @@ class MainActivity : FragmentActivity() {
         refresh.setOnClickListener { request() }
         tune.setOnClickListener {
             currentRadio?.let { settings ->
-                showRadioSettings(profile, settings) { saved ->
+                showRadioSettings(profile, settings, connectionsStayHigh) { saved ->
                     expectedRadio = saved
                     request() // Read back only in response to the explicit Save action.
                 }
@@ -920,7 +1127,7 @@ class MainActivity : FragmentActivity() {
         request() // The only automatic fetch: opening this dialog explicitly requests it.
     }
 
-    private fun showRadioSettings(profile: BleDeviceProfile, current: RadioSettings, onSaved: (RadioSettings) -> Unit) {
+    private fun showRadioSettings(profile: BleDeviceProfile, current: RadioSettings, connectionsStayHigh: Boolean, onSaved: (RadioSettings) -> Unit) {
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24), dp(12), dp(24), dp(12))
@@ -929,7 +1136,7 @@ class MainActivity : FragmentActivity() {
             layout.addView(sectionLabel(label))
             return EditText(this).apply {
                 setText(initial)
-                setTextColor(Color.WHITE)
+                setTextColor(colors.text)
                 inputType = InputType.TYPE_CLASS_TEXT
                 keyListener = android.text.method.DigitsKeyListener.getInstance("0123456789.-")
                 layout.addView(this, LinearLayout.LayoutParams(-1, -2))
@@ -938,6 +1145,29 @@ class MainActivity : FragmentActivity() {
         val recent = input("Recent activity interval (ms)", current.recentText())
         val inactive = input("Inactive interval (ms)", current.inactiveText())
         val seconds = input("Inactivity before slowing (seconds)", current.idleSeconds.toString())
+        fun powerInput(label: String, initial: Int): Spinner {
+            layout.addView(sectionLabel(label))
+            return Spinner(this).apply {
+                adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+                    RadioSettings.TX_POWER_LEVELS.map { if (it == 3) "+3 dBm (default)" else "${if (it > 0) "+" else ""}$it dBm" })
+                setSelection(RadioSettings.TX_POWER_LEVELS.indexOf(initial))
+                layout.addView(this, LinearLayout.LayoutParams(-1, -2))
+            }
+        }
+        val power = current.txPowerDbm?.let {
+            powerInput(if (current.idleTxPowerDbm == null) "ESP transmit power (dBm)" else if (connectionsStayHigh) "Connected / recent advertising power (dBm)" else "Recent-activity transmit power (dBm)", it)
+        }
+        val idlePower = current.idleTxPowerDbm?.let { powerInput(if (connectionsStayHigh) "Inactive advertising power (dBm)" else "Inactive transmit power (dBm)", it) }
+        layout.addView(text(when {
+            power == null -> "Transmit power control requires standalone ESP firmware v2.8.8 or later."
+            idlePower == null -> "This firmware uses one fixed power level. Update to v2.8.10 for connected/recent and inactive advertising power."
+            !connectionsStayHigh -> "Update the standalone ESP firmware to v2.8.10 to keep connected links at high power. This older firmware also lowers connection power after inactivity."
+            else -> "Connected phone/watch links always use the high power level. Only advertising power follows the inactivity timer above. Boot, connections, disconnections and authenticated commands restart the recent-activity window. " +
+                "Initial discovery uses inactive power: the ESP cannot detect a phone or watch passively scanning. " +
+                "Health refreshes do not extend the window. OTA transfers hold recent-activity power."
+        } + "\n\nHigher power can improve ESP-to-phone/watch range and uses more energy while transmitting. " +
+            "Lowering the high power level may disconnect a distant phone or watch. Inactive advertising power affects discovery range. " +
+            "Inactive power must not exceed recent-activity power. Choose the same value for both to keep fixed power.", 13f, false))
         layout.addView(text("Use an interval (100) or range (50-100). Higher intervals advertise less often and can delay discovery. " +
             "Intervals: 20-2000 ms, in multiples of 0.625 ms; multiples of 5 ms are easiest. Inactivity: 5-3600 seconds. " +
             "Inactive intervals must be at least as long as recent-activity intervals.\n\n" +
@@ -945,8 +1175,8 @@ class MainActivity : FragmentActivity() {
             "Reading device health does not restart that window. Existing connections keep their connection timing.", 13f, false))
         val status = text("", 14f, false).apply { setPadding(0, dp(12), 0, 0) }
         layout.addView(status)
-        val dialog = AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
-            .setTitle("${profile.displayName} Advertising")
+        val dialog = AppAppearance.dialog(this)
+            .setTitle("${profile.displayName} Radio settings")
             .setView(ScrollView(this).apply { addView(layout) })
             .setNegativeButton("Cancel", null)
             .setNeutralButton("Restore defaults", null)
@@ -962,19 +1192,26 @@ class MainActivity : FragmentActivity() {
             recent.setText(RadioSettings.DEFAULT.recentText())
             inactive.setText(RadioSettings.DEFAULT.inactiveText())
             seconds.setText(RadioSettings.DEFAULT.idleSeconds.toString())
+            power?.setSelection(RadioSettings.TX_POWER_LEVELS.indexOf(3))
+            idlePower?.setSelection(RadioSettings.TX_POWER_LEVELS.indexOf(3))
             status.text = "Defaults selected. Tap Save to ESP to apply."
         }
         save.setOnClickListener {
-            val requested = try { RadioSettings.fromInput(recent.text.toString(), inactive.text.toString(), seconds.text.toString()) }
+            val requested = try {
+                RadioSettings.fromInput(recent.text.toString(), inactive.text.toString(), seconds.text.toString())
+                    .copy(txPowerDbm = power?.let { RadioSettings.TX_POWER_LEVELS[it.selectedItemPosition] },
+                        idleTxPowerDbm = idlePower?.let { RadioSettings.TX_POWER_LEVELS[it.selectedItemPosition] })
+                    .also { require(it.valid()) { "Inactive power must not exceed recent-activity power." } }
+            }
             catch (e: IllegalArgumentException) { status.text = e.message; return@setOnClickListener }
             val client = clients[profile.id]
             if (client == null) { status.text = "Device disconnected. Close this view and reconnect first."; return@setOnClickListener }
             save.isEnabled = false; defaults.isEnabled = false; cancel.isEnabled = false
-            recent.isEnabled = false; inactive.isEnabled = false; seconds.isEnabled = false
+            recent.isEnabled = false; inactive.isEnabled = false; seconds.isEnabled = false; power?.isEnabled = false; idlePower?.isEnabled = false
             dialog.setCancelable(false)
             status.text = "Saving to ESP…"
             client.updateRadioSettings(requested) { success, message ->
-                EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Advertising settings: $message", deviceId = profile.id, deviceName = profile.displayName)
+                EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Radio settings: $message", deviceId = profile.id, deviceName = profile.displayName)
                 if (dialog.isShowing) {
                     if (success) {
                         dialog.dismiss()
@@ -983,7 +1220,7 @@ class MainActivity : FragmentActivity() {
                     } else {
                         status.text = message
                         save.isEnabled = true; defaults.isEnabled = true; cancel.isEnabled = true
-                        recent.isEnabled = true; inactive.isEnabled = true; seconds.isEnabled = true
+                        recent.isEnabled = true; inactive.isEnabled = true; seconds.isEnabled = true; power?.isEnabled = true; idlePower?.isEnabled = true
                         dialog.setCancelable(true)
                     }
                 }
@@ -998,35 +1235,56 @@ class MainActivity : FragmentActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24), dp(8), dp(24), dp(12))
         }
+        var settingsHealthPending = false
+        var settingsHealthStarted = false
+        val firmwarePanel = FirmwareUpdatePanel(this, profile, {
+            lastDeviceHealth[profile.id]?.takeIf { runtime.ready && android.os.SystemClock.elapsedRealtime() - it.capturedAt <= 60_000 }?.health
+        }, { image ->
+            if (!appForeground || !authenticated || profiles.firstOrNull { it.id == profile.id } != profile) {
+                toast("Reopen this device's settings before updating firmware")
+            } else authenticate("Authenticate to update ${profile.displayName}") { ok ->
+                if (ok && appForeground && profiles.firstOrNull { it.id == profile.id } == profile) {
+                    settingsDialog.dismiss()
+                    requestCarOta(profile, image)
+                }
+            }
+        })
+        firmwarePanels.add(firmwarePanel)
         val name = EditText(this).apply {
             hint = "Device name"
             setText(profile.displayName)
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
+            setTextColor(colors.text)
+            setHintTextColor(colors.muted)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
         }
         val configuredAddress = EditText(this).apply {
             hint = "BLE address (optional)"
             setText(profile.defaultAddress ?: runtime.cachedAddress.orEmpty())
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
+            setTextColor(colors.text)
+            setHintTextColor(colors.muted)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
         }
         val cachedSwitch = Switch(this).apply {
             text = "Use cached device address"
-            setTextColor(Color.WHITE)
+            setTextColor(colors.text)
             isChecked = runtime.preferCached
             isEnabled = runtime.cachedAddress != null || profile.defaultAddress != null
             setPadding(0, dp(6), 0, dp(6))
         }
+        val autoConnectSwitch = Switch(this).apply {
+            text = "Connect automatically when the app opens"
+            setTextColor(colors.text)
+            isChecked = runtime.autoConnect
+            setPadding(0, dp(6), 0, dp(6))
+        }
         val locationSwitch = Switch(this).apply {
             text = "Record location when this device is triggered"
-            setTextColor(Color.WHITE)
+            setTextColor(colors.text)
             isChecked = runtime.recordLocation
             setPadding(0, dp(6), 0, dp(6))
         }
         val address = text("Address: ${runtime.cachedAddress ?: profile.defaultAddress ?: "Not learned yet"}", 12f, false).apply {
-            setTextColor(Color.rgb(184, 186, 198))
+            setTextColor(colors.secondary)
             setPadding(0, dp(2), 0, dp(8))
         }
         layout.addView(sectionLabel("Device"))
@@ -1036,7 +1294,7 @@ class MainActivity : FragmentActivity() {
         if (store.get(pskJournalKey(profile)) != null) {
             layout.addView(primaryButton("Recover interrupted PSK change") {
                 recoverPskChange(profile)
-            }, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dp(8) })
+            }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         }
         val pskActionLabel = when {
             runtime.psk.isEmpty() -> "Set PSK on app"
@@ -1045,28 +1303,37 @@ class MainActivity : FragmentActivity() {
         }
         layout.addView(primaryButton(pskActionLabel) {
             showPskEditor(profile, recovery = false, onSaved)
-        }, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dp(8) })
+        }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         if (runtime.psk.isNotEmpty() && profile.supportsRemotePskUpdate) {
             layout.addView(primaryButton("Change PSK saved on app") {
                 authenticate("Authenticate for PSK recovery") { ok ->
                     if (ok) showPskEditor(profile, recovery = true, onSaved)
                 }
-            }, LinearLayout.LayoutParams(-1, dp(48)).apply { bottomMargin = dp(8) })
+            }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
             layout.addView(text(
                 "The ESP-and-app change requires the existing PSK. The app-only option replaces this phone's saved copy and does not change the ESP.",
                 12f,
                 false,
-            ).apply { setTextColor(Color.rgb(184, 186, 198)) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+            ).apply { setTextColor(colors.secondary) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
         } else if (!profile.supportsRemotePskUpdate) {
             layout.addView(text(
                 "PSK changes here affect only this app. Update the matching ESPHome secret and firmware separately.",
                 12f,
                 false,
-            ).apply { setTextColor(Color.rgb(184, 186, 198)) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+            ).apply { setTextColor(colors.secondary) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
         }
         layout.addView(sectionLabel("Connection"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        layout.addView(autoConnectSwitch, LinearLayout.LayoutParams(-1, -2))
         layout.addView(cachedSwitch, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(4) })
         layout.addView(address, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+        layout.addView(text("Press and Device health can still connect when automatic connection is off. Reconnect and Rescan use the saved connection settings; save any edits first.", 12f, false),
+            LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+        layout.addView(primaryButton("Reconnect") {
+            if (restartDeviceConnection(profile, false)) settingsDialog.dismiss()
+        }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+        layout.addView(primaryButton("Rescan for this device") {
+            if (restartDeviceConnection(profile, true)) settingsDialog.dismiss()
+        }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         layout.addView(sectionLabel("History"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
         layout.addView(locationSwitch, LinearLayout.LayoutParams(-1, -2))
         layout.addView(text(
@@ -1074,14 +1341,16 @@ class MainActivity : FragmentActivity() {
             12f,
             false,
         ).apply {
-            setTextColor(Color.rgb(184, 186, 198))
+            setTextColor(colors.secondary)
         }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+        layout.addView(sectionLabel("Device health"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+        layout.addView(primaryButton("Device health and BLE signal") {
+            settingsDialog.dismiss()
+            showDeviceHealth(profile)
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+        layout.addView(sectionLabel("Firmware updates"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+        layout.addView(firmwarePanel, LinearLayout.LayoutParams(-1, -2))
         if (profile.supportsBleOta) {
-            layout.addView(sectionLabel("Firmware"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
-            layout.addView(primaryButton("Device health and firmware version") {
-                settingsDialog.dismiss()
-                showDeviceHealth(profile)
-            }, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(4) })
             layout.addView(primaryButton("Update ESP firmware (.bin)") {
                 pendingFirmwareProfileId = profile.id
                 firmwarePickerActive = true
@@ -1090,28 +1359,33 @@ class MainActivity : FragmentActivity() {
                 // firmware preparation or an active transfer.
                 settingsDialog.dismiss()
                 firmwareFileLauncher.launch(arrayOf("application/octet-stream", "*/*"))
-            }, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(4) })
+            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
         }
         layout.addView(primaryButton("Remove device") {
-            AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+            AppAppearance.dialog(this)
                 .setTitle("Remove ${profile.displayName}?")
                 .setMessage("This removes its card, saved PSK, address, and per-device settings from this phone. It does not change the ESP.")
                 .setNegativeButton("Cancel", null)
                 .setPositiveButton("Remove") { _, _ -> removeDevice(profile) }
                 .show()
-        }, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(20) })
+        }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(20) })
         val scroll = ScrollView(this).apply {
             isFillViewport = true
             addView(layout, FrameLayout.LayoutParams(-1, -2))
         }
 
-        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        AppAppearance.dialog(this)
             .setTitle("${profile.displayName} Settings")
             .setView(scroll)
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Save", null)
             .create().also { dialog ->
                 settingsDialog = dialog
+                dialog.setOnDismissListener {
+                    firmwarePanel.close(); firmwarePanels.remove(firmwarePanel)
+                    firmwareHealthFetch = null
+                    if (settingsHealthPending) clients[profile.id]?.cancelDeviceHealth()
+                }
                 dialog.setOnShowListener {
                     dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                         val newName = name.text.toString().trim()
@@ -1124,6 +1398,8 @@ class MainActivity : FragmentActivity() {
                             else -> {
                                 runtime.preferCached = cachedSwitch.isChecked
                                 store.put(profile.preferCachedStoreKey, runtime.preferCached.toString())
+                                runtime.autoConnect = autoConnectSwitch.isChecked
+                                store.put(profile.autoConnectStoreKey, runtime.autoConnect.toString())
                                 val requestLocationPermission = locationSwitch.isChecked && !hasLocationPermission()
                                 runtime.recordLocation = locationSwitch.isChecked && !requestLocationPermission
                                 store.put(profile.recordLocationStoreKey, runtime.recordLocation.toString())
@@ -1144,6 +1420,20 @@ class MainActivity : FragmentActivity() {
                     }
                 }
                 dialog.show()
+                firmwarePanel.start()
+                firmwareHealthFetch = {
+                    if (dialog.isShowing && appForeground && runtime.ready && !hasPendingOperations && !settingsHealthStarted) {
+                        settingsHealthStarted = true; settingsHealthPending = true
+                        clients[profile.id]?.requestDeviceHealth { snapshot, _ ->
+                            settingsHealthPending = false
+                            if (dialog.isShowing && snapshot != null) {
+                                lastDeviceHealth[profile.id] = TimedDeviceHealth(snapshot, android.os.SystemClock.elapsedRealtime())
+                                firmwarePanel.refreshInstalled()
+                            }
+                        }
+                    }
+                }
+                firmwareHealthFetch?.invoke()
             }
     }
 
@@ -1151,6 +1441,7 @@ class MainActivity : FragmentActivity() {
         val runtime = runtimes.getValue(profile.id)
         val appOnly = !profile.supportsRemotePskUpdate
         val initialSetup = runtime.psk.isEmpty()
+        val createsDeviceKey = !appOnly && !recovery && !initialSetup
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(24), dp(8), dp(24), dp(12))
@@ -1164,7 +1455,9 @@ class MainActivity : FragmentActivity() {
             runtime.psk.isEmpty() -> "Enter the PSK already installed on this device."
             profile.supportsRemotePskUpdate -> "The existing PSK is verified locally, then the authenticated car and this phone are updated together."
             else -> "First update ESPHome, then enter the existing and new PSKs here to update this phone's matching copy."
-        }, 13f, false).apply { setTextColor(Color.rgb(184, 186, 198)) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+        }, 13f, false).apply { setTextColor(colors.secondary) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+        if (createsDeviceKey) layout.addView(text(PskKeyPolicy.NEW_KEY_GUIDANCE, 13f, false),
+            LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
         current?.let { layout.addView(it, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) }) }
         layout.addView(next, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         confirm?.let { layout.addView(it, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) }) }
@@ -1173,9 +1466,9 @@ class MainActivity : FragmentActivity() {
             next.setText(generated)
             confirm?.setText(generated)
             showGeneratedPsk(generated)
-        }, LinearLayout.LayoutParams(-1, dp(48)))
+        }, LinearLayout.LayoutParams(-1, -2))
 
-        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        AppAppearance.dialog(this)
             .setTitle(when {
                 appOnly -> "PSK saved on app"
                 recovery -> "PSK saved on app"
@@ -1191,6 +1484,7 @@ class MainActivity : FragmentActivity() {
                         when {
                             current != null && current.text.toString().trim() != runtime.psk -> current.error = "Existing PSK is incorrect"
                             !PskUpdateProtocol.validKey(value) -> next.error = "Use 1–128 UTF-8 bytes without NUL characters"
+                            createsDeviceKey && !PskUpdateProtocol.validNewKey(value) -> next.error = PskKeyPolicy.NEW_KEY_GUIDANCE
                             confirm != null && value != confirm.text.toString().trim() -> confirm.error = "PSKs do not match"
                             else -> {
                                 dialog.dismiss()
@@ -1213,7 +1507,7 @@ class MainActivity : FragmentActivity() {
         authenticate("Authenticate to add a BLE device") { ok ->
             if (!ok) return@authenticate
             val labels = arrayOf("ESPHome device", "Standalone device")
-            AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+            AppAppearance.dialog(this)
                 .setTitle("Add device")
                 .setItems(labels) { _, which ->
                     showAddDeviceDetails(if (which == 0) BleDeviceType.ESPHOME_ACCESS else BleDeviceType.CAR)
@@ -1230,25 +1524,25 @@ class MainActivity : FragmentActivity() {
         val name = EditText(this).apply {
             hint = "Name"
             setText(if (type == BleDeviceType.CAR) "Car" else "Access Device")
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
+            setTextColor(colors.text)
+            setHintTextColor(colors.muted)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
         }
         val address = EditText(this).apply {
             hint = "BLE address (optional)"
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
+            setTextColor(colors.text)
+            setHintTextColor(colors.muted)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
         }
         layout.addView(text(
             "The name is your own label and does not need to match the ESP's Bluetooth name. The BLE address uniquely identifies the physical ESP. It is optional for the first device of this type, but required when two devices use the same firmware profile.",
             13f,
             false,
-        ).apply { setTextColor(Color.rgb(184, 186, 198)) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+        ).apply { setTextColor(colors.secondary) }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
         layout.addView(name, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         layout.addView(address)
 
-        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        AppAppearance.dialog(this)
             .setTitle(if (type == BleDeviceType.CAR) "Add standalone device" else "Add ESPHome device")
             .setView(layout)
             .setNegativeButton("Cancel", null)
@@ -1301,6 +1595,7 @@ class MainActivity : FragmentActivity() {
         val index = profiles.indexOfFirst { it.id == profile.id }
         if (index < 0) return
         val updated = profile.copy(displayName = name, defaultAddress = address)
+        if (profile.defaultAddress != address) lastDeviceHealth.remove(profile.id)
         profiles[index] = updated
         runtimes.getValue(profile.id).apply {
             if (address != null) {
@@ -1319,10 +1614,12 @@ class MainActivity : FragmentActivity() {
         stopClient(profile.id)
         profiles.removeAll { it.id == profile.id }
         runtimes.remove(profile.id)
+        lastDeviceHealth.remove(profile.id)
         listOf(
             profile.pskStoreKey,
             profile.addressStoreKey,
             profile.preferCachedStoreKey,
+            profile.autoConnectStoreKey,
             profile.recordLocationStoreKey,
         ).forEach(store::remove)
         profileRepository.save(profiles)
@@ -1330,6 +1627,7 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun rebuildUi() {
+        PressWidgetProvider.refreshAll(this)
         stopAllClients()
         setContentView(buildUi())
         authOverlay.visibility = if (authenticated) View.GONE else View.VISIBLE
@@ -1337,7 +1635,7 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun showAppSettings() {
-        if (pendingPressId != null) {
+        if (hasPendingOperations) {
             toast(if (pendingOtaImage != null) "Finish the firmware update before changing settings" else "Finish the current BLE action first")
             return
         }
@@ -1347,32 +1645,67 @@ class MainActivity : FragmentActivity() {
         }
         val authSwitch = Switch(this).apply {
             text = "Require device authentication"
-            setTextColor(Color.WHITE)
+            setTextColor(colors.text)
             isChecked = requireAuthentication
             setPadding(0, dp(8), 0, dp(8))
         }
+        var selectedDuration = BackgroundConnectionDuration.fromSaved(store.get(BackgroundConnectionDuration.STORE_KEY))
         lateinit var settingsDialog: AlertDialog
         val persistSettings = {
             requireAuthentication = authSwitch.isChecked
             store.put("require_auth", requireAuthentication.toString())
+            store.put(BackgroundConnectionDuration.STORE_KEY, selectedDuration.name)
         }
         options.addView(authSwitch)
+        options.addView(sectionLabel("Appearance"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+        options.addView(primaryButton("Theme and accent colour") {
+            persistSettings()
+            settingsDialog.dismiss()
+            showAppearanceSettings()
+        }, LinearLayout.LayoutParams(-1, -2))
+        options.addView(sectionLabel("Connection"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+        lateinit var durationButton: Button
+        durationButton = primaryButton("Background connections: ${selectedDuration.label}") {
+            val choices = BackgroundConnectionDuration.entries
+            AppAppearance.dialog(this)
+                .setTitle("Background connection duration")
+                .setSingleChoiceItems(choices.map { it.label }.toTypedArray(), choices.indexOf(selectedDuration)) { dialog, index ->
+                    selectedDuration = choices[index]
+                    durationButton.text = "Background connections: ${selectedDuration.label}"
+                    dialog.dismiss()
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
+        options.addView(durationButton, LinearLayout.LayoutParams(-1, -2))
+        options.addView(text("Applies after leaving the app and after each confirmed widget press. Shorter durations reduce background Bluetooth use. An operation already in progress is allowed to finish.", 12f, false),
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
         options.addView(sectionLabel("Devices"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
         options.addView(primaryButton("Add device") {
             persistSettings()
             settingsDialog.dismiss()
             showAddDevice()
-        }, LinearLayout.LayoutParams(-1, dp(48)))
+        }, LinearLayout.LayoutParams(-1, -2))
         options.addView(sectionLabel("Privacy and support"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
-        options.addView(primaryButton("Connection notifications") { showConnectionNotifications() }, LinearLayout.LayoutParams(-1, dp(48)))
-        options.addView(primaryButton("Privacy policy") { showPrivacyPolicy() }, LinearLayout.LayoutParams(-1, dp(48)))
+        options.addView(primaryButton("Connection notifications") { showConnectionNotifications() }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+        options.addView(primaryButton("Privacy policy") { showPrivacyPolicy() }, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
         options.addView(primaryButton("Contact support") {
             runCatching {
                 startActivity(Intent(Intent.ACTION_SENDTO, "mailto:info@6675162.xyz".toUri())
                     .putExtra(Intent.EXTRA_SUBJECT, "Remote Key support"))
             }.onFailure { toast("Email info@6675162.xyz for support") }
-        }, LinearLayout.LayoutParams(-1, dp(48)))
-        settingsDialog = AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        }, LinearLayout.LayoutParams(-1, -2))
+        options.addView(primaryButton("Copy support summary") { copySupportSummary() },
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+        options.addView(text("Includes versions, Bluetooth state and the last Device health signal readings, labelled with their age. No keys, device names, addresses, locations or logs.", 12f, false),
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
+        options.addView(sectionLabel("About"), LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
+        options.addView(text("App version: ${BuildConfig.VERSION_NAME} (build ${BuildConfig.VERSION_CODE})", 14f, false).apply {
+            setTextIsSelectable(true)
+            setTextColor(colors.secondary)
+            setPadding(0, dp(4), 0, dp(16))
+        }, LinearLayout.LayoutParams(-1, -2))
+        settingsDialog = AppAppearance.dialog(this)
             .setTitle("Remote Key Settings")
             .setView(ScrollView(this).apply { addView(options) })
             .setPositiveButton("Done") { _, _ ->
@@ -1382,16 +1715,30 @@ class MainActivity : FragmentActivity() {
         settingsDialog.show()
     }
 
+    private fun showAppearanceSettings() {
+        val initial = AppAppearance.read(this)
+        val picker = AppearanceSettingsView(this, initial)
+        AppAppearance.dialog(this).setTitle("Appearance")
+            .setView(ScrollView(this).apply { addView(picker) })
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Apply") { _, _ ->
+                if (picker.selection != initial) {
+                    AppAppearance.save(this, picker.selection)
+                    recreate()
+                }
+            }.show()
+    }
+
     private fun showPrivacyPolicy() {
         val policy = resources.openRawResource(R.raw.privacy_policy).bufferedReader().use { it.readText() }
         val content = text("", 15f, false).apply {
             text = HtmlCompat.fromHtml(policy, HtmlCompat.FROM_HTML_MODE_LEGACY)
             setTextIsSelectable(true)
             movementMethod = LinkMovementMethod.getInstance()
-            setLinkTextColor(Color.rgb(160, 190, 255))
+            setLinkTextColor(colors.accent)
             setPadding(dp(20), dp(12), dp(20), dp(12))
         }
-        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        AppAppearance.dialog(this)
             .setTitle("Privacy policy")
             .setView(ScrollView(this).apply { addView(content) })
             .setPositiveButton("Done", null)
@@ -1399,9 +1746,9 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun showConnectionNotifications() {
-        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        AppAppearance.dialog(this)
             .setTitle("Connection notifications")
-            .setMessage("Remote Key keeps existing Bluetooth connections ready for up to two minutes after you leave the app, or while a firmware update finishes. Allow notifications to see when this is happening. Notifications are optional and never contain ads.")
+            .setMessage("Remote Key can keep Bluetooth connections ready after you leave the app for the duration chosen in App Settings, or while an operation finishes. Allow notifications to see when this is happening. Notifications are optional and never contain ads.")
             .setPositiveButton("Enable / manage") { _, _ ->
                 if (Build.VERSION.SDK_INT >= 33 &&
                     ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
@@ -1421,13 +1768,26 @@ class MainActivity : FragmentActivity() {
             .show()
     }
 
+    private fun copySupportSummary() {
+        val bluetooth = BluetoothAvailability.read(this, bluetoothManager)
+        val summary = SupportSummary.format(BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE, Build.VERSION.SDK_INT,
+            bluetooth.message ?: "On", BackgroundConnectionDuration.fromSaved(store.get(BackgroundConnectionDuration.STORE_KEY)),
+            profiles.map { profile ->
+                val runtime = runtimes.getValue(profile.id)
+                SupportDeviceInfo(if (profile.type == BleDeviceType.CAR) "Standalone" else "ESPHome",
+                    runtime.state.name, runtime.ready, runtime.autoConnect, lastDeviceHealth[profile.id])
+            }, android.os.SystemClock.elapsedRealtime())
+        getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Remote Key support summary", summary))
+        toast("Support summary copied")
+    }
+
     private fun showGeneratedPsk(generated: String) {
         val value = text(generated, 17f, true).apply {
             typeface = Typeface.MONOSPACE
             gravity = Gravity.CENTER
             setPadding(dp(16), dp(18), dp(16), dp(18))
         }
-        AlertDialog.Builder(this, R.style.Theme_CarKey_Dialog)
+        AppAppearance.dialog(this)
             .setTitle("Save this PSK now")
             .setMessage("This is the only time Remote Key will display or offer to copy this generated PSK. It remains masked after this dialog closes. Return to the PSK dialog and tap Save to apply it.")
             .setView(value)
@@ -1457,6 +1817,7 @@ class MainActivity : FragmentActivity() {
     private fun pskJournalKey(profile: BleDeviceProfile) = "${profile.pskStoreKey}_pending_change"
 
     private fun recoverPskChange(profile: BleDeviceProfile) {
+        if (!requireBluetoothAvailable()) return
         authenticate("Authenticate to recover the device key") { ok ->
             if (!ok) return@authenticate
             val journal = runCatching { org.json.JSONObject(store.get(pskJournalKey(profile)) ?: return@authenticate) }.getOrNull()
@@ -1546,36 +1907,48 @@ class MainActivity : FragmentActivity() {
             ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
 
     @android.annotation.SuppressLint("MissingPermission")
-    private fun captureOperationLocation(profile: BleDeviceProfile) {
+    private fun captureOperationLocation(profile: BleDeviceProfile, locationSession: String) {
         if (!runtimes.getValue(profile.id).recordLocation || !hasLocationPermission()) return
         val operationTime = System.currentTimeMillis()
-        val manager = getSystemService(LocationManager::class.java)
-        val provider = when {
-            manager.isProviderEnabled(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER
-            manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER
-            else -> {
-                EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Location not recorded: location services are disabled", deviceId = profile.id, deviceName = profile.displayName)
-                return
-            }
-        }
-        val save: (Location) -> Unit = { location ->
-            EventLog.addLocation(this, location.latitude, location.longitude, location.accuracy, operationSession, operationTime, profile.id, profile.displayName)
-            EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Saved operation location with +/-${location.accuracy.toInt()} m accuracy", deviceId = profile.id, deviceName = profile.displayName)
-        }
-        if (Build.VERSION.SDK_INT >= 30) {
-            manager.getCurrentLocation(provider, CancellationSignal(), mainExecutor, save)
-        } else {
-            val listener = object : LocationListener {
-                override fun onLocationChanged(location: Location) {
-                    manager.removeUpdates(this)
-                    save(location)
+        try {
+            val manager = getSystemService(LocationManager::class.java)
+            val provider = when {
+                manager.isProviderEnabled(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER
+                manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER
+                else -> {
+                    EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Location not recorded: location services are disabled", deviceId = profile.id, deviceName = profile.displayName)
+                    return
                 }
-                override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) = Unit
-                override fun onProviderEnabled(provider: String) = Unit
-                override fun onProviderDisabled(provider: String) = Unit
             }
-            @Suppress("DEPRECATION")
-            manager.requestSingleUpdate(provider, listener, Looper.getMainLooper())
+            val save: (Location?) -> Unit = { location ->
+                if (location == null) {
+                    EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Location not recorded: no current fix available", deviceId = profile.id, deviceName = profile.displayName)
+                } else {
+                    EventLog.addLocation(this, location.latitude, location.longitude, location.accuracy, locationSession, operationTime, profile.id, profile.displayName)
+                    EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Saved operation location with +/-${location.accuracy.toInt()} m accuracy", deviceId = profile.id, deviceName = profile.displayName)
+                }
+            }
+            if (Build.VERSION.SDK_INT >= 30) {
+                manager.getCurrentLocation(provider, CancellationSignal(), mainExecutor, save)
+            } else {
+                val listener = object : LocationListener {
+                    override fun onLocationChanged(location: Location) {
+                        manager.removeUpdates(this)
+                        save(location)
+                    }
+                    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) = Unit
+                    override fun onProviderEnabled(provider: String) = Unit
+                    override fun onProviderDisabled(provider: String) = Unit
+                }
+                @Suppress("DEPRECATION")
+                manager.requestSingleUpdate(provider, listener, Looper.getMainLooper())
+            }
+        } catch (_: SecurityException) {
+            // Android can revoke while-in-use location access after Home/Recents.
+            // Optional location must not interrupt an already successful press.
+            EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Location not recorded: Android denied location access", deviceId = profile.id, deviceName = profile.displayName)
+        } catch (_: IllegalArgumentException) {
+            EventLog.add(this, EventLog.Kind.DIAGNOSTIC, "Location not recorded: provider unavailable", deviceId = profile.id, deviceName = profile.displayName)
         }
     }
 
@@ -1603,21 +1976,21 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun sectionLabel(value: String) = text(value, 14f, true).apply {
-        setTextColor(Color.rgb(184, 186, 198))
+        setTextColor(colors.secondary)
         setPadding(0, dp(6), 0, dp(8))
     }
 
     private fun pskInput(hintText: String) = EditText(this).apply {
         hint = hintText
         inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-        setTextColor(Color.WHITE)
-        setHintTextColor(Color.GRAY)
+        setTextColor(colors.text)
+        setHintTextColor(colors.muted)
     }
 
     private fun text(value: String, size: Float, bold: Boolean) = TextView(this).apply {
         text = value
         textSize = size
-        setTextColor(Color.WHITE)
+        setTextColor(colors.text)
         gravity = Gravity.CENTER_VERTICAL
         if (bold) setTypeface(typeface, Typeface.BOLD)
     }
@@ -1626,9 +1999,10 @@ class MainActivity : FragmentActivity() {
         text = label
         isAllCaps = false
         textSize = 14f
-        setTextColor(Color.WHITE)
-        background = rounded(Color.rgb(64, 103, 172), 22f)
-        setPadding(dp(10), 0, dp(10), 0)
+        minimumHeight = dp(48)
+        setTextColor(colors.onAccent)
+        background = rounded(colors.accent, 22f)
+        setPadding(dp(12), dp(10), dp(12), dp(10))
         setOnClickListener { action() }
     }
 
@@ -1636,7 +2010,7 @@ class MainActivity : FragmentActivity() {
         setImageResource(icon)
         contentDescription = description
         setPadding(dp(12), dp(12), dp(12), dp(12))
-        imageTintList = ColorStateList.valueOf(Color.WHITE)
+        imageTintList = ColorStateList.valueOf(colors.text)
         background = selectableBorderlessBackground()
         setOnClickListener { action() }
     }

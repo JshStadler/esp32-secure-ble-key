@@ -9,8 +9,9 @@ import androidx.core.content.ContextCompat
 
 /** Keeps the process eligible for BLE while the short background lease is active. */
 class BackgroundConnectionService : Service() {
-    internal class Lease(val busy: () -> Boolean, val disconnect: () -> Unit) {
-        val period = BackgroundGracePeriod(SystemClock.elapsedRealtime())
+    internal class Lease(val duration: BackgroundConnectionDuration,
+        val busy: () -> Boolean, val disconnect: () -> Unit) {
+        val period = BackgroundGracePeriod(SystemClock.elapsedRealtime(), duration.milliseconds)
         fun check() = period.expired(SystemClock.elapsedRealtime(), busy())
     }
     companion object {
@@ -56,8 +57,9 @@ class BackgroundConnectionService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val notification = NotificationCompat.Builder(this, channel)
             .setSmallIcon(R.drawable.ic_key_notification)
-            .setContentTitle("Remote Key connected")
-            .setContentText(if (lease?.busy() == true) "Firmware update in progress" else "Keeping connections ready for 2 minutes")
+            .setContentTitle("Remote Key Bluetooth")
+            .setContentText(if (lease?.duration == BackgroundConnectionDuration.OFF) "Finishing a Bluetooth operation" else
+                "Background connection window: ${lease?.duration?.label ?: "a short time"}")
             .setContentIntent(open).setOngoing(true).setSilent(true).build()
         try { startForeground(260, notification) }
         catch (_: RuntimeException) {
