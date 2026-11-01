@@ -10,14 +10,15 @@ import org.junit.Test
 class PskUpdateProtocolTest {
     @Test fun matchesIndependentPythonAndFirmwareVector() {
         val r = request()
-        assertEquals("a2101112131415161718191a1b57a484ca886ec772bfd91e3cc1bbd99006b661e3d9af4484dbcd511cba14a8",
+        assertEquals("a2101112131415161718191a1b10a4cd968b3cc12ded830b2999ba96dac97ac4730bbe4a2127dd9a949cc88a92c02b445341920d22dc9870d6f3da27fe",
             r.payload.joinToString("") { "%02x".format(it) })
         assertEquals(true, PskUpdateProtocol.verifyReceipt(r,
-            "PSK2:OK:c4db2030f6f70abe4ca45388d740c7c8e8e1bfb2266c08d460ce3ad642c2c54d"))
+            "PSK2:OK:f291eaacd0db934af1b807624da45dea818498c0d8efda8b8b2a3305e2280c69"))
     }
     private val nonce = ByteArray(16) { it.toByte() }
     private val iv = ByteArray(12) { (it + 16).toByte() }
-    private fun request(replacement: String = "replacement-key") = PskUpdateProtocol.create("car-main", nonce, "synthetic-current-key", replacement, iv)
+    private val replacement = "5e90b1c274a83d6f0a519fbe842c73d6"
+    private fun request(replacement: String = this.replacement) = PskUpdateProtocol.create("car-main", nonce, "synthetic-current-key", replacement, iv)
     private fun decrypt(payload: ByteArray, binding: String = "car-main", challenge: ByteArray = nonce): ByteArray {
         val key = PskUpdateProtocol.mac("synthetic-current-key".toByteArray(), PskUpdateProtocol.context("BLEKEY-PSK2-ENC", binding, challenge))
         return Cipher.getInstance("AES/GCM/NoPadding").run {
@@ -28,8 +29,8 @@ class PskUpdateProtocolTest {
     }
     @Test fun replacementIsEncryptedAndEveryCiphertextByteIsAuthenticated() {
         val r = request()
-        assertArrayEquals("replacement-key".toByteArray(), decrypt(r.payload))
-        assertFalse(r.payload.toString(Charsets.ISO_8859_1).contains("replacement-key"))
+        assertArrayEquals(replacement.toByteArray(), decrypt(r.payload))
+        assertFalse(r.payload.toString(Charsets.ISO_8859_1).contains(replacement))
         for (i in 1 until r.payload.size) {
             val changed = r.payload.copyOf(); changed[i] = (changed[i].toInt() xor 1).toByte()
             assertTrue("byte $i", runCatching { decrypt(changed) }.isFailure)
@@ -47,16 +48,24 @@ class PskUpdateProtocolTest {
         assertEquals(true, PskUpdateProtocol.verifyReceipt(r, receipt(true)))
         assertEquals(false, PskUpdateProtocol.verifyReceipt(r, receipt(false)))
         assertNull(PskUpdateProtocol.verifyReceipt(r, receipt(false).replace("FAIL", "OK")))
-        assertNull(PskUpdateProtocol.verifyReceipt(request("different"), receipt(true)))
+        assertNull(PskUpdateProtocol.verifyReceipt(request(replacement.reversed()), receipt(true)))
         assertNull(PskUpdateProtocol.verifyReceipt(r, "OK:PSK_UPDATED"))
     }
     @Test fun keyLimitsUseUtf8BytesAndRejectEmbeddedNul() {
-        for (n in listOf(127, 128)) assertArrayEquals("x".repeat(n).toByteArray(), decrypt(request("x".repeat(n)).payload))
+        for (n in listOf(127, 128)) {
+            val key = replacement.repeat(4).take(n)
+            assertArrayEquals(key.toByteArray(), decrypt(request(key).payload))
+        }
         assertTrue(PskUpdateProtocol.validKey("é".repeat(64)))
         assertFalse(PskUpdateProtocol.validKey("é".repeat(65)))
         assertFalse(PskUpdateProtocol.validKey("a\u0000b"))
         assertFalse(PskUpdateProtocol.validKey(""))
         assertFalse(PskUpdateProtocol.validKey("x".repeat(129)))
+    }
+    @Test fun cannotCreateAnUpdateWithAWeakReplacement() {
+        for (weak in listOf("replacement-key", "x".repeat(128), "password".repeat(4))) {
+            assertTrue(runCatching { request(weak) }.isFailure)
+        }
     }
     @Test fun unavailableAuthenticationNeverGrantsAccess() {
         assertEquals(AppPolicies.AuthenticationRoute.UNAVAILABLE, AppPolicies.authenticationRoute(29, false, false))

@@ -1,4 +1,5 @@
 #include "psk_update.h"
+#include "psk_key_policy.h"
 #include "psa/crypto.h"
 #include <string.h>
 #include <stdio.h>
@@ -60,8 +61,8 @@ bool psk2_decrypt(const char *key, const char *binding, const uint8_t nonce[16],
         psa_destroy_key(id);
     }
     psa_reset_key_attributes(&attributes);
-    bool valid = rc == PSA_SUCCESS && plaintext_len > 0 && plaintext_len <= PSK2_MAX_KEY &&
-                 memchr(replacement, 0, plaintext_len) == NULL;
+    bool valid = rc == PSA_SUCCESS &&
+                 psk_valid_new_key((const uint8_t *)replacement, plaintext_len);
     if (valid) {
         replacement[plaintext_len] = 0;
         n = context("BLEKEY-PSK2-ACK", binding, nonce, transcript);

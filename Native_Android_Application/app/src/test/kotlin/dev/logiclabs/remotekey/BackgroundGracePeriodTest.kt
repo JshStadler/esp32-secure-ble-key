@@ -4,6 +4,26 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class BackgroundGracePeriodTest {
+    @Test fun offExpiresImmediatelyUnlessAnOperationIsFinishing() {
+        val period = BackgroundGracePeriod(5_000, BackgroundConnectionDuration.OFF.milliseconds)
+        assertTrue(period.expired(5_000, false))
+        assertFalse(period.expired(100_000, true))
+        assertTrue(period.expired(100_000, false))
+    }
+
+    @Test fun shortDurationUsesElapsedTimeAndDoesNotRestartAfterAnOperation() {
+        val period = BackgroundGracePeriod(5_000, BackgroundConnectionDuration.THIRTY_SECONDS.milliseconds)
+        assertFalse(period.expired(34_999, false))
+        assertTrue(period.expired(35_000, false))
+        assertFalse(period.expired(60_000, true))
+        assertTrue(period.expired(60_001, false))
+    }
+
+    @Test fun returningToAppCancelsAShortLease() {
+        val period = BackgroundGracePeriod(0, 30_000)
+        period.cancel()
+        assertFalse(period.expired(1_000_000, false))
+    }
     @Test fun disconnectsAtTwoMinutesIncludingTimeAsleep() {
         val period = BackgroundGracePeriod(1_000)
         assertFalse(period.expired(120_999, false))

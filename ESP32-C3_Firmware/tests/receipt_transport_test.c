@@ -15,7 +15,7 @@ struct ble_gatt_access_ctxt { int op; struct os_mbuf *om; };
 #define OS_MBUF_PKTLEN(om) ((om)->len)
 typedef struct {
     uint8_t receipt_id[16], receipt_mac[16], receipt_op, receipt_reply[19], nonce[16], auth_failures;
-    bool receipt_context, receipt_part, receipt_valid, closing;
+    bool receipt_context, receipt_part, receipt_valid, receipt_compact, closing;
     int64_t receipt_started;
 } client_state_t;
 static client_state_t clients[3];
@@ -39,6 +39,11 @@ static void generate_nonce_for_slot(int slot, bool notify) { (void)notify; clien
 static void ble_gap_terminate(uint16_t handle, int reason) { (void)handle; (void)reason; }
 static void mark_authenticated(uint16_t handle) { clients[handle].auth_failures = 0; }
 static void mark_ble_activity(void) {}
+static int auth_results;
+static uint8_t last_auth_result[19];
+static void set_auth_result(uint16_t handle, const uint8_t reply[19]) {
+    (void)handle; auth_results++; memcpy(last_auth_result, reply, 19);
+}
 static void schedule_receipt_expiry(void) {}
 static bool press_remote_button(void) { pulse_count++; button_busy = true; return true; }
 #include "receipt_under_test.inc"
@@ -67,8 +72,50 @@ static int exchange(int handle, uint8_t op, const uint8_t id[16], bool tamper) {
     assert(om.bytes[0] == 0xb1 && om.bytes[1] == op && !memcmp(om.bytes + 3, mac, 16));
     return om.bytes[2];
 }
+static void compact_auth(int handle, const uint8_t id[16], bool full, bool tamper) {
+    uint8_t nonce[16], transcript[64], mac[32], packet[49];
+    memcpy(nonce, clients[handle].nonce, 16);
+    size_t n = receipt_transcript(transcript, false, RECEIPT_PROVE, id, nonce, 0);
+    assert(compute_hmac(transcript, n, current_psk, mac));
+    if (tamper) mac[31] ^= 1;
+    int before = auth_results;
+    int rc;
+    if (full) {
+        packet[0] = 0xf3; memcpy(packet + 1, id, 16); memcpy(packet + 17, mac, 32);
+        rc = fragment(handle, packet, 49);
+    } else {
+        packet[0] = 0xf0; memcpy(packet + 1, id, 16); assert(fragment(handle, packet, 17) == 0);
+        packet[0] = 0xf4; packet[1] = RECEIPT_PROVE; memcpy(packet + 2, mac, 16);
+        assert(fragment(handle, packet, 18) == 0);
+        packet[0] = 0xf2; memcpy(packet + 1, mac + 16, 16); rc = fragment(handle, packet, 17);
+    }
+    if (tamper) {
+        assert(rc == BLE_ATT_ERR_INSUFFICIENT_AUTHEN && auth_results == before);
+        return;
+    }
+    assert(rc == 0 && auth_results == before + 1);
+    assert(last_auth_result[0] == 0xb1 && last_auth_result[1] == RECEIPT_PROVE && last_auth_result[2] == RECEIPT_PROVED);
+    n = receipt_transcript(transcript, true, RECEIPT_PROVE, id, nonce, RECEIPT_PROVED);
+    assert(compute_hmac(transcript, n, current_psk, mac));
+    assert(!memcmp(last_auth_result + 3, mac, 16));
+    // Replay uses the consumed nonce and must not produce another signed result.
+    packet[0] = 0xf3; memcpy(packet + 1, id, 16);
+    n = receipt_transcript(transcript, false, RECEIPT_PROVE, id, nonce, 0);
+    assert(compute_hmac(transcript, n, current_psk, packet + 17));
+    assert(fragment(handle, packet, 49) == BLE_ATT_ERR_INSUFFICIENT_AUTHEN);
+    assert(auth_results == before + 1);
+}
 int main(void) {
     uint8_t id[16] = {1}, other[16] = {2};
+    compact_auth(0, id, true, false);
+    compact_auth(1, other, false, false);
+    compact_auth(0, id, true, true);
+    compact_auth(1, id, false, true);
+    assert(pulse_count == 0);
+    uint8_t malformed[49] = {0xf3};
+    assert(fragment(0, malformed, 48) != 0);
+    malformed[0] = 0xf4; malformed[1] = RECEIPT_PRESS;
+    assert(fragment(0, malformed, 18) != 0);
     assert(exchange(0, RECEIPT_PROVE, id, false) == RECEIPT_PROVED && pulse_count == 0);
     exchange(0, RECEIPT_PRESS, id, true); assert(pulse_count == 0);
     assert(exchange(0, RECEIPT_PRESS, id, false) == RECEIPT_PENDING && pulse_count == 1);
@@ -86,5 +133,5 @@ int main(void) {
     fake_now += 5001; partial[0] = 0xf2; assert(fragment(0, partial, 17) != 0);
     for (int i = 0; i < 5; ++i) exchange(2, RECEIPT_PROVE, id, true);
     assert(clients[2].closing);
-    puts("Real GATT handler: authentication, lost response/reconnect, duplicate/ACK, busy, expiry and fragment faults passed");
+    puts("Real GATT handler: legacy/AUTH2 proof, full/split/tamper/replay, lost response/reconnect, duplicate/ACK, busy, expiry and fragment faults passed");
 }

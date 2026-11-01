@@ -18,6 +18,12 @@ separate Car and Gate apps so each watch app keeps one clear target and PSK.
 
 ## Current limitations
 
+Version 2.8.12 (`gate-ble-v2.8.12-update-metadata`) adds `fw` and `build` fields to
+the existing BLE identity descriptor. Android can compare that running revision
+with a published GitHub config and link to its source. This does not change the
+BLE command protocol or install anything through the phone. Older gate configs
+do not report their running revision over BLE; update through ESPHome to enable it.
+
 - The BLE server permits five simultaneous clients, with independent challenge,
   status, and Garmin split-write state for each connection.
 - PSK updates over BLE are not exposed. Change the key slots in the YAML and
@@ -25,11 +31,19 @@ separate Car and Gate apps so each watch app keeps one clear target and PSK.
 - BLE transmit power is set to the classic ESP32 maximum of +9 dBm for both
   advertising and connections. Enclosure and antenna placement still affect range.
 
-## Easiest install: one YAML file
+## Install with ESPHome OTA
 
-Use `centurion-d5-evo-ble-v2.yaml` as the complete ESPHome device
-configuration. It contains the existing gate configuration and all BLE/HMAC
-logic, so no companion header or package file is needed.
+Use `centurion-d5-evo-ble-v2.yaml` as the ESPHome device configuration. It
+contains the existing gate configuration and BLE/HMAC logic. Its
+`external_components` block fetches the signal diagnostic from a fixed commit
+in this repository, so the YAML can be pasted directly into ESPHome Builder.
+For local component development, replace that source with `type: local` and
+`path: components`, and copy `components/gate_ble_signal/` beside the YAML.
+Keep the existing `secrets.yaml` with your installed Wi-Fi/API/OTA credentials
+and BLE keys. Compile and install with the normal ESPHome OTA workflow.
+This deployment configuration requires ESPHome 2026.10.0, preserves the second
+key reference `!secret ble_psk2`, and uses OTA encryption inherited from the
+existing native API key. Do not substitute validation credentials when flashing.
 
 The first slot remains the generic `BLE Remote` and uses the existing secret:
 
@@ -60,7 +74,7 @@ The production configuration preserves the installed controller identity
 spare-board BLE indicator on GPIO2 has been removed, so the YAML is a drop-in
 replacement for the existing gate controller wiring.
 
-After boot, logs must show `gate-ble-v2.7.0-authenticated-live-state-production` and
+After boot, logs must show `gate-ble-v2.8.7-on-demand-signal-production` and
 `max BLE clients = 5`. The same build string is exposed as the diagnostic
 `BLE Firmware Build` text sensor. If either still says one client, clean the
 ESPHome build files before installing again.
@@ -82,6 +96,35 @@ characteristic `b1b2c3d4-e5f6-7890-abcd-ef123456789b`. It is not placed in the
 public advertisement: each BLE session must first authenticate successfully.
 The app reads it while connected and shows Open, Closed, Opening, Closing, or
 the relevant controller warning on that device card.
+
+## BLE signal readings
+
+Android 2.8.4 and newer can already show the gate-to-phone RSSI at **Device
+settings > Device health and BLE signal**. Android 2.8.7 plus this gate build
+also shows the phone-to-gate RSSI. Car firmware and Garmin do not need an update
+for this gate feature. Older gate builds remain usable and show only the
+phone-side reading.
+
+The optional `signal1` capability uses characteristic
+`b1b2c3d4-e5f6-7890-abcd-ef123456789c`. Only an authenticated, non-closing session
+can request or read a result. An eight-byte random request ID is written with
+response. A read returns ten bytes: state (0 waiting, 1 ready, 2 unavailable),
+the eight-byte request ID, and signed RSSI (127 if unavailable). All packets fit
+the default MTU. The Android app retries waiting reads for at most 2.5 seconds;
+only opening health or explicitly refreshing it initiates a diagnostic.
+
+The component tracks five sessions, matches controller results to the peer,
+request and connection generation, and rejects late results after a reconnect.
+If the controller never returns a callback, further ESP-side RSSI requests
+remain unavailable until the callback drains or BLE restarts; key operations
+and phone-side RSSI continue normally. No diagnostic schedules an automatic
+restart, radio scan or relay operation. Full car-style firmware health is not
+implemented on the gate.
+
+After updating, test both readings near and far; Refresh with the phone and
+watch connected together; disconnect/reconnect during Refresh; and confirm
+ordinary phone/watch presses and live gate state still work. Verify the relay
+does not operate simply by opening health. Physical validation is still needed.
 
 ## Legacy v1 rollback files
 

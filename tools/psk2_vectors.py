@@ -14,7 +14,14 @@ def mac(k, data):
 enc = mac(key, context(b"BLEKEY-PSK2-ENC"))
 ack = mac(key, context(b"BLEKEY-PSK2-ACK"))
 lines = []
-for i, replacement in enumerate([b"replacement-key", b"x"*127, b"x"*128, b"a\0b", b""]):
+strong = b"5e90b1c274a83d6f0a519fbe842c73d6"
+long_key = strong * 4
+replacements = [strong, long_key[:127], long_key, b"a\0b", b"",
+                b"replacement-key", b"x" * 128, b"a" * 31 + b"b",
+                (b"0123456789abcdef" * 8)[:127],
+                strong + "é".encode() * 48, strong + "é".encode() * 49,
+                strong + b"\0"]
+for i, replacement in enumerate(replacements):
     packet = b"\xa2" + iv + AESGCM(enc).encrypt(iv, replacement, context(b"BLEKEY-PSK2"))
     lines.append(f'static const unsigned char packet{i}[] = {{' + ','.join(map(str, packet)) + '};')
     if i == 0:

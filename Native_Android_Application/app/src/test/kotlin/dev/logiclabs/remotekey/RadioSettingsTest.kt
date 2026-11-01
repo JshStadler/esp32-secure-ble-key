@@ -43,4 +43,53 @@ class RadioSettingsTest {
             packet.copyOfRange(11, 43).joinToString("") { "%02x".format(it) })
         assertTrue(runCatching { RadioSettings.DEFAULT.packet(ByteArray(15), "test-key") }.isFailure)
     }
+    @Test fun powerUsesVersionedFullMacAndSignedByteWithoutChangingLegacyPackets() {
+        val nonce = ByteArray(16) { it.toByte() }
+        val settings = RadioSettings.DEFAULT.copy(txPowerDbm = -12)
+        val packet = settings.packet(nonce, "test-key")
+        assertEquals(44, packet.size)
+        assertEquals(5.toByte(), packet[0])
+        assertEquals((-12).toByte(), packet[11])
+        assertEquals("8773aca385f2cf69f73cc55b896addffa6ce85e25154ed9f56c9d132c8e3e00c", packet.copyOfRange(12, 44).joinToString("") { "%02x".format(it) })
+        assertFalse(packet.contentEquals(settings.copy(txPowerDbm = 9).packet(nonce, "test-key")))
+        assertFalse(packet.contentEquals(settings.packet(ByteArray(16), "test-key")))
+        RadioSettings.TX_POWER_LEVELS.forEach { assertTrue(settings.copy(txPowerDbm = it).valid()) }
+        listOf(-15, -11, 1, 10, 12, 127).forEach { power ->
+            assertFalse(settings.copy(txPowerDbm = power).valid())
+            assertTrue(runCatching { settings.copy(txPowerDbm = power).packet(nonce, "test-key") }.isFailure)
+        }
+        assertEquals(43, settings.copy(txPowerDbm = null).packet(nonce, "test-key").size)
+    }
+
+    @Test fun dualPowerAuthenticatesBothTargetsAndRetainsOlderWireVersions() {
+        val settings = RadioSettings.DEFAULT.copy(txPowerDbm = 9, idleTxPowerDbm = -3)
+        val nonce = ByteArray(16) { it.toByte() }
+        val packet = settings.packet(nonce, "test-key")
+        assertTrue(settings.valid())
+        assertEquals(3, settings.wireVersion)
+        assertEquals(48, settings.minimumMtu)
+        assertEquals(45, packet.size)
+        assertEquals(6.toByte(), packet[0])
+        assertEquals(9.toByte(), packet[11])
+        assertEquals((-3).toByte(), packet[12])
+        assertEquals("593a0fc317602662aeb9877d5f8e95ff3ec3e0f01fdaada82035e2ed0b64e280", packet.copyOfRange(13, 45).joinToString("") { "%02x".format(it) })
+        assertFalse(packet.contentEquals(settings.copy(idleTxPowerDbm = 0).packet(nonce, "test-key")))
+        assertFalse(packet.contentEquals(settings.copy(txPowerDbm = 6).packet(nonce, "test-key")))
+        assertFalse(packet.contentEquals(settings.packet(ByteArray(16), "test-key")))
+        assertEquals(2, settings.copy(idleTxPowerDbm = null).wireVersion)
+        assertEquals(47, settings.copy(idleTxPowerDbm = null).minimumMtu)
+        assertEquals(1, RadioSettings.DEFAULT.wireVersion)
+        assertEquals(46, RadioSettings.DEFAULT.minimumMtu)
+    }
+    @Test fun inactivePowerCannotExceedRecentPowerAndEqualPowerStaysValid() {
+        RadioSettings.TX_POWER_LEVELS.forEach { recent ->
+            RadioSettings.TX_POWER_LEVELS.forEach { idle ->
+                assertEquals(idle <= recent, RadioSettings.DEFAULT.copy(txPowerDbm = recent, idleTxPowerDbm = idle).valid())
+            }
+        }
+        assertFalse(RadioSettings.DEFAULT.copy(idleTxPowerDbm = 3).valid())
+        assertFalse(RadioSettings.DEFAULT.copy(txPowerDbm = 9, idleTxPowerDbm = 1).valid())
+        assertTrue(runCatching { RadioSettings.DEFAULT.copy(txPowerDbm = 3, idleTxPowerDbm = 9).encode() }.isFailure)
+    }
+
 }

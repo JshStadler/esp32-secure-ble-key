@@ -29,6 +29,7 @@ data class BleDeviceProfile(
 ) {
     val commandPt1Uuid get() = UUID.fromString(commandUuid.toString().dropLast(2) + "95")
     val commandPt2Uuid get() = UUID.fromString(commandUuid.toString().dropLast(2) + "96")
+    val signalUuid get() = UUID.fromString(commandUuid.toString().dropLast(2) + "9c")
     val supportsRemotePskUpdate get() = type == BleDeviceType.CAR
     val supportsBleOta get() = type == BleDeviceType.CAR
     val supportsLiveState get() = type == BleDeviceType.ESPHOME_ACCESS
@@ -36,6 +37,7 @@ data class BleDeviceProfile(
     val pskStoreKey get() = "device_${id}_psk"
     val addressStoreKey get() = "device_${id}_address"
     val preferCachedStoreKey get() = "device_${id}_prefer_cached"
+    val autoConnectStoreKey get() = "device_${id}_auto_connect"
     val recordLocationStoreKey get() = "device_${id}_record_location"
 }
 
@@ -78,12 +80,29 @@ object BleDeviceProfiles {
 }
 
 /** Encrypted ordered card list. PSKs remain in their own encrypted entries. */
-class DeviceProfileRepository(private val store: SecureStore) {
+class DeviceProfileRepository(
+    private val read: (String) -> String?,
+    private val write: (String, String) -> Unit,
+) {
+    constructor(store: SecureStore) : this(store::get, store::put)
+
     companion object { private const val KEY = "device_profiles_v1" }
 
+    fun needsInitialSetup() = read(KEY) == null
+
     fun load(): MutableList<BleDeviceProfile> {
-        val saved = store.get(KEY)
-        if (saved == null) return BleDeviceProfiles.defaults.toMutableList().also(::save)
+        val saved = read(KEY)
+        if (saved == null) {
+            // Preserve pre-dashboard installations and their original credential IDs.
+            val legacyKeys = listOf("psk", "cached_address") + BleDeviceProfiles.defaults.flatMap {
+                listOf(it.pskStoreKey, it.addressStoreKey)
+            }
+            if (legacyKeys.any { !read(it).isNullOrBlank() }) {
+                return BleDeviceProfiles.defaults.toMutableList().also(::save)
+            }
+            // Do not persist until setup is completed or explicitly skipped.
+            return mutableListOf()
+        }
         return runCatching {
             val array = JSONArray(saved)
             MutableList(array.length()) { index ->
@@ -108,6 +127,6 @@ class DeviceProfileRepository(private val store: SecureStore) {
                 put("address", profile.defaultAddress ?: "")
             })
         }
-        store.put(KEY, array.toString())
+        write(KEY, array.toString())
     }
 }

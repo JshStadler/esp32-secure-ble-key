@@ -10,11 +10,12 @@ import javax.crypto.spec.SecretKeySpec
 /** PSK2: AES-256-GCM with independent, challenge-derived request/receipt keys. */
 object PskUpdateProtocol {
     private val random = SecureRandom()
-    const val MAX_KEY_BYTES = 128
+    const val MAX_KEY_BYTES = PskKeyPolicy.MAX_KEY_BYTES
     data class Request(val payload: ByteArray, internal val receiptKey: ByteArray)
 
-    fun validKey(value: String): Boolean = value.isNotEmpty() &&
-        '\u0000' !in value && value.toByteArray(Charsets.UTF_8).size <= MAX_KEY_BYTES
+    /** Existing device keys remain importable for migration and recovery. */
+    fun validKey(value: String): Boolean = PskKeyPolicy.validExisting(value)
+    fun validNewKey(value: String): Boolean = PskKeyPolicy.validNew(value)
 
     internal fun mac(key: ByteArray, value: ByteArray): ByteArray = Mac.getInstance("HmacSHA256").run {
         init(SecretKeySpec(key, "HmacSHA256"))
@@ -28,7 +29,7 @@ object PskUpdateProtocol {
         create(binding, nonce, currentKey, replacement, ByteArray(12).also(random::nextBytes))
 
     internal fun create(binding: String, nonce: ByteArray, currentKey: String, replacement: String, iv: ByteArray): Request {
-        require(nonce.size == 16 && iv.size == 12 && validKey(replacement))
+        require(nonce.size == 16 && iv.size == 12 && validNewKey(replacement))
         val key = currentKey.toByteArray(Charsets.UTF_8)
         val encryptionKey = mac(key, context("BLEKEY-PSK2-ENC", binding, nonce))
         val receiptKey = mac(key, context("BLEKEY-PSK2-ACK", binding, nonce))

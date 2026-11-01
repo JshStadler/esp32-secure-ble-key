@@ -72,6 +72,35 @@ pre-shared key, and each challenge is a fresh 16-byte random nonce.
 
 ## API v2
 
+### Compact Car authentication transport (auth2, v2.8.4)
+
+The Car identity advertises `auth2`. This is an optional transport for RCP1
+PROVE, with the **same transcript, independent random 16-byte client request ID,
+full 32-byte request HMAC, and verified 16-byte reply tag** described above.
+It performs no GPIO operation and changes no GATT handles or properties.
+
+At ATT MTU 52 or higher, write `F3 || request_id[16] || MAC[32]` (49 bytes)
+to `...789c`. At smaller MTUs, write the existing F0/F1/F2 fragments, replacing
+only F1's opcode with F4; its operation byte must be PROVE (1). F4 cannot request
+a press, query or acknowledgment. The same per-connection staging expiry and
+authentication failure limits apply. Every completed verification consumes its
+challenge, including failures.
+
+On success, firmware sends the rotated challenge on the existing challenge
+notification, and the existing **19-byte RCP1 PROVED result** on the requesting
+connection's status notification. It also retains that binary result for status
+and receipt reads. No result is broadcast to other connections. Clients verify
+the proof for their exact request and wait for the final write callback before
+becoming ready; an early notification may be buffered. A missing or invalid
+proof closes the connection, never silently downgrades authentication. Android
+reads the next challenge only if its notification did not arrive.
+
+This removes two request writes, the separate proof read and normally the
+post-proof challenge read from Android setup. Garmin still uses three writes at
+its default MTU, and replaces the proof read with a notification; capability
+discovery adds a read on new connections. Older clients retain F0/F1/F2 and
+read their reply; new clients use this path only when `auth2` is advertised.
+
 The Car binding is `car-main`; the Gate binding is `gate-main`.
 
 ```text
@@ -114,7 +143,7 @@ may poll it while connected. Current values are `Unknown`, `Closed`, `Open`,
 
 The existing read-only identity characteristic `a1b2c3d4-e5f6-7890-abcd-ef1234567897`
 keeps its UUID and handle. A read before authentication returns only
-`blekey|2|car-main|car|press,ota1,psk2,health1,radio1`. On an authenticated, non-closing
+`blekey|2|car-main|car|press,ota1,psk2,health1,radio1,rcp1,auth2,radio2,radio3,linkpower1`. On an authenticated, non-closing
 connection, an explicit read appends comma-separated health fields to this
 capability list:
 The two lines below are concatenated without a newline on the wire.
@@ -131,6 +160,12 @@ reason; application-triggered software resets add a reason retained in RTC RAM
 without writing flash. `ota` is `pending`, `valid`, `initial`, or `unknown`.
 Advertising min/max values use 0.625ms BLE units, `idlesec` is seconds, and
 `advmode` is `recent`, `inactive`, or `off` (all connection slots may be occupied).
+Firmware v2.8.4 optionally appends `,rssi=-67`: the RSSI in dBm measured by the
+ESP for **this authenticated connection**. A failed/unavailable controller
+reading is omitted (127 is never a valid measurement). Android separately
+requests connected RSSI from its own controller only when the health view is
+opened/refreshed. The two directions are labelled explicitly; there is no
+background RSSI polling. Older firmware remains readable without this field.
 Health is a maximum 512-byte ASCII read; clients must support long reads if
 the negotiated MTU is smaller. Unknown capabilities/fields can be ignored.
 
@@ -173,6 +208,93 @@ the actual values. After Save, Android explicitly reads them back. Saving
 starts the recent-activity window and restarts advertising with the new values;
 existing connections are retained. A host callout handles the inactive deadline.
 
+## Car transmit power configuration (radio2, v2.8.8)
+
+`radio2` extends `radio1` on the same OTA-control characteristic, without changing
+GATT handles. Clients only use it when the ESP advertises the new capability.
+
+```text
+config2 = config[10] || signed_int8(tx_dbm)       # 11 bytes
+transcript = ASCII("BLEKEY-RADIO2") || 0x00 || ASCII("car-main") ||
+             0x00 || nonce[16] || config2        # 50 bytes
+packet = 0x05 || config2 || HMAC-SHA256(PSK, transcript)  # 44 bytes, MTU >= 47
+```
+
+Allowed power levels are -12, -9, -6, -3, 0, +3, +6 and +9 dBm; default +3.
+The full MAC covers the signed power byte and fresh challenge. Authentication,
+nonce rotation, OTA exclusion, and failure limits are the same as radio1.
+Legacy radio1 writes preserve the current power target.
+
+Firmware applies and verifies default, advertising and every active connection's
+controller power before committing the complete v2 configuration. A failure
+restores the previous target to all affected links. `ERR:RADIO_APPLY` means the
+controller rejected the update and the previous target was restored;
+`ERR:RADIO_SAVE` means persistence failed and the previous target was restored.
+`ERR:RADIO_RESTORE` means restoration also failed: inspect health and reconnect;
+never assume the controller matches the saved target after this error.
+Interval changes become active only after persistence succeeds. A missing
+acknowledgement remains an uncertain outcome: reconnect and read health.
+
+The `radio2` NVS record is version 2 plus the 11-byte config. Firmware falls back
+to a valid legacy `radio1` record with +3 dBm when no valid v2 record exists.
+It retains that legacy record for rollback, so a downgrade restores the older
+intervals and fixed power rather than the newer radio settings. New connections
+receive the saved target individually using their actual controller handle.
+
+Authenticated health adds `txdbm` (saved target), `txadv` (controller advertising
+power) and `txconn` (controller power for this connection), all in dBm. Failed
+controller reads omit the actual field rather than reporting a placeholder.
+These values are controller settings, not measured RF output or received RSSI.
+The existing 512-byte health limit is unchanged.
+
+## Recent and inactive advertising power (radio3, v2.8.10)
+
+`radio3` adds a second signed power byte to radio2. No GATT handles change.
+
+```text
+config3 = config[10] || signed_int8(recent_tx_dbm) || signed_int8(idle_tx_dbm)
+transcript = ASCII("BLEKEY-RADIO3") || 0x00 || ASCII("car-main") ||
+             0x00 || nonce[16] || config3        # 51 bytes
+packet = 0x06 || config3 || HMAC-SHA256(PSK, transcript)  # 45 bytes, MTU >= 48
+```
+
+Both levels use the existing -12..+9 dBm / 3 dB step limits; inactive power must
+not exceed recent power. Equal values keep fixed power. The two targets and
+intervals are validated, authenticated and saved together in the version-3
+`radio3` NVS blob. A valid radio2 configuration migrates with its existing fixed
+power assigned to both targets. Radio1 migrates with both at +3 dBm. Older NVS
+records remain available to downgraded firmware. Old radio1 writes preserve both
+power targets; old radio2 writes deliberately select fixed power for both.
+
+The default (non-advertising) controller power and each connected link always
+use the configured high/recent target. Only advertising power follows the
+existing recent-advertising deadline. Boot, successful/failed connection events, disconnects
+and authenticated commands restart the window. The first exposed connection
+event is its result; this cannot boost the initial advertising packet or first
+connection exchange. A passively scanning phone/watch cannot trigger a boost.
+Initial discovery after the idle deadline must therefore work at inactive power.
+Health reads and ordinary link traffic do not extend the window.
+
+Advertising may slow and use inactive power while one or more devices remain
+connected; their connection power stays high. With all connection slots occupied,
+there are no advertising packets to save power on, and every connected link stays
+high. OTA transfer also holds advertising at recent power regardless of deadline.
+Finishing/aborting OTA releases that hold; its authenticated traffic has refreshed
+the shared deadline. No new RSSI polling or periodic advertising bursts are added.
+A failed automatic transition attempts to restore high advertising power and
+all high-power links, then retries at most once every five seconds on the existing
+maintenance loop. Actual readback may differ from the intended mode after an error.
+
+New health fields are `txidle` (saved inactive target) and `txmode`
+(`recent`, `inactive`, or `update`) for advertising. `txdbm` is the saved high
+connection/recent-advertising target; `txadv` / `txconn` are actual controller
+readbacks. `linkpower1` announces that connected links always use the high target.
+The earlier 2.8.9 radio3 implementation lacks this capability and also reduced
+connected power; updated clients identify that older behavior and request an
+upgrade. The radio3 packet and NVS format are unchanged.
+A configuration save enters the recent window immediately. If saving fails,
+firmware restores independent previous connection and advertising power levels.
+
 ## Car PSK2 (v2.6.0)
 
 The identity characteristic advertises `psk2`. Updating a key requires an
@@ -189,7 +311,15 @@ packet         = 0xA2 || random_IV[12] || AES-256-GCM(encryption_key, IV, new_PS
 ```
 
 The GCM output is ciphertext followed by its 16-byte tag. New keys must be
-1–128 UTF-8 bytes without NUL. Send the packet to the existing PSK-update
+32–128 UTF-8 bytes without NUL, contain at least eight distinct byte values,
+and must not repeat a pattern of 1–16 bytes (including a partial final repeat).
+Android checks replacements before transmission and the firmware checks the
+decrypted key before saving. Fresh customized bootstrap keys use the same policy.
+Use the random PSK generator: these checks reject obvious weaknesses but cannot
+prove that a manually chosen key has enough entropy. Existing installed keys
+still authenticate and can be imported or recovered using the original
+1–128-byte format; this does not permit a weak new remote replacement.
+Send the packet to the existing PSK-update
 characteristic. The nonce rotates after verification. No key change occurs
 unless GCM verification and persistent storage both succeed.
 

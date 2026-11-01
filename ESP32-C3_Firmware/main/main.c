@@ -19,7 +19,7 @@
  *   - USB-CDC console disabled in production (CONFIG_ESP_CONSOLE_NONE)
  *   - Button GPIO held in high-impedance (INPUT) at idle
  *   - Advertising: 50-100ms fast window, 200-400ms afterwards
- *   - Periodic restart every 3 hours (when idle)
+ *   - BLE watchdog recovery; daily restart deferred during active operations
  *
  * BLE GATT Service:
  *   - Challenge characteristic (read/notify): 16-byte random nonce
@@ -55,6 +55,7 @@
 #include "ota_health.h"
 #include "device_health.h"
 #include "radio_config.h"
+#include "radio_power.h"
 #include "esp_partition.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -63,6 +64,7 @@
 /* PSA Crypto for HMAC-SHA256 (ESP-IDF 6 / mbedTLS 4 public API) */
 #include "psa/crypto.h"
 #include "psk_update.h"
+#include "psk_key_policy.h"
 #include "press_receipt.h"
 
 /* BLE TX power control (NimBLE on C3) */
@@ -133,9 +135,6 @@ static const char *TAG = "CAR_UNLOCK";
 /* ---- BLE ---- */
 #define BLE_DEVICE_NAME "BLE-Device"
 
-/* BLE TX power in dBm. 3 dBm good for car cabin with external antenna. */
-#define BLE_TX_POWER 3
-
 /* BLE advertising intervals (in 0.625ms units).
  * Fast mode improves Garmin discovery after boot/disconnect/activity.
  * Idle mode stays responsive enough for short Garmin scan windows while
@@ -144,6 +143,7 @@ static const char *TAG = "CAR_UNLOCK";
  * Authenticated app settings may override them; see radio_config.h. */
 static radio_config_t radio_config = RADIO_DEFAULTS;
 static bool radio_config_persisted = false;
+static radio_power_state_t radio_power_state = RADIO_POWER_STATE_INITIAL;
 
 /* Max simultaneous BLE connections */
 #define MAX_CONNECTIONS 3
@@ -305,8 +305,9 @@ typedef struct {
     int64_t  connected_at;
     uint8_t  auth_failures;
     char     status[PSK2_RECEIPT_SIZE];
+    uint16_t status_length;
     uint8_t receipt_id[16], receipt_mac[16], receipt_op, receipt_reply[19];
-    bool receipt_context, receipt_part, receipt_valid;
+    bool receipt_context, receipt_part, receipt_valid, receipt_compact;
     int64_t receipt_started;
     int64_t  last_activity_at;  /* milliseconds from now_ms() */
 } client_state_t;
@@ -314,18 +315,9 @@ typedef struct {
 static client_state_t clients[MAX_CONNECTIONS];
 static press_receipt_t press_receipts[RECEIPT_SLOTS];
 static int receipt_button_slot = -1;
-static volatile int receipt_released_slot = -1;
 static struct ble_npl_event receipt_button_event;
 static struct ble_npl_callout receipt_expiry_callout;
-
-static void receipt_button_complete(struct ble_npl_event *event) {
-    (void)event;
-    int completed = receipt_released_slot;
-    if (completed >= 0 && press_receipts[completed].result == RECEIPT_PENDING)
-        press_receipts[completed].result = RECEIPT_PRESSED;
-    if (receipt_button_slot == completed) receipt_button_slot = -1;
-    receipt_released_slot = -1;
-}
+static void receipt_button_complete(struct ble_npl_event *event);
 
 /* Split command buffer for low-MTU clients (Garmin watches) */
 typedef struct {
@@ -380,6 +372,7 @@ static bool button_busy = false;
 static void start_advertising(void);
 static void force_restart_advertising(void);
 static void mark_ble_activity(void);
+static void sync_radio_power(bool force);
 static int  count_active_slots(void);
 static void log_client_state(const char *reason);
 static void generate_nonce_for_slot(int slot, bool notify);
@@ -424,9 +417,17 @@ static void button_timer_callback(void *arg) {
     gpio_set_level(DEBUG_LED_GPIO, 0);
 #endif
 
-    button_busy = false;
-    receipt_released_slot = receipt_button_slot;
+    /* Only release hardware here. Keep all button/receipt state on the BLE
+     * host queue: a second press must not start before completion is consumed. */
     ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &receipt_button_event);
+}
+
+static void receipt_button_complete(struct ble_npl_event *event) {
+    (void)event;
+    if (receipt_button_slot >= 0 && press_receipts[receipt_button_slot].result == RECEIPT_PENDING)
+        press_receipts[receipt_button_slot].result = RECEIPT_PRESSED;
+    receipt_button_slot = -1;
+    button_busy = false;
 }
 
 static bool press_remote_button(void) {
@@ -446,6 +447,9 @@ static bool press_remote_button(void) {
     if (err != ESP_OK) {
         /* Timer failed — release GPIO immediately to avoid stuck press */
         gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
+#ifdef DEBUG_LED_ENABLED
+        gpio_set_level(DEBUG_LED_GPIO, 0);
+#endif
         button_busy = false;
         LOG_E(TAG, "Button timer start failed: %s", esp_err_to_name(err));
         return false;
@@ -507,7 +511,8 @@ static void load_psk(void) {
     current_psk[0] = '\0';
     if ((err == ESP_ERR_NVS_NOT_FOUND) &&
         strcmp(DEFAULT_PSK, "CHANGE_ME_before_flashing_32chars!") != 0) {
-        if (strlen(DEFAULT_PSK) > MAX_PSK_LEN || !save_psk(DEFAULT_PSK))
+        if (!psk_valid_new_key((const uint8_t *)DEFAULT_PSK, strlen(DEFAULT_PSK)) ||
+            !save_psk(DEFAULT_PSK))
             current_psk[0] = '\0';
     } else {
         LOG_E(TAG, "No valid provisioned PSK; remote commands disabled");
@@ -630,11 +635,13 @@ static int ensure_client_slot(uint16_t conn_handle) {
     clients[slot].in_use        = true;
     clients[slot].connected_at = now_ms();
     strcpy(clients[slot].status, "READY");
+    clients[slot].status_length = 5;
     clients[slot].authenticated = false;
     clients[slot].last_activity_at = now_ms();
     clients[slot].conn_handle   = conn_handle;
     generate_nonce_for_slot(slot, false);
     mark_ble_activity();
+    sync_radio_power(true);
     LOG_W(TAG, "Repaired missing client slot %d for handle %d", slot, conn_handle);
     log_client_state("slot-repaired");
 
@@ -728,6 +735,7 @@ static void set_status(uint16_t conn_handle, const char *msg) {
     char *status_str = clients[slot].status;
     strncpy(status_str, msg, sizeof(clients[slot].status) - 1);
     status_str[sizeof(clients[slot].status) - 1] = '\0';
+    clients[slot].status_length = strlen(status_str);
 
     /* A command result belongs only to its initiating client. Broadcasting it
      * makes another connected phone/watch report a command it did not send. */
@@ -740,6 +748,16 @@ static void set_status(uint16_t conn_handle, const char *msg) {
                   conn_handle, rc, status_str);
         }
     }
+}
+
+/* AUTH2 uses the existing status handle; no GATT handles or CCCDs move.
+ * Only a client explicitly requesting AUTH2 receives a binary proof. */
+static void set_auth_result(uint16_t conn_handle, const uint8_t reply[19]) {
+    int slot = find_client_by_handle(conn_handle);
+    if (slot < 0) return;
+    memcpy(clients[slot].status, reply, 19);
+    clients[slot].status_length = 19;
+    ble_gatts_notify_custom(conn_handle, status_val_handle, om_from_buf(reply, 19));
 }
 
 static void set_ota_status(uint16_t conn_handle, const char *msg) {
@@ -819,27 +837,33 @@ static void load_radio_config(void) {
     radio_config_persisted = false;
     nvs_handle_t handle;
     if (nvs_open("car_unlock", NVS_READONLY, &handle) != ESP_OK) return;
-    uint8_t data[1 + RADIO_CONFIG_SIZE];
-    size_t length = sizeof(data);
-    esp_err_t err = nvs_get_blob(handle, "radio1", data, &length);
-    nvs_close(handle);
+    uint8_t data[1 + RADIO_CONFIG3_SIZE];
     radio_config_t loaded;
-    if (err == ESP_OK && length == sizeof(data) && data[0] == 1 &&
-        radio_config_decode(&loaded, data + 1)) {
+    for (int version = 3; version >= 1; --version) {
+        const char *key = version == 3 ? "radio3" : version == 2 ? "radio2" : "radio1";
+        size_t expected = 1 + (version == 3 ? RADIO_CONFIG3_SIZE : version == 2 ? RADIO_CONFIG2_SIZE : RADIO_CONFIG_SIZE);
+        size_t length = sizeof(data);
+        esp_err_t err = nvs_get_blob(handle, key, data, &length);
+        if (err != ESP_OK || length != expected || data[0] != version) continue;
+        bool valid = version == 3 ? radio_config3_decode(&loaded, data + 1) :
+            version == 2 ? radio_config2_decode(&loaded, data + 1) : radio_config_decode(&loaded, data + 1);
+        if (!valid) continue;
         radio_config = loaded;
-        radio_config_persisted = true;
+        radio_config_persisted = version == 3;
+        break; // Keep old records for rollback; migrate only on the next save.
     }
+    nvs_close(handle);
 }
 
 static bool save_radio_config(const radio_config_t *config) {
     if (!radio_config_valid(config)) return false;
-    uint8_t data[1 + RADIO_CONFIG_SIZE] = {1}, current[RADIO_CONFIG_SIZE];
-    radio_config_encode(data + 1, config);
-    radio_config_encode(current, &radio_config);
+    uint8_t data[1 + RADIO_CONFIG3_SIZE] = {3}, current[RADIO_CONFIG3_SIZE];
+    radio_config3_encode(data + 1, config);
+    radio_config3_encode(current, &radio_config);
     if (radio_config_persisted && memcmp(data + 1, current, sizeof(current)) == 0) return true;
     nvs_handle_t handle;
     if (nvs_open("car_unlock", NVS_READWRITE, &handle) != ESP_OK) return false;
-    esp_err_t err = nvs_set_blob(handle, "radio1", data, sizeof(data));
+    esp_err_t err = nvs_set_blob(handle, "radio3", data, sizeof(data));
     if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
     if (err != ESP_OK) return false;
@@ -866,15 +890,27 @@ static void check_running_ota_image(bool healthy) {
     }
 }
 
+static void sync_radio_power(bool force) {
+    if (!ble_synced) return;
+    uint16_t handles[MAX_CONNECTIONS];
+    unsigned count = 0;
+    for (int i = 0; i < MAX_CONNECTIONS; ++i)
+        if (clients[i].in_use && !clients[i].closing) handles[count++] = clients[i].conn_handle;
+    radio_power_sync(&radio_power_state, &radio_config, now_ms(), fast_adv_until_ms,
+        ota_session.active, handles, count, force);
+}
+
 static void mark_ble_activity(void) {
     fast_adv_until_ms = now_ms() + ((int64_t)radio_config.idle_seconds * 1000);
     ble_npl_callout_reset(&slow_adv_callout,
         ble_npl_time_ms_to_ticks32((uint32_t)radio_config.idle_seconds * 1000));
+    sync_radio_power(false);
     if (ble_synced && adv_active && !adv_using_fast_interval) start_advertising();
 }
 
 static void slow_adv_callback(struct ble_npl_event *event) {
     (void)event;
+    sync_radio_power(false);
     if (adv_active && now_ms() >= fast_adv_until_ms) start_advertising();
 }
 
@@ -981,7 +1017,7 @@ static int chr_access_status(uint16_t conn_handle, uint16_t attr_handle,
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
         int slot = ensure_client_slot(conn_handle);
         if (slot < 0) return BLE_ATT_ERR_UNLIKELY;
-        int rc = os_mbuf_append(ctxt->om, clients[slot].status, strlen(clients[slot].status));
+        int rc = os_mbuf_append(ctxt->om, clients[slot].status, clients[slot].status_length);
         return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
     return BLE_ATT_ERR_UNLIKELY;
@@ -1256,6 +1292,8 @@ static int chr_access_identity(uint16_t conn_handle, uint16_t attr_handle,
             default: break;
         }
     } else if (state_result == ESP_ERR_NOT_FOUND || running->subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY) ota = "initial";
+    int8_t rssi = 127;
+    bool rssi_valid = ble_gap_conn_rssi(conn_handle, &rssi) == 0 && rssi != 127;
     device_health_t health = {
         .version = app->version, .build = build, .idf = app->idf_ver,
         .reset = health_reset_reason(), .ota = ota,
@@ -1265,6 +1303,10 @@ static int chr_access_identity(uint16_t conn_handle, uint16_t attr_handle,
         .ghost_reaps = ghost_reaps,
         .radio = radio_config,
         .adv_mode = !ble_gap_adv_active() ? "off" : adv_using_fast_interval ? "recent" : "inactive",
+        .rssi_valid = rssi_valid, .rssi = rssi,
+        .power_mode = ota_session.active ? "update" : now_ms() < fast_adv_until_ms ? "recent" : "inactive",
+        .tx_adv = radio_power_dbm(esp_ble_tx_power_get(ESP_BLE_PWR_TYPE_ADV)),
+        .tx_conn = radio_power_dbm(esp_ble_tx_power_get_enhanced(ESP_BLE_ENHANCED_PWR_TYPE_CONN, conn_handle)),
     };
     char response[512];
     int length = device_health_format(response, sizeof(response), &health);
@@ -1315,33 +1357,49 @@ static int chr_access_receipt(uint16_t conn_handle, uint16_t attr_handle,
     }
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
     uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
-    uint8_t packet[18];
+    uint8_t packet[49];
     if (len < 1 || len > sizeof(packet) || os_mbuf_copydata(ctxt->om, 0, len, packet) != 0)
         return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     if (packet[0] == 0xf0 && len == 17) {
         memcpy(client->receipt_id, packet + 1, 16);
         client->receipt_context = true; client->receipt_part = false; client->receipt_valid = false;
+        client->receipt_compact = false;
         client->receipt_started = now_ms();
         return 0;
+    }
+    /* One write at MTU >= 52: opcode + independent client ID + full HMAC.
+     * Same RCP1 PROVE transcript and 128-bit device proof as the legacy path. */
+    bool full_auth = packet[0] == 0xf3 && len == 49;
+    if (full_auth) {
+        memcpy(client->receipt_id, packet + 1, 16);
+        memcpy(client->receipt_mac, packet + 17, 16);
+        client->receipt_op = RECEIPT_PROVE;
+        client->receipt_context = true; client->receipt_part = true;
+        client->receipt_valid = false; client->receipt_compact = true;
+        client->receipt_started = now_ms();
     }
     if (!client->receipt_context || now_ms() - client->receipt_started > 5000) {
         client->receipt_context = false; client->receipt_part = false;
         return BLE_ATT_ERR_UNLIKELY;
     }
-    if (packet[0] == 0xf1 && len == 18 && packet[1] >= RECEIPT_PROVE && packet[1] <= RECEIPT_ACK) {
+    if ((packet[0] == 0xf1 || packet[0] == 0xf4) && len == 18 &&
+        packet[1] >= RECEIPT_PROVE && packet[1] <= RECEIPT_ACK &&
+        (packet[0] != 0xf4 || packet[1] == RECEIPT_PROVE)) {
+        client->receipt_compact = packet[0] == 0xf4;
         client->receipt_op = packet[1];
         memcpy(client->receipt_mac, packet + 2, 16); client->receipt_part = true;
         return 0;
     }
-    if (packet[0] != 0xf2 || len != 17 || !client->receipt_part) return BLE_ATT_ERR_UNLIKELY;
+    if ((!full_auth && (packet[0] != 0xf2 || len != 17)) || !client->receipt_part) return BLE_ATT_ERR_UNLIKELY;
     client->receipt_context = false; client->receipt_part = false;
     uint8_t nonce[16], transcript[64], expected[32], supplied[32];
     memcpy(nonce, client->nonce, 16);
-    memcpy(supplied, client->receipt_mac, 16); memcpy(supplied + 16, packet + 1, 16);
+    memcpy(supplied, client->receipt_mac, 16);
+    memcpy(supplied + 16, packet + (full_auth ? 33 : 1), 16);
     size_t size = receipt_transcript(transcript, false, client->receipt_op, client->receipt_id, nonce, 0);
     bool valid = current_psk[0] && compute_hmac(transcript, size, current_psk, expected) &&
         constant_time_equal(expected, supplied, 32);
-    generate_nonce_for_slot(slot, false);
+    generate_nonce_for_slot(slot, client->receipt_compact);
     if (!valid) {
         if (++client->auth_failures >= MAX_AUTH_FAILURES) {
             client->closing = true;
@@ -1375,6 +1433,7 @@ static int chr_access_receipt(uint16_t conn_handle, uint16_t attr_handle,
     client->receipt_reply[0] = 0xb1; client->receipt_reply[1] = client->receipt_op;
     client->receipt_reply[2] = result; memcpy(client->receipt_reply + 3, expected, 16);
     client->receipt_valid = true;
+    if (client->receipt_compact) set_auth_result(conn_handle, client->receipt_reply);
     return 0;
 }
 
@@ -1390,16 +1449,20 @@ static int chr_access_ota_control(uint16_t conn_handle, uint16_t attr_handle,
     }
     os_mbuf_copydata(ctxt->om, 0, len, payload);
 
-    if (payload[0] == 0x04) {
+    if (payload[0] >= 0x04 && payload[0] <= 0x06) {
+        const unsigned version = payload[0] - 3;
+        const unsigned config_size = version == 3 ? RADIO_CONFIG3_SIZE : version == 2 ? RADIO_CONFIG2_SIZE : RADIO_CONFIG_SIZE;
         int slot = find_client_by_handle(conn_handle);
-        if (len != RADIO_PACKET_SIZE || slot < 0 || !clients[slot].authenticated || clients[slot].closing) {
+        if (len != 1 + config_size + HMAC_LEN || slot < 0 || !clients[slot].authenticated || clients[slot].closing) {
             set_ota_status(conn_handle, "ERR:RADIO_AUTH");
             return 0;
         }
-        uint8_t transcript[RADIO_TRANSCRIPT_SIZE], expected[HMAC_LEN];
-        radio_transcript(transcript, clients[slot].nonce, payload + 1);
-        bool valid = compute_hmac(transcript, sizeof(transcript), current_psk, expected) &&
-            constant_time_equal(expected, payload + 1 + RADIO_CONFIG_SIZE, HMAC_LEN);
+        uint8_t transcript[RADIO_TRANSCRIPT3_SIZE], expected[HMAC_LEN];
+        if (version == 3) radio_transcript3(transcript, clients[slot].nonce, payload + 1);
+        else if (version == 2) radio_transcript2(transcript, clients[slot].nonce, payload + 1);
+        else radio_transcript(transcript, clients[slot].nonce, payload + 1);
+        bool valid = compute_hmac(transcript, version == 3 ? RADIO_TRANSCRIPT3_SIZE : version == 2 ? RADIO_TRANSCRIPT2_SIZE : RADIO_TRANSCRIPT_SIZE, current_psk, expected) &&
+            constant_time_equal(expected, payload + 1 + config_size, HMAC_LEN);
         generate_nonce_for_slot(slot, true);
         if (!valid) {
             set_ota_status(conn_handle, "ERR:RADIO_AUTH");
@@ -1415,12 +1478,27 @@ static int chr_access_ota_control(uint16_t conn_handle, uint16_t attr_handle,
             return 0;
         }
         radio_config_t requested;
-        if (!radio_config_decode(&requested, payload + 1)) {
+        if (!(version == 3 ? radio_config3_decode(&requested, payload + 1) : version == 2 ? radio_config2_decode(&requested, payload + 1) : radio_config_decode(&requested, payload + 1))) {
             set_ota_status(conn_handle, "ERR:RADIO_RANGE");
             return 0;
         }
-        if (!save_radio_config(&requested)) {
-            set_ota_status(conn_handle, "ERR:RADIO_SAVE");
+        if (version == 1) {
+            requested.tx_power_dbm = radio_config.tx_power_dbm;
+            requested.idle_tx_power_dbm = radio_config.idle_tx_power_dbm;
+        }
+        uint16_t handles[MAX_CONNECTIONS];
+        unsigned count = 0;
+        for (int i = 0; i < MAX_CONNECTIONS; ++i)
+            if (clients[i].in_use && !clients[i].closing) handles[count++] = clients[i].conn_handle;
+        const radio_config_t previous = radio_config;
+        const int previous_adv = radio_power_target(&previous, now_ms(), fast_adv_until_ms, ota_session.active);
+        radio_update_result_t result = radio_power_update(&requested, &previous, previous_adv, handles, count, save_radio_config);
+        radio_power_state.applied_dbm = result == RADIO_UPDATE_OK ? requested.tx_power_dbm :
+            result == RADIO_UPDATE_RESTORE ? 127 : previous_adv;
+        radio_power_state.retry_after_ms = 0;
+        if (result != RADIO_UPDATE_OK) {
+            set_ota_status(conn_handle, result == RADIO_UPDATE_SAVE ? "ERR:RADIO_SAVE" :
+                result == RADIO_UPDATE_RESTORE ? "ERR:RADIO_RESTORE" : "ERR:RADIO_APPLY");
             return 0;
         }
         mark_authenticated(conn_handle);
@@ -1681,6 +1759,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
              * restarting. */
             LOG_W(TAG, "Connect failed, status=%d", event->connect.status);
             adv_active = false;
+            mark_ble_activity(); // A failed connection is also a detected attempt.
             log_client_state("connect-failed");
             start_advertising();
             return 0;
@@ -1697,11 +1776,13 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
             clients[slot].in_use        = true;
             clients[slot].connected_at = now_ms();
             strcpy(clients[slot].status, "READY");
+            clients[slot].status_length = 5;
             clients[slot].authenticated = false;
             clients[slot].last_activity_at = now_ms();
             clients[slot].conn_handle   = conn_handle;
             generate_nonce_for_slot(slot, false);
             mark_ble_activity();
+            sync_radio_power(true); // New handle needs power even if already recent.
             LOG_I(TAG, "Client connected, slot %d, handle %d", slot, conn_handle);
             log_client_state("connect");
         } else {
@@ -1712,7 +1793,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
             return 0;
         }
 
-        /* Tighten link supervision: 4s timeout.
+        /* Link supervision: 8s timeout.
          * Params: min_itvl, max_itvl (1.25ms units), latency,
          *         supervision_timeout (10ms units) */
         struct ble_gap_upd_params params = {
@@ -1907,12 +1988,10 @@ static void ble_on_sync(void) {
         LOG_W(TAG, "Failed to set preferred MTU: %d", rc);
     }
 
-    /* Set TX power */
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P3);
-
+    radio_power_state = (radio_power_state_t)RADIO_POWER_STATE_INITIAL;
     mark_ble_activity();
     start_advertising();
-    LOG_I(TAG, "BLE synced, advertising started (TX %d dBm)", BLE_TX_POWER);
+    LOG_I(TAG, "BLE synced, advertising started (TX %d dBm)", radio_config.tx_power_dbm);
 }
 
 static void ble_on_reset(int reason) {
@@ -1929,13 +2008,14 @@ static void nimble_host_task(void *param) {
 }
 
 /* ============================================================
- * Main loop task: ghost reaper, timeouts, periodic restart
+ * Main loop task: ghost reaper, timeouts, recovery
  * ============================================================ */
 
 /* Called only on the NimBLE event queue: client slots, advertising, and
  * OTA handles now have one owner. The independent task only watches its heartbeat. */
 static void maintain_ble_state(void) {
     int64_t now = now_ms();
+    sync_radio_power(false);
     uint32_t recoveries_before = adv_recoveries;
     uint32_t ghosts_before = ghost_reaps;
         /* ---- Ghost slot reaper ----
