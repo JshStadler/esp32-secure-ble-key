@@ -91,7 +91,13 @@ after its result. Connecting is amber, sending is blue, confirmation is green an
 failure/uncertainty is red. Confirmation lasts three seconds before the widget
 returns to its device name and ready status (or idle when Off).
 Tapping a widget again while it shows **Wait… / Connecting…** cancels that unsent
-request immediately, without an authentication prompt. Once the command is sent,
+request immediately, without an authentication prompt, while continuing the connection
+attempt within its original ten-second deadline. **Link… / Connect only** means
+the device is connecting without a queued button press. On connection, the saved
+background duration starts (Off disconnects immediately). A new explicit tap can
+request another press, including while connecting; canceled requests are never replayed.
+The notification's **Disconnect** action can stop a connection-only attempt entirely.
+Once the command is sent,
 it cannot be recalled: taps during **Send… / Sending…** are ignored and the app
 waits for its result. Cached widget or notification cancellation actions are bound
 to the original request, so they cannot cancel a newer press or start one.

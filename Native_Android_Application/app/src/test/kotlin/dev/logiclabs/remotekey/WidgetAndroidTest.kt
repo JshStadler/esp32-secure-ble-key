@@ -91,7 +91,7 @@ class WidgetAndroidTest {
     }
     @Test fun actualRemoteViewsShowDistinctProgressAndConfirmationOnCompactAndLargeWidgets() {
         val context = RuntimeEnvironment.getApplication()
-        val phases = listOf("Connecting…", "Sending…", "Pressed • ready for 2 minutes", "Ready • 2 minutes", "Unable to confirm — check the device", "Not sent — connection timed out", "Canceled before sending")
+        val phases = listOf("Connecting…", "Sending…", "Pressed • ready for 2 minutes", "Ready • 2 minutes", "Unable to confirm — check the device", "Not sent — connection timed out", "Canceled before sending", "Connecting only…")
         listOf(1f, 2f).forEach { scale ->
             RuntimeEnvironment.setQualifiers("w360dp-h640dp-mdpi")
             RuntimeEnvironment.setFontScale(scale)
@@ -263,5 +263,17 @@ class WidgetAndroidTest {
             file.outputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
             bitmap.recycle()
         }
+    }
+    @Test fun aConnectionOnlyWidgetNeedsANewExplicitPressRatherThanReusingTheCanceledToken() {
+        val context = RuntimeEnvironment.getApplication()
+        val view = PressWidgetProvider.views(context, 123, BleDeviceProfiles.GATE,
+            "Connecting only…", false, true, iconOnly = true).apply(context, android.widget.FrameLayout(context))
+        assertTrue(view.contentDescription.toString().contains("Connecting only"))
+        assertTrue(view.contentDescription.toString().contains("Tap to press"))
+        assertTrue(view.performClick())
+        val action = shadowOf(context).nextStartedActivity
+        assertEquals(WidgetPressActivity::class.java.name, action.component?.className)
+        assertEquals(123, action.getIntExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, -1))
+        assertNull(shadowOf(context).nextStartedService)
     }
 }

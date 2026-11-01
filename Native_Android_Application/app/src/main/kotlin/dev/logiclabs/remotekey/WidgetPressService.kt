@@ -53,10 +53,7 @@ class WidgetPressService : Service() {
         when (intent?.action) {
             "cancel" -> {
                 val owner = sessions[intent.getStringExtra("cancel_profile_id")]
-                if (owner?.window?.cancelPending(intent.getStringExtra("cancel_request_id")) == true) {
-                    owner.log("Widget request canceled before sending")
-                    owner.end("Canceled before sending")
-                }
+                owner?.cancelPress(intent.getStringExtra("cancel_request_id"))
                 stopIfIdle()
                 return START_NOT_STICKY
             }
@@ -122,6 +119,22 @@ class WidgetPressService : Service() {
             scheduleCheck()
             if (client == null) connect() else dispatchIfReady()
         }
+        fun cancelPress(requestId: String?) {
+            if (!window.cancelPending(requestId)) return
+            log("Widget press canceled before sending; connection attempt retained")
+            clearFeedback()
+            publish("Canceled • connecting only")
+            scheduleCheck() // Keep the original ten-second connection deadline.
+            val owned = generation
+            val canceledSession = session
+            feedbackReset = Runnable {
+                feedbackReset = null
+                if (!current() || owned != generation || canceledSession != session || window.busy) return@Runnable
+                if (window.connectingOnly) publish("Connecting only…")
+                else if (ready) publish("Connected")
+            }.also { handler.postDelayed(it, 3_000) }
+            dispatchIfReady()
+        }
         private val tick = object : Runnable {
             override fun run() {
                 if (!current()) return
@@ -147,14 +160,14 @@ class WidgetPressService : Service() {
                     PressWidgetProvider.connection(this@WidgetPressService, profile.id, "widget", state == BleCarKeyClient.State.CONNECTED)
                     if (state != BleCarKeyClient.State.CONNECTED) ready = false
                     if (state == BleCarKeyClient.State.DISCONNECTED) {
-                        if (window.busy) finishRequest(false, if (window.dispatched) "Unable to confirm — check the device" else "Not sent — $message")
+                        if (window.busy || window.connectingOnly) finishRequest(false, if (window.dispatched) "Unable to confirm — check the device" else "Not sent — $message")
                         else end("Tap to reconnect")
-                    } else if (state == BleCarKeyClient.State.RETRYING && !window.busy) end("Tap to reconnect")
+                    } else if (state == BleCarKeyClient.State.RETRYING && !window.busy && !window.connectingOnly) end("Tap to reconnect")
                 }
                 override fun onReadyChanged(ready: Boolean) { if (live()) { this@DeviceSession.ready = ready; dispatchIfReady() } }
                 override fun onDeviceAddress(address: String) { if (live()) store.put(profile.addressStoreKey, address) }
                 override fun onDeviceState(state: String) {}
-                override fun onCommandResult(success: Boolean, message: String) { if (live()) finishRequest(success, message) }
+                override fun onCommandResult(success: Boolean, message: String) { if (live() && window.dispatched) finishRequest(success, message) }
                 override fun onDiagnostic(message: String) { if (live()) log(message) }
                 override fun onPskUpdateResult(success: Boolean, message: String) {}
                 override fun onOtaProgress(sent: Int, total: Int) {}
@@ -165,7 +178,7 @@ class WidgetPressService : Service() {
                 readSetting(profile.preferCachedStoreKey)?.toBooleanStrictOrNull() ?: (profile.defaultAddress != null))
         }
         private fun dispatchIfReady() {
-            if (!current() || !ready || !window.busy || window.dispatched) return
+            if (!current() || !ready || (!window.busy && !window.connectingOnly) || window.dispatched) return
             window.timeout(now())?.let { finishRequest(false, it); return }
             if (PressWidgetProvider.deviceId(this@WidgetPressService, widgetId) != profile.id ||
                 loadProfiles().firstOrNull { it.id == profile.id } != profile || readSetting(profile.pskStoreKey) != key ||
@@ -174,10 +187,21 @@ class WidgetPressService : Service() {
                 finishRequest(false, "Not sent — device setup changed; tap again")
                 return
             }
+            if (window.connectingOnly) {
+                val duration = BackgroundConnectionDuration.fromSaved(readSetting(BackgroundConnectionDuration.STORE_KEY))
+                window.complete(now(), duration.milliseconds)
+                log("Connected after cancellation; no button command sent")
+                if (duration == BackgroundConnectionDuration.OFF) end("Canceled • disconnected")
+                else {
+                    publish(if (feedbackReset != null) "Canceled • connected" else "Ready • ${duration.label}")
+                    scheduleCheck()
+                }
+                return
+            }
             if (window.claim(now())) { scheduleCheck(); publish("Sending…"); client?.press() }
         }
         private fun finishRequest(success: Boolean, result: String) {
-            if (!window.busy) return
+            if (!window.busy && !window.connectingOnly) return
             val wasSent = window.dispatched
             val duration = BackgroundConnectionDuration.fromSaved(readSetting(BackgroundConnectionDuration.STORE_KEY))
             window.complete(now(), duration.milliseconds)

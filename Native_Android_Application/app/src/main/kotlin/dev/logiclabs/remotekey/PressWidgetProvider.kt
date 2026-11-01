@@ -161,7 +161,7 @@ class PressWidgetProvider : AppWidgetProvider() {
                 // Waiting taps cancel their specific request; sent-command taps are ignored.
                 setBoolean(R.id.widget_press, "setEnabled", true)
                 setOnClickPendingIntent(R.id.widget_press, click)
-                val action = if (canCancel) "Tap to cancel before sending" else if (working) "Already sending; cannot cancel" else "Tap to press"
+                val action = if (canCancel) "Tap to cancel before sending; connection will continue" else if (working) "Already sending; cannot cancel" else "Tap to press"
                 setContentDescription(R.id.widget_press, "${profile?.displayName ?: "Remote Key"}: $displayedMessage. $action")
             }
         }

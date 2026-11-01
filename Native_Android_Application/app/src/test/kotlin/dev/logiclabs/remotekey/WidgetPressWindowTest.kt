@@ -10,9 +10,14 @@ class WidgetPressWindowTest {
         assertEquals("request-a", w.cancellationId)
         assertTrue(w.cancelPending("request-a"))
         assertFalse(w.claim(1))
-        assertFalse(w.complete(2))
-        assertFalse(w.active)
+        assertTrue(w.connectingOnly)
+        assertTrue(w.active)
         assertNull(w.cancellationId)
+        assertTrue(w.complete(2))
+        assertFalse(w.connectingOnly)
+        assertFalse(w.claim(3))
+        assertFalse(w.expired(30_001))
+        assertTrue(w.expired(30_002))
     }
     @Test fun cancellationCannotRecallAnAlreadyDispatchedCommandOrHideItsReceipt() {
         val w = WidgetPressWindow()
@@ -107,5 +112,28 @@ class WidgetPressWindowTest {
         w.complete(2_000)
         assertEquals(30_000, w.nextCheckDelay(2_000))
         assertEquals(1, w.nextCheckDelay(40_000))
+    }
+    @Test fun cancelingTheCommandDoesNotExtendTheConnectionDeadline() {
+        val w = WidgetPressWindow()
+        w.tap(1_000, "request-a")
+        assertTrue(w.cancelPending("request-a"))
+        assertFalse(w.cancelPending("request-a"))
+        assertEquals(1_000, w.nextCheckDelay(10_000))
+        assertNull(w.timeout(10_999))
+        assertNotNull(w.timeout(11_000))
+        assertFalse(w.claim(11_000))
+        w.cancel()
+        assertFalse(w.active)
+        assertFalse(w.connectingOnly)
+        assertFalse(w.complete(11_001))
+    }
+    @Test fun anotherExplicitTapCanAuthorizeANewPressDuringConnectionOnly() {
+        val w = WidgetPressWindow()
+        w.tap(0, "canceled"); w.cancelPending("canceled")
+        assertTrue(w.tap(9_000, "new-press"))
+        assertFalse(w.connectingOnly)
+        assertFalse(w.cancelPending("canceled"))
+        assertTrue(w.claim(10_000))
+        assertFalse(w.claim(10_001))
     }
 }

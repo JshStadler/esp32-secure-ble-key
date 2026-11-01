@@ -84,19 +84,19 @@ class ConcurrentWidgetPressTest {
         assertFalse(PressWidgetProvider.isBusy("car"))
         assertFalse(shadowOf(service).isStoppedBySelf)
     }
-    @Test fun cancelingGateDoesNotCancelCarAndStaleCallbacksCannotAffectItsReplacement() = withService { service, intent, connections ->
+    @Test fun cancelingGateKeepsItsConnectionAndDoesNotCancelCarOrANewerRequest() = withService { service, intent, connections ->
         service.onStartCommand(intent(BleDeviceProfiles.GATE, "gate-old"), 0, 1)
         service.onStartCommand(intent(BleDeviceProfiles.CAR, "car-a"), 0, 2)
         val old = connections.getValue("gate")
         service.onStartCommand(WidgetPressService.cancellationIntent(service, "gate", "gate-old"), 0, 3)
-        assertTrue(old.stopped)
+        assertFalse(old.stopped)
         assertTrue(PressWidgetProvider.isBusy("car"))
         assertFalse(connections.getValue("car").stopped)
-        service.onStartCommand(intent(BleDeviceProfiles.GATE, "gate-new"), 0, 4)
-        service.onStartCommand(WidgetPressService.cancellationIntent(service, "gate", "gate-old"), 0, 5)
         old.ready(); old.complete()
         assertEquals(0, old.presses)
-        assertTrue(PressWidgetProvider.isBusy("gate"))
+        assertFalse(PressWidgetProvider.isBusy("gate"))
+        service.onStartCommand(intent(BleDeviceProfiles.GATE, "gate-new"), 0, 4)
+        service.onStartCommand(WidgetPressService.cancellationIntent(service, "gate", "gate-old"), 0, 5)
         connections.getValue("gate").ready()
         assertEquals(1, connections.getValue("gate").presses)
         connections.getValue("car").ready()
@@ -121,7 +121,9 @@ class ConcurrentWidgetPressTest {
         assertFalse(connections.getValue("gate").stopped)
         assertTrue(PressWidgetProvider.isBusy("gate"))
         service.onStartCommand(WidgetPressService.cancellationIntent(service, "car", "car-a"), 0, 4)
-        assertTrue(connections.getValue("car").stopped)
+        assertFalse(connections.getValue("car").stopped)
+        connections.getValue("car").ready()
+        assertEquals(0, connections.getValue("car").presses)
         connections.getValue("gate").complete()
         assertEquals(1, connections.getValue("gate").presses)
         assertTrue(PressWidgetProvider.currentMessage("gate").startsWith("Pressed"))
@@ -154,5 +156,90 @@ class ConcurrentWidgetPressTest {
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(5))
         assertTrue(connections.getValue("car").stopped)
         assertTrue(shadowOf(service).isStoppedBySelf)
+    }
+    @Test fun canceledPressConnectsWithoutPressingAndKeepsTheConfiguredLeaseFromReady() = withService { service, intent, connections ->
+        val request = intent(BleDeviceProfiles.GATE, "connect-only")
+        service.onStartCommand(request, 0, 1)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(2))
+        service.onStartCommand(WidgetPressService.cancellationIntent(service, "gate", "connect-only"), 0, 2)
+        val link = connections.getValue("gate")
+        assertFalse(link.stopped)
+        assertFalse(PressWidgetProvider.isBusy("gate"))
+        assertTrue(PressWidgetProvider.currentMessage("gate").startsWith("Canceled"))
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(3))
+        assertEquals("Connecting only…", PressWidgetProvider.currentMessage("gate"))
+        link.ready(); link.ready(); link.complete()
+        service.onStartCommand(request, 0, 3) // Redelivery cannot restore a canceled authorization.
+        assertEquals(0, link.presses)
+        assertTrue(PressWidgetProvider.isConnected("gate"))
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(29))
+        link.ready() // A repeated ready callback must not renew the lease.
+        assertFalse(link.stopped)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
+        assertTrue(link.stopped)
+        assertEquals(0, link.presses)
+    }
+    @Test fun cancellationDoesNotExtendTheOriginalConnectionTimeoutAndLateCallbacksCannotPress() = withService { service, intent, connections ->
+        service.onStartCommand(intent(BleDeviceProfiles.GATE, "expired"), 0, 1)
+        val old = connections.getValue("gate")
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(9))
+        service.onStartCommand(WidgetPressService.cancellationIntent(service, "gate", "expired"), 0, 2)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(1))
+        assertTrue(old.stopped)
+        assertTrue(PressWidgetProvider.currentMessage("gate").contains("timed out"))
+        service.onStartCommand(intent(BleDeviceProfiles.GATE, "replacement"), 0, 3)
+        old.ready(); old.complete()
+        assertEquals(0, old.presses)
+        assertTrue(PressWidgetProvider.isBusy("gate"))
+        connections.getValue("gate").ready()
+        assertEquals(1, connections.getValue("gate").presses)
+    }
+    @Test fun anotherExplicitTapCanSendBeforeTheCanceledConnectionsFeedbackReset() = withService { service, intent, connections ->
+        service.onStartCommand(intent(BleDeviceProfiles.GATE, "canceled"), 0, 1)
+        service.onStartCommand(WidgetPressService.cancellationIntent(service, "gate", "canceled"), 0, 2)
+        service.onStartCommand(intent(BleDeviceProfiles.GATE, "new"), 0, 3)
+        service.onStartCommand(WidgetPressService.cancellationIntent(service, "gate", "canceled"), 0, 4)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(3))
+        assertTrue(PressWidgetProvider.isBusy("gate"))
+        assertEquals("Connecting…", PressWidgetProvider.currentMessage("gate"))
+        connections.getValue("gate").ready()
+        assertEquals(1, connections.getValue("gate").presses)
+    }
+    @Test fun connectionOnlyAllowsRetriesButStillEndsAtTheOriginalDeadline() = withService { service, intent, connections ->
+        service.onStartCommand(intent(BleDeviceProfiles.GATE, "retry"), 0, 1)
+        service.onStartCommand(WidgetPressService.cancellationIntent(service, "gate", "retry"), 0, 2)
+        val link = connections.getValue("gate")
+        link.listener.onReadyChanged(false)
+        link.listener.onState(BleCarKeyClient.State.RETRYING, "Retrying")
+        assertFalse(link.stopped)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(10))
+        assertTrue(link.stopped)
+        link.ready()
+        assertEquals(0, link.presses)
+    }
+    @Test fun connectionOnlyHonoursOffAndCanBeDisconnectedFromItsNotification() = withService { service, intent, connections ->
+        val previous = service.readSetting
+        service.readSetting = { if (it == BackgroundConnectionDuration.STORE_KEY) "OFF" else previous(it) }
+        service.onStartCommand(intent(BleDeviceProfiles.GATE, "off"), 0, 1)
+        service.onStartCommand(WidgetPressService.cancellationIntent(service, "gate", "off"), 0, 2)
+        connections.getValue("gate").ready()
+        assertTrue(connections.getValue("gate").stopped)
+        assertEquals(0, connections.getValue("gate").presses)
+        service.onStartCommand(intent(BleDeviceProfiles.CAR, "close"), 0, 3)
+        service.onStartCommand(WidgetPressService.cancellationIntent(service, "car", "close"), 0, 4)
+        service.onStartCommand(WidgetPressService.cancellationIntent(service, "car", "close").setAction("close"), 0, 5)
+        val link = connections.getValue("car")
+        assertTrue(link.stopped)
+        link.ready()
+        assertEquals(0, link.presses)
+    }
+    @Test fun changedDeviceSetupCannotBeUsedToKeepACanceledConnection() = withService { service, intent, connections ->
+        service.onStartCommand(intent(BleDeviceProfiles.GATE, "changed"), 0, 1)
+        service.onStartCommand(WidgetPressService.cancellationIntent(service, "gate", "changed"), 0, 2)
+        val oldRead = service.readSetting
+        service.readSetting = { if (it == BleDeviceProfiles.GATE.pskStoreKey) "different-key" else oldRead(it) }
+        connections.getValue("gate").ready()
+        assertTrue(connections.getValue("gate").stopped)
+        assertEquals(0, connections.getValue("gate").presses)
     }
 }

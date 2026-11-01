@@ -18,6 +18,7 @@ internal object WidgetStatusText {
         else -> Tone.IDLE
     }
     fun label(message: String): String = when {
+        message.startsWith("Connecting only") -> "Connect only"
         message.startsWith("Pressed") -> "Pressed ✓"
         message.startsWith("Unable to confirm") -> "Check device"
         message.startsWith("Not sent") -> "Not sent"
@@ -26,7 +27,7 @@ internal object WidgetStatusText {
         else -> message
     }
     fun compactLabel(message: String): String = when (tone(message)) {
-        Tone.CONNECTING -> "Wait…"
+        Tone.CONNECTING -> if (message.startsWith("Connecting only")) "Link…" else "Wait…"
         Tone.SENDING -> "Send…"
         Tone.CONFIRMED -> "Done"
         Tone.ERROR -> when {
